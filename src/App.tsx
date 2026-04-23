@@ -25,6 +25,24 @@ type Chat = {
   time: string;
   unread: number;
   presence: string;
+  peerUserId?: string;
+};
+
+type CallState = 'ringing' | 'ongoing' | 'completed' | 'missed' | 'declined';
+
+type CallItem = {
+  id: string;
+  participantIds: string[];
+  initiatorId: string;
+  kind: 'audio' | 'video';
+  direction: 'incoming' | 'outgoing';
+  state: CallState;
+  startedAt: string;
+  durationSeconds: number;
+  answeredAt?: string;
+  endedAt?: string;
+  peerUserId?: string;
+  peerName: string;
 };
 
 type CatalogItem = {
@@ -46,7 +64,7 @@ type StatusItem = {
   fontFamily?: string;
   fontSize?: number;
   reactions?: Array<{ userId: string; emoji: string; reactedAt: string }>;
-  comments?: Array<{ id: string; userId: string; text: string; createdAt: string }>;
+  comments?: Array<{ id: string; userId: string; text: string; createdAt: string; updatedAt?: string }>;
   views?: Array<{ userId: string; viewedAt: string }>;
   createdAt: string;
 };
@@ -56,6 +74,21 @@ type StatusViewer = {
   name: string;
   avatar: string;
   viewedAt: string;
+};
+
+type StatusReactor = {
+  userId: string;
+  name: string;
+  avatar: string;
+  emoji: string;
+  reactedAt: string;
+};
+
+type AppUser = {
+  id: string;
+  name: string;
+  avatar: string;
+  phone: string;
 };
 
 type UpdateGroup = {
@@ -71,7 +104,7 @@ type UpdateGroup = {
     fontFamily?: string;
     fontSize?: number;
     reactions?: Array<{ userId: string; emoji: string; reactedAt: string }>;
-    comments?: Array<{ id: string; userId: string; text: string; createdAt: string }>;
+    comments?: Array<{ id: string; userId: string; text: string; createdAt: string; updatedAt?: string }>;
     views?: Array<{ userId: string; viewedAt: string }>;
     createdAt: string;
   }>;
@@ -156,6 +189,17 @@ const formatRelative = (value: string | null) => {
   return `${Math.round(minutes / 60)}h ago`;
 };
 
+const formatDurationLabel = (seconds: number) => {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(totalSeconds / 60);
+  const remainder = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${remainder}`;
+};
+
+const WEBRTC_CONFIGURATION: RTCConfiguration = {
+  iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+};
+
 function App() {
   const [activeView, setActiveView] = useState<View>('chats');
   const [selectedChatId, setSelectedChatId] = useState<string>('c1');
@@ -164,21 +208,46 @@ function App() {
   const [catalogCategory, setCatalogCategory] = useState('All');
   const [catalogItems, setCatalogItems] = useState<CatalogItem[]>(initialCatalogItems);
   const [callSheetVisible, setCallSheetVisible] = useState(false);
+  const [calls, setCalls] = useState<CallItem[]>([]);
+  const [incomingCall, setIncomingCall] = useState<CallItem | null>(null);
+  const [activeCall, setActiveCall] = useState<CallItem | null>(null);
+  const [activeCallSeconds, setActiveCallSeconds] = useState(0);
+  const [localCallStream, setLocalCallStream] = useState<MediaStream | null>(null);
+  const [remoteCallStream, setRemoteCallStream] = useState<MediaStream | null>(null);
+  const [callError, setCallError] = useState<string | null>(null);
   const [mediaViewer, setMediaViewer] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [currentUserId, setCurrentUserId] = useState('u1');
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
+  const [users, setUsers] = useState<AppUser[]>([]);
   const [statusText, setStatusText] = useState('');
   const [statusAssetFiles, setStatusAssetFiles] = useState<File[]>([]);
+  const [statusComposerVisible, setStatusComposerVisible] = useState(false);
+  const [statusBackgroundColor, setStatusBackgroundColor] = useState('#10233e');
+  const [statusFontFamily, setStatusFontFamily] = useState('System');
+  const [statusFontSize, setStatusFontSize] = useState(30);
   const [catalogAssetFiles, setCatalogAssetFiles] = useState<File[]>([]);
   const [updatesFeed, setUpdatesFeed] = useState<UpdateGroup[]>([]);
   const [statuses, setStatuses] = useState<StatusItem[]>([]);
   const [activeStatusGroupIndex, setActiveStatusGroupIndex] = useState<number | null>(null);
   const [activeStatusItemIndex, setActiveStatusItemIndex] = useState(0);
   const [statusProgress, setStatusProgress] = useState(0);
+  const [statusElapsedMs, setStatusElapsedMs] = useState(0);
   const [statusCommentDraft, setStatusCommentDraft] = useState('');
   const [statusViewers, setStatusViewers] = useState<StatusViewer[]>([]);
   const [statusViewersVisible, setStatusViewersVisible] = useState(false);
+  const [statusReactors, setStatusReactors] = useState<StatusReactor[]>([]);
+  const [statusReactorsVisible, setStatusReactorsVisible] = useState(false);
+  const [statusThreadVisible, setStatusThreadVisible] = useState(false);
+  const [statusReplyVisible, setStatusReplyVisible] = useState(false);
+  const [statusHoldActive, setStatusHoldActive] = useState(false);
+  const [editingStatusCommentId, setEditingStatusCommentId] = useState<string | null>(null);
+  const [editingStatusCommentText, setEditingStatusCommentText] = useState('');
+  const [newChatVisible, setNewChatVisible] = useState(false);
+  const [authVisible, setAuthVisible] = useState(false);
+  const [authMode, setAuthMode] = useState<'switch' | 'login' | 'register'>('switch');
+  const [authForm, setAuthForm] = useState({ name: '', phone: '' });
   const [profile, setProfile] = useState({
     name: 'Temwa Lesa',
     about: 'Seller, founder, and product operator.',
@@ -256,12 +325,31 @@ function App() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const callMediaStreamRef = useRef<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const applyBootstrapRef = useRef<(payload: any) => void>(() => undefined);
+  const updatesFeedRef = useRef<UpdateGroup[]>([]);
+  const statusGroupIndexRef = useRef<number | null>(null);
+  const statusItemIndexRef = useRef(0);
+  const activeCallRef = useRef<CallItem | null>(null);
   const [chatItems, setChatItems] = useState<Chat[]>(initialChats);
-  const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? initialChats[0];
-  const messages = messagesByChat[activeChat.id] ?? [];
+  const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? null;
+  const messages = activeChat ? messagesByChat[activeChat.id] ?? [] : [];
   const activeStatusGroup = activeStatusGroupIndex === null ? null : updatesFeed[activeStatusGroupIndex] ?? null;
   const activeStatusItem = activeStatusGroup?.items[activeStatusItemIndex] ?? null;
+  const activeStatusId = activeStatusItem?.id ?? null;
+  const statusPlaybackPaused =
+    statusHoldActive ||
+    statusThreadVisible ||
+    statusReplyVisible ||
+    statusViewersVisible ||
+    statusReactorsVisible ||
+    Boolean(statusCommentDraft.trim()) ||
+    Boolean(editingStatusCommentId);
   const filteredCatalogItems = useMemo(() => {
     return catalogItems.filter((item) => {
       const matchesCategory = catalogCategory === 'All' || item.category === catalogCategory;
@@ -274,6 +362,75 @@ function App() {
       return matchesCategory && matchesSearch;
     });
   }, [catalogCategory, catalogItems, catalogSearch]);
+
+  const attachStreamToVideo = (element: HTMLVideoElement | null, stream: MediaStream | null) => {
+    if (!element) {
+      return;
+    }
+
+    if ('srcObject' in element) {
+      element.srcObject = stream;
+    }
+  };
+
+  const closePeerConnection = () => {
+    peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop());
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+    callMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    callMediaStreamRef.current = null;
+    setLocalCallStream(null);
+    setRemoteCallStream(null);
+  };
+
+  const ensureCallMedia = async (kind: 'audio' | 'video') => {
+    if (callMediaStreamRef.current) {
+      return callMediaStreamRef.current;
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: kind === 'video',
+    });
+    callMediaStreamRef.current = stream;
+    setLocalCallStream(stream);
+    return stream;
+  };
+
+  const emitCallSignal = (callId: string, signalType: 'offer' | 'answer' | 'ice-candidate', payload: unknown, toUserId?: string) => {
+    socketRef.current?.emit('call:signal', {
+      callId,
+      fromUserId: currentUserId,
+      toUserId,
+      signalType,
+      payload,
+    });
+  };
+
+  const ensurePeerConnection = async (call: CallItem) => {
+    if (peerConnectionRef.current) {
+      return peerConnectionRef.current;
+    }
+
+    const connection = new RTCPeerConnection(WEBRTC_CONFIGURATION);
+    const remoteStream = new MediaStream();
+    setRemoteCallStream(remoteStream);
+    connection.ontrack = (event) => {
+      event.streams[0]?.getTracks().forEach((track) => {
+        remoteStream.addTrack(track);
+      });
+      setRemoteCallStream(new MediaStream(remoteStream.getTracks()));
+    };
+    connection.onicecandidate = (event) => {
+      if (event.candidate) {
+        emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), call.peerUserId);
+      }
+    };
+    const localStream = await ensureCallMedia(call.kind);
+    localStream.getTracks().forEach((track) => connection.addTrack(track, localStream));
+    peerConnectionRef.current = connection;
+    return connection;
+  };
 
   const uploadFiles = async (files: File[]) => {
     if (!files.length) {
@@ -300,6 +457,55 @@ function App() {
 
   const getStatusItemDuration = (item: UpdateGroup['items'][number]) =>
     item.assets.some((asset) => asset.kind === 'video') ? STATUS_VIDEO_DURATION_MS : STATUS_IMAGE_DURATION_MS;
+  const activeStatusDuration = activeStatusItem ? getStatusItemDuration(activeStatusItem) : null;
+
+  const getChatTitle = (chat: any, userId: string, userList: AppUser[]) => {
+    if (chat.kind !== 'direct') {
+      return chat.title;
+    }
+
+    const peerId = (chat.participants ?? []).find((participantId: string) => participantId !== userId);
+    return userList.find((user) => user.id === peerId)?.name ?? chat.title;
+  };
+
+  const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => ({
+    id: chat.id,
+    name: getChatTitle(chat, userId, userList),
+    preview: chat.lastMessagePreview,
+    time: formatClock(chat.updatedAt ?? new Date().toISOString()),
+    unread: chat.unreadCount ?? 0,
+    presence: 'online',
+    peerUserId: chat.kind === 'direct'
+      ? (chat.participants ?? []).find((participantId: string) => participantId !== userId)
+      : undefined,
+  });
+
+  const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
+    const peerUserId = (call.participantIds ?? []).find((participantId: string) => participantId !== userId);
+    const peerName = userList.find((user) => user.id === peerUserId)?.name ?? 'Call';
+    return {
+      id: call.id,
+      participantIds: call.participantIds ?? [],
+      initiatorId: call.initiatorId ?? call.participantIds?.[0] ?? userId,
+      kind: call.kind,
+      direction: call.initiatorId === userId ? 'outgoing' : 'incoming',
+      state: call.state,
+      startedAt: call.startedAt,
+      durationSeconds: call.durationSeconds ?? 0,
+      answeredAt: call.answeredAt,
+      endedAt: call.endedAt,
+      peerUserId,
+      peerName,
+    };
+  };
+
+  const getUserMeta = useCallback((userId: string) => {
+    const match = users.find((user) => user.id === userId);
+    return {
+      name: userId === currentUserId ? 'You' : match?.name ?? userId,
+      avatar: match?.avatar ?? (userId === currentUserId ? profile.name.slice(0, 2).toUpperCase() : 'ZU'),
+    };
+  }, [currentUserId, profile.name, users]);
 
   const reconcileIncomingMessage = useCallback((chatId: string, incomingMessage: any) => {
     setMessagesByChat((current) => {
@@ -358,6 +564,24 @@ function App() {
     );
   }, []);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    updatesFeedRef.current = updatesFeed;
+  }, [updatesFeed]);
+
+  useEffect(() => {
+    statusGroupIndexRef.current = activeStatusGroupIndex;
+  }, [activeStatusGroupIndex]);
+
+  useEffect(() => {
+    statusItemIndexRef.current = activeStatusItemIndex;
+  }, [activeStatusItemIndex]);
+
+  useEffect(() => {
+    activeCallRef.current = activeCall;
+  }, [activeCall]);
+
   const syncReceiptState = async (messageId: string, state: ReceiptState) => {
     await fetch(`${API_BASE_URL}/api/messages/${messageId}/receipt`, {
       method: 'PATCH',
@@ -369,6 +593,8 @@ function App() {
   const applyBootstrap = (payload: any) => {
     setCurrentUserId(payload.currentUserId ?? 'u1');
     setCurrentDeviceId(payload.currentDeviceId ?? null);
+    const nextUsers = payload.users ?? [];
+    setUsers(nextUsers);
     setProfile({
       name: payload.profile?.name ?? 'Temwa Lesa',
       about: payload.profile?.about ?? '',
@@ -377,15 +603,10 @@ function App() {
         ? payload.profile.avatar
         : 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
     });
-    setChatItems(
-      (payload.chats ?? []).map((chat: any) => ({
-        id: chat.id,
-        name: chat.title,
-        preview: chat.lastMessagePreview,
-        time: formatClock(chat.updatedAt ?? new Date().toISOString()),
-        unread: chat.unreadCount ?? 0,
-        presence: 'online',
-      })),
+    const nextChats = (payload.chats ?? []).map((chat: any) => mapChatFromServer(chat, payload.currentUserId ?? 'u1', nextUsers));
+    setChatItems(nextChats);
+    setSelectedChatId((current) =>
+      nextChats.some((chat: Chat) => chat.id === current) ? current : nextChats[0]?.id ?? '',
     );
     setMessagesByChat(
       Object.fromEntries(
@@ -417,66 +638,93 @@ function App() {
         imageUrl: item.imageUrls?.[0] ?? '',
       })),
     );
+    const nextCalls = (payload.calls ?? []).map((call: any) => mapCallFromServer(call, payload.currentUserId ?? 'u1', nextUsers));
+    setCalls(nextCalls);
+    const liveCall = nextCalls.find((call: CallItem) => call.state === 'ongoing' || call.state === 'ringing') ?? null;
+    setActiveCall(liveCall);
+    setIncomingCall(
+      nextCalls.find((call: CallItem) => call.state === 'ringing' && call.initiatorId !== (payload.currentUserId ?? 'u1')) ?? null,
+    );
     setStatuses(payload.statuses ?? []);
     setUpdatesFeed(payload.updatesFeed ?? []);
   };
+  applyBootstrapRef.current = applyBootstrap;
 
-  const closeStatusViewer = () => {
+  const closeStatusViewer = useCallback(() => {
     setActiveStatusGroupIndex(null);
     setActiveStatusItemIndex(0);
     setStatusProgress(0);
-  };
+    setStatusElapsedMs(0);
+    setStatusThreadVisible(false);
+    setStatusViewersVisible(false);
+    setStatusReactorsVisible(false);
+    setStatusHoldActive(false);
+    setStatusCommentDraft('');
+    setEditingStatusCommentId(null);
+    setEditingStatusCommentText('');
+  }, []);
 
   const openStatusViewer = (groupIndex: number) => {
     setActiveStatusGroupIndex(groupIndex);
     setActiveStatusItemIndex(0);
     setStatusProgress(0);
+    setStatusElapsedMs(0);
     setStatusCommentDraft('');
     setStatusViewersVisible(false);
+    setStatusReactorsVisible(false);
+    setEditingStatusCommentId(null);
   };
 
   const moveStatus = useCallback((direction: 'next' | 'previous') => {
-    if (activeStatusGroupIndex === null) {
+    const currentGroupIndex = statusGroupIndexRef.current;
+    const currentItemIndex = statusItemIndexRef.current;
+    const feed = updatesFeedRef.current;
+
+    if (currentGroupIndex === null) {
       return;
     }
 
-    const currentGroup = updatesFeed[activeStatusGroupIndex];
+    const currentGroup = feed[currentGroupIndex];
     if (!currentGroup) {
       closeStatusViewer();
       return;
     }
 
     if (direction === 'previous') {
-      if (activeStatusItemIndex > 0) {
+      if (currentItemIndex > 0) {
         setActiveStatusItemIndex((current) => current - 1);
         setStatusProgress(0);
+        setStatusElapsedMs(0);
         return;
       }
 
-      if (activeStatusGroupIndex > 0) {
-        const previousGroup = updatesFeed[activeStatusGroupIndex - 1];
-        setActiveStatusGroupIndex(activeStatusGroupIndex - 1);
+      if (currentGroupIndex > 0) {
+        const previousGroup = feed[currentGroupIndex - 1];
+        setActiveStatusGroupIndex(currentGroupIndex - 1);
         setActiveStatusItemIndex(Math.max(0, (previousGroup?.items.length ?? 1) - 1));
         setStatusProgress(0);
+        setStatusElapsedMs(0);
       }
       return;
     }
 
-    if (activeStatusItemIndex < currentGroup.items.length - 1) {
+    if (currentItemIndex < currentGroup.items.length - 1) {
       setActiveStatusItemIndex((current) => current + 1);
       setStatusProgress(0);
+      setStatusElapsedMs(0);
       return;
     }
 
-    if (activeStatusGroupIndex < updatesFeed.length - 1) {
-      setActiveStatusGroupIndex(activeStatusGroupIndex + 1);
+    if (currentGroupIndex < feed.length - 1) {
+      setActiveStatusGroupIndex(currentGroupIndex + 1);
       setActiveStatusItemIndex(0);
       setStatusProgress(0);
+      setStatusElapsedMs(0);
       return;
     }
 
     closeStatusViewer();
-  }, [activeStatusGroupIndex, activeStatusItemIndex, updatesFeed]);
+  }, [closeStatusViewer]);
 
   useEffect(() => {
     let cancelled = false;
@@ -508,7 +756,7 @@ function App() {
           setCurrentDeviceId(payload.session.deviceId);
         }
         if (payload.bootstrap) {
-          applyBootstrap(payload.bootstrap);
+          applyBootstrapRef.current(payload.bootstrap);
         }
         return;
       } catch {
@@ -517,7 +765,7 @@ function App() {
           .then((response) => response.json())
           .then((payload) => {
             if (!cancelled) {
-              applyBootstrap(payload);
+              applyBootstrapRef.current(payload);
             }
           })
           .catch(() => undefined);
@@ -537,7 +785,7 @@ function App() {
     socketRef.current = socket;
     socket.on('system:ready', (payload) => {
       if (payload.bootstrap && !currentDeviceId) {
-        applyBootstrap(payload.bootstrap);
+        applyBootstrapRef.current(payload.bootstrap);
       }
     });
     socket.on('message:new', (message) => {
@@ -564,6 +812,19 @@ function App() {
         ),
       );
     });
+    socket.on('chat:created', (chat) => {
+      if (!(chat.participants ?? []).includes(currentUserId)) {
+        return;
+      }
+
+      setChatItems((current) => {
+        const mapped = mapChatFromServer(chat, currentUserId, users);
+        if (current.some((item) => item.id === mapped.id)) {
+          return current;
+        }
+        return [mapped, ...current];
+      });
+    });
     socket.on('catalog:itemCreated', (item) => {
       setCatalogItems((current) => [
         {
@@ -577,6 +838,71 @@ function App() {
         },
         ...current,
       ]);
+    });
+    socket.on('call:created', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:incoming', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:updated', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:participantJoined', ({ callId, userId }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== callId || currentCall.initiatorId !== currentUserId) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const connection = await ensurePeerConnection(currentCall);
+          const offer = await connection.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: currentCall.kind === 'video',
+          });
+          await connection.setLocalDescription(offer);
+          emitCallSignal(callId, 'offer', offer, userId);
+        } catch {
+          setCallError('Unable to start the call media session.');
+        }
+      })();
+    });
+    socket.on('call:signal', ({ callId, fromUserId, signalType, payload }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== callId) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const connection = await ensurePeerConnection(currentCall);
+          if (signalType === 'offer') {
+            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            const answer = await connection.createAnswer();
+            await connection.setLocalDescription(answer);
+            emitCallSignal(callId, 'answer', answer, fromUserId);
+            return;
+          }
+
+          if (signalType === 'answer') {
+            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            return;
+          }
+
+          if (signalType === 'ice-candidate' && payload) {
+            await connection.addIceCandidate(new RTCIceCandidate(payload));
+          }
+        } catch {
+          setCallError('Call signaling lost sync. Please retry the call.');
+        }
+      })();
     });
     socket.on('updates:refresh', (feed) => {
       setUpdatesFeed(feed);
@@ -617,7 +943,8 @@ function App() {
     return () => {
       socket.disconnect();
     };
-  }, [activeView, currentDeviceId, currentUserId, profile.name, reconcileIncomingMessage, selectedChatId, upsertStatus]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, currentDeviceId, currentUserId, ensurePeerConnection, profile.name, reconcileIncomingMessage, selectedChatId, upsertCall, upsertStatus, users]);
 
   useEffect(() => {
     if (activeView !== 'chats') {
@@ -632,36 +959,206 @@ function App() {
   }, [activeView, messagesByChat, selectedChatId]);
 
   useEffect(() => {
-    if (!activeStatusItem) {
+    if (!activeStatusId) {
       return;
     }
 
-    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/view`, {
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusId}/view`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userId: currentUserId }),
     }).catch(() => undefined);
+  }, [activeStatusId, currentUserId]);
 
-    const duration = getStatusItemDuration(activeStatusItem);
-    const startedAt = Date.now();
+  useEffect(() => {
+    if (!activeStatusId) {
+      setStatusProgress(0);
+      setStatusElapsedMs(0);
+      return;
+    }
+
     setStatusProgress(0);
+    setStatusElapsedMs(0);
+  }, [activeStatusId]);
+
+  useEffect(() => {
+    if (!activeStatusId || !activeStatusDuration || statusPlaybackPaused) {
+      return;
+    }
 
     const timer = window.setInterval(() => {
-      const ratio = Math.min(1, (Date.now() - startedAt) / duration);
-      setStatusProgress(ratio);
-      if (ratio >= 1) {
-        window.clearInterval(timer);
-        moveStatus('next');
-      }
+      setStatusElapsedMs((current) => {
+        const nextValue = current + 80;
+        if (nextValue >= activeStatusDuration) {
+          window.clearInterval(timer);
+          setStatusProgress(1);
+          window.setTimeout(() => moveStatus('next'), 0);
+          return activeStatusDuration;
+        }
+
+        return nextValue;
+      });
     }, 80);
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeStatusGroupIndex, activeStatusItemIndex, activeStatusItem, currentUserId, moveStatus]);
+  }, [activeStatusDuration, activeStatusId, moveStatus, statusPlaybackPaused]);
+
+  useEffect(() => {
+    if (!activeStatusDuration) {
+      setStatusProgress(0);
+      return;
+    }
+
+    setStatusProgress(Math.min(1, statusElapsedMs / activeStatusDuration));
+  }, [activeStatusDuration, statusElapsedMs]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ongoing') {
+      setActiveCallSeconds(0);
+      return;
+    }
+
+    const baseSeconds = activeCall.durationSeconds ?? 0;
+    setActiveCallSeconds(baseSeconds);
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setActiveCallSeconds(baseSeconds + Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [activeCall]);
+
+  useEffect(() => {
+    attachStreamToVideo(localVideoRef.current, localCallStream);
+  }, [localCallStream]);
+
+  useEffect(() => {
+    attachStreamToVideo(remoteVideoRef.current, remoteCallStream);
+  }, [remoteCallStream]);
+
+  useEffect(() => {
+    if (!activeCall || !socketRef.current) {
+      return;
+    }
+
+    setCallError(null);
+    socketRef.current.emit('call:join', { callId: activeCall.id, userId: currentUserId });
+    if (activeCall.state === 'ringing' || activeCall.state === 'ongoing') {
+      void ensureCallMedia(activeCall.kind).catch(() => {
+        setCallError('Camera or microphone permission was denied.');
+      });
+    }
+
+    return () => {
+      socketRef.current?.emit('call:leave', { callId: activeCall.id, userId: currentUserId });
+      closePeerConnection();
+    };
+  }, [activeCall, currentUserId]);
+
+  function upsertCall(incomingCallItem: any, overrideUserId?: string, overrideUsers?: AppUser[]) {
+    const mapped = mapCallFromServer(incomingCallItem, overrideUserId ?? currentUserId, overrideUsers ?? users);
+    setCalls((current) => {
+      const existingIndex = current.findIndex((item) => item.id === mapped.id);
+      if (existingIndex >= 0) {
+        const next = [...current];
+        next[existingIndex] = mapped;
+        return next;
+      }
+      return [mapped, ...current];
+    });
+
+    if (mapped.state === 'ringing' && mapped.initiatorId !== (overrideUserId ?? currentUserId)) {
+      setIncomingCall(mapped);
+    }
+    if (mapped.state === 'ongoing' || mapped.state === 'ringing') {
+      setActiveCall(mapped);
+    }
+    if (['completed', 'missed', 'declined'].includes(mapped.state)) {
+      setActiveCall((current) => (current?.id === mapped.id ? null : current));
+      setIncomingCall((current) => (current?.id === mapped.id ? null : current));
+    }
+  }
+
+  const updateCallState = async (callId: string, state: CallState, durationSeconds?: number) => {
+    const response = await fetch(`${API_BASE_URL}/api/calls/${callId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state, durationSeconds }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.call) {
+      upsertCall(payload.call);
+    }
+  };
+
+  const startCall = async (kind: 'audio' | 'video') => {
+    if (!activeChat?.peerUserId) {
+      return;
+    }
+
+    setCallSheetVisible(false);
+    try {
+      await ensureCallMedia(kind);
+      setCallError(null);
+    } catch {
+      setCallError('Camera or microphone permission was denied.');
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/calls`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        participantIds: [currentUserId, activeChat.peerUserId],
+        initiatorId: currentUserId,
+        kind,
+        direction: 'outgoing',
+      }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.call) {
+      upsertCall(payload.call);
+    }
+  };
+
+  const acceptIncomingCall = async () => {
+    if (!incomingCall) {
+      return;
+    }
+
+    try {
+      await ensureCallMedia(incomingCall.kind);
+      setCallError(null);
+    } catch {
+      setCallError('Camera or microphone permission was denied.');
+      return;
+    }
+    await updateCallState(incomingCall.id, 'ongoing', incomingCall.durationSeconds);
+    setIncomingCall(null);
+  };
+
+  const endActiveCall = async () => {
+    if (!activeCall) {
+      return;
+    }
+
+    const finalState: CallState =
+      activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? 'declined' : 'completed';
+    await updateCallState(activeCall.id, finalState, activeCallSeconds);
+    closePeerConnection();
+  };
 
   const sendMessage = () => {
-    if (!messageDraft.trim()) {
+    if (!messageDraft.trim() || !activeChat) {
       return;
     }
 
@@ -726,6 +1223,76 @@ function App() {
     setCatalogAssetFiles([]);
   };
 
+  const submitAuth = async () => {
+    const endpoint =
+      authMode === 'login'
+        ? '/api/auth/login'
+        : authMode === 'register'
+          ? '/api/auth/register'
+          : '/api/auth/switch';
+    const body =
+      authMode === 'switch'
+        ? {
+            deviceId: currentDeviceId,
+            userId: authForm.phone,
+            platform: 'web',
+            label: 'Web browser',
+          }
+        : {
+            deviceId: currentDeviceId,
+            phone: authForm.phone.trim(),
+            name: authForm.name.trim(),
+            platform: 'web',
+            label: 'Web browser',
+          };
+
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.session?.deviceId) {
+      window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrap(payload.bootstrap);
+    }
+    setAuthVisible(false);
+    setAuthForm({ name: '', phone: '' });
+  };
+
+  const switchToUser = async (userId: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/switch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        userId,
+        platform: 'web',
+        label: 'Web browser',
+      }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.session?.deviceId) {
+      window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrap(payload.bootstrap);
+    }
+    setAuthVisible(false);
+  };
+
   const openAttachmentChooser = () => {
     attachmentInputRef.current?.click();
   };
@@ -776,6 +1343,10 @@ function App() {
   };
 
   const startRecording = async () => {
+    if (isRecording) {
+      return;
+    }
+
     if (!navigator.mediaDevices || typeof MediaRecorder === 'undefined') {
       window.alert('Voice note recording is not supported in this browser.');
       return;
@@ -795,6 +1366,7 @@ function App() {
       };
 
       recorder.onstop = () => {
+        const durationSeconds = Math.max(1, recordingSeconds);
         const blob = new Blob(recordingChunksRef.current, { type: 'audio/webm' });
         const audioUrl = URL.createObjectURL(blob);
         const clientRef = `web-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -810,7 +1382,7 @@ function App() {
               text: 'Voice note',
               time: 'Now',
               audioUrl,
-              durationLabel: '0:05',
+              durationLabel: formatDurationLabel(durationSeconds),
               receiptState: 'sent',
             },
           ],
@@ -828,16 +1400,25 @@ function App() {
                 kind: 'voice',
                 text: 'Voice note',
                 mediaUrls: uploadedUrls.length ? uploadedUrls : [audioUrl],
-                durationSeconds: 5,
+                durationSeconds,
               }),
             }),
           )
           .catch(() => undefined);
+        if (recordingTimerRef.current) {
+          window.clearInterval(recordingTimerRef.current);
+          recordingTimerRef.current = null;
+        }
         mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
         mediaStreamRef.current = null;
+        setRecordingSeconds(0);
       };
 
       recorder.start();
+      setRecordingSeconds(0);
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingSeconds((current) => current + 1);
+      }, 1000);
       setIsRecording(true);
     } catch {
       window.alert('Microphone permission is required to record voice notes.');
@@ -850,6 +1431,10 @@ function App() {
     }
 
     mediaRecorderRef.current.stop();
+    if (recordingTimerRef.current) {
+      window.clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
     setIsRecording(false);
   };
 
@@ -879,7 +1464,7 @@ function App() {
           onTouchEnd={stopRecording}
           type="button"
         >
-          {isRecording ? 'Stop' : 'Mic'}
+          {isRecording ? formatDurationLabel(recordingSeconds) : 'Mic'}
         </button>
       </div>
     );
@@ -921,6 +1506,64 @@ function App() {
       body: JSON.stringify({ userId: currentUserId, text: statusCommentDraft.trim() }),
     }).catch(() => undefined);
     setStatusCommentDraft('');
+    setStatusReplyVisible(false);
+  };
+
+  const postStatus = async () => {
+    const assetUrls = await uploadFiles(statusAssetFiles).catch((): string[] => []);
+    if (!statusText.trim() && !assetUrls.length) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: currentUserId,
+        text: statusText.trim(),
+        backgroundColor: statusBackgroundColor,
+        fontFamily: statusFontFamily === 'System' ? undefined : statusFontFamily,
+        fontSize: statusFontSize,
+        assets: assetUrls.map((url: string) => ({ kind: 'image', url })),
+        audience: 'contacts',
+      }),
+    }).catch(() => undefined);
+    setStatusText('');
+    setStatusAssetFiles([]);
+    setStatusComposerVisible(false);
+  };
+
+  const startEditingStatusComment = (commentId: string, text: string) => {
+    setEditingStatusCommentId(commentId);
+    setEditingStatusCommentText(text);
+  };
+
+  const saveStatusCommentEdit = () => {
+    if (!activeStatusItem || !editingStatusCommentId || !editingStatusCommentText.trim()) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/comments/${editingStatusCommentId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, text: editingStatusCommentText.trim() }),
+    }).catch(() => undefined);
+    setEditingStatusCommentId(null);
+    setEditingStatusCommentText('');
+  };
+
+  const deleteStatusComment = (commentId: string) => {
+    if (!activeStatusItem) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/comments/${commentId}?userId=${currentUserId}`, {
+      method: 'DELETE',
+    }).catch(() => undefined);
+    if (editingStatusCommentId === commentId) {
+      setEditingStatusCommentId(null);
+      setEditingStatusCommentText('');
+    }
   };
 
   const openViewerList = () => {
@@ -937,12 +1580,68 @@ function App() {
       .catch(() => undefined);
   };
 
+  const openReactorList = () => {
+    if (!activeStatusItem) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/reactors`)
+      .then((response) => response.json())
+      .then((payload) => {
+        setStatusReactors(payload.reactors ?? []);
+        setStatusReactorsVisible(true);
+      })
+      .catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (!statusViewersVisible || !activeStatusItem) {
+      return;
+    }
+
+    openViewerList();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeStatusItem, activeStatusItem?.views?.length, statusViewersVisible]);
+
+  useEffect(() => {
+    if (!statusReactorsVisible || !activeStatusItem) {
+      return;
+    }
+
+    openReactorList();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeStatusItem, activeStatusItem?.reactions?.length, statusReactorsVisible]);
+
+  const createDirectChat = async (peerUserId: string, seedMessage?: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/chats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, peerUserId }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    const mappedChat = mapChatFromServer(payload.chat, currentUserId, users);
+    setChatItems((current) => (current.some((item) => item.id === mappedChat.id) ? current : [mappedChat, ...current]));
+    setSelectedChatId(mappedChat.id);
+    setNewChatVisible(false);
+    setActiveView('chats');
+    if (seedMessage) {
+      setMessageDraft(seedMessage);
+    }
+  };
+
   const renderChatsView = () => (
     <>
       <section className="chat-sidebar">
         <header className="chat-sidebar-header">
           <h1>Chats</h1>
-          <button className="compose-square" type="button">✎</button>
+          <div className="sidebar-header-actions">
+            <button className="compose-square" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">👤</button>
+            <button className="compose-square" onClick={() => setNewChatVisible(true)} type="button">✎</button>
+          </div>
         </header>
 
         <div className="search-box desktop-search">
@@ -952,7 +1651,7 @@ function App() {
         <div className="chat-list desktop-chat-list">
           {chatItems.map((chat) => (
             <button
-              className={`chat-list-item desktop-chat-item ${chat.id === activeChat.id ? 'active' : ''}`}
+              className={`chat-list-item desktop-chat-item ${chat.id === activeChat?.id ? 'active' : ''}`}
               key={chat.id}
               onClick={() => setSelectedChatId(chat.id)}
               type="button"
@@ -974,6 +1673,8 @@ function App() {
       </section>
 
       <main className="desktop-chatboard">
+        {activeChat ? (
+          <>
         <header className="desktop-chat-header">
           <div className="desktop-chat-title">
             <div className="avatar desktop-avatar">{activeChat.name.slice(0, 2).toUpperCase()}</div>
@@ -1013,10 +1714,12 @@ function App() {
         </section>
 
         <footer className="composer desktop-composer">
-          <input
+          <textarea
             aria-label="Message composer"
             onChange={(event) => setMessageDraft(event.target.value)}
             placeholder="Type a message"
+            rows={1}
+            className="desktop-message-input"
             value={messageDraft}
           />
           {renderComposerControls()}
@@ -1036,6 +1739,19 @@ function App() {
             </button>
           ))}
         </div>
+          </>
+        ) : (
+          <section className="empty-chat-state">
+            <h3>No chats yet</h3>
+            <p>Switch account or start a new conversation after login.</p>
+            <button className="send-button" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">
+              Open Account
+            </button>
+            <button className="send-button secondary-button" onClick={() => setNewChatVisible(true)} type="button">
+              New Conversation
+            </button>
+          </section>
+        )}
       </main>
     </>
   );
@@ -1104,8 +1820,13 @@ function App() {
               <button
                 onClick={() => {
                   setActiveView('chats');
-                  setSelectedChatId('c4');
-                  setMessageDraft(`Hi, I want to buy ${item.title}. `);
+                  const seller = users.find((user) => user.name === item.seller && user.id !== currentUserId);
+                  if (seller) {
+                    void createDirectChat(seller.id, `Hi, I want to buy ${item.title}. `);
+                  } else {
+                    setActiveView('chats');
+                    setMessageDraft(`Hi, I want to buy ${item.title}. `);
+                  }
                 }}
                 type="button"
               >
@@ -1132,6 +1853,9 @@ function App() {
             <button key={section} type="button">{section}</button>
           ))}
         </div>
+        <button className="settings-auth-button" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">
+          Switch Or Login
+        </button>
       </aside>
 
       <section className="settings-profile">
@@ -1188,38 +1912,18 @@ function App() {
       <header className="panel-header">
         <div>
           <h2>Updates</h2>
-          <p>Post multiple photos or text status and watch them appear in realtime.</p>
+          <p>Share photos or launch the text composer like on mobile.</p>
         </div>
       </header>
 
-      <div className="updates-composer">
-        <textarea
-          onChange={(event) => setStatusText(event.target.value)}
-          placeholder="Share an update"
-          value={statusText}
-        />
+      <div className="updates-composer compact">
+        <div>
+          <strong>Create an update</strong>
+          <p>Use the camera for media or the pen for styled text status.</p>
+        </div>
         <div className="updates-actions">
           <button onClick={() => statusInputRef.current?.click()} type="button">Add Photos</button>
-          <button
-            onClick={async () => {
-              const assetUrls = await uploadFiles(statusAssetFiles).catch((): string[] => []);
-              fetch(`${API_BASE_URL}/api/statuses`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  userId: currentUserId,
-                  text: statusText,
-                  assets: assetUrls.map((url: string) => ({ kind: 'image', url })),
-                  audience: 'contacts',
-                }),
-              }).catch(() => undefined);
-              setStatusText('');
-              setStatusAssetFiles([]);
-            }}
-            type="button"
-          >
-            Post Update
-          </button>
+          <button onClick={() => setStatusComposerVisible(true)} type="button">Open Text Composer</button>
         </div>
       </div>
 
@@ -1231,7 +1935,7 @@ function App() {
           </div>
           <div className="status-board-actions">
             <button onClick={() => statusInputRef.current?.click()} type="button">📷+</button>
-            <button type="button">✎</button>
+            <button onClick={() => setStatusComposerVisible(true)} type="button">✎</button>
           </div>
         </div>
 
@@ -1312,8 +2016,53 @@ function App() {
         <div className="modal-overlay" onClick={() => setCallSheetVisible(false)}>
           <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
             <h3>Choose call type</h3>
-            <button onClick={() => setCallSheetVisible(false)} type="button">Audio Call</button>
-            <button onClick={() => setCallSheetVisible(false)} type="button">Video Call</button>
+            <p>{calls.length} synced call record{calls.length === 1 ? '' : 's'}</p>
+            <button onClick={() => void startCall('audio')} type="button">Audio Call</button>
+            <button onClick={() => void startCall('video')} type="button">Video Call</button>
+          </div>
+        </div>
+      ) : null}
+
+      {incomingCall ? (
+        <div className="modal-overlay">
+          <div className="dialog-card call-card">
+            <h3>Incoming {incomingCall.kind} call</h3>
+            <p>{incomingCall.peerName} is calling you now.</p>
+            <div className="call-card-actions">
+              <button className="status-viewer-action reply" onClick={() => void acceptIncomingCall()} type="button">Answer</button>
+              <button className="status-viewer-action" onClick={() => void updateCallState(incomingCall.id, 'declined', 0)} type="button">Decline</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {activeCall ? (
+        <div className="modal-overlay">
+          <div className="dialog-card call-card active">
+            <h3>{activeCall.kind === 'video' ? 'Video Call' : 'Audio Call'}</h3>
+            <p>{activeCall.peerName}</p>
+            <strong>{activeCall.state === 'ongoing' ? formatDurationLabel(activeCallSeconds) : 'Ringing...'}</strong>
+            {callError ? <p>{callError}</p> : null}
+            <div className={`call-media-grid ${activeCall.kind === 'video' ? 'video' : 'audio'}`}>
+              {activeCall.kind === 'video' ? (
+                <video autoPlay muted playsInline ref={localVideoRef} />
+              ) : (
+                <div className="call-audio-pill">Your mic is live</div>
+              )}
+              {activeCall.kind === 'video' ? (
+                <video autoPlay playsInline ref={remoteVideoRef} />
+              ) : (
+                <div className="call-audio-pill">{remoteCallStream ? `${activeCall.peerName} connected` : 'Waiting for peer'}</div>
+              )}
+            </div>
+            <div className="call-card-actions">
+              {activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? (
+                <button className="status-viewer-action reply" onClick={() => void acceptIncomingCall()} type="button">Answer</button>
+              ) : null}
+              <button className="status-viewer-action done" onClick={() => void endActiveCall()} type="button">
+                {activeCall.state === 'ongoing' ? 'End Call' : 'Cancel'}
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -1361,7 +2110,14 @@ function App() {
               </div>
             </div>
 
-            <div className="status-viewer-body">
+            <div
+              className="status-viewer-body"
+              onMouseDown={() => setStatusHoldActive(true)}
+              onMouseUp={() => setStatusHoldActive(false)}
+              onMouseLeave={() => setStatusHoldActive(false)}
+              onTouchStart={() => setStatusHoldActive(true)}
+              onTouchEnd={() => setStatusHoldActive(false)}
+            >
               <button className="status-hit-zone left" onClick={() => moveStatus('previous')} type="button" />
               <div className="status-viewer-media">
                 {activeStatusItem.assets[0]?.url ? (
@@ -1385,38 +2141,97 @@ function App() {
                     <button className="status-stat-button" onClick={openViewerList} type="button">
                       Views {activeStatusItem.views?.length ?? 0}
                     </button>
-                    <span>Replies {activeStatusItem.comments?.length ?? 0}</span>
-                    <span>Reactions {activeStatusItem.reactions?.length ?? 0}</span>
+                    <button className="status-stat-button" onClick={() => setStatusThreadVisible(true)} type="button">
+                      Replies {activeStatusItem.comments?.length ?? 0}
+                    </button>
+                    <button className="status-stat-button" onClick={openReactorList} type="button">
+                      Reactions {activeStatusItem.reactions?.length ?? 0}
+                    </button>
                   </div>
                   <div className="status-reaction-row">
                     {STATUS_REACTIONS.map((emoji) => (
-                      <button key={emoji} className="status-reaction-button" onClick={() => submitStatusReaction(emoji)} type="button">
+                      <button key={emoji} className={`status-reaction-button ${(activeStatusItem.reactions ?? []).some((reaction) => reaction.userId === currentUserId && reaction.emoji === emoji) ? 'active' : ''}`} onClick={() => submitStatusReaction(emoji)} type="button">
                         {emoji}
+                        <small>{(activeStatusItem.reactions ?? []).filter((reaction) => reaction.emoji === emoji).length}</small>
                       </button>
                     ))}
                   </div>
-                  <div className="status-comment-row">
-                    <input
-                      onChange={(event) => setStatusCommentDraft(event.target.value)}
-                      placeholder="Reply to status"
-                      value={statusCommentDraft}
-                    />
-                    <button onClick={submitStatusComment} type="button">Send</button>
+                  <div className="status-action-row">
+                    <button className="status-viewer-action" onClick={() => submitStatusReaction('❤️')} type="button">♡</button>
+                    <button className="status-viewer-action reply" onClick={() => setStatusReplyVisible(true)} type="button">Reply</button>
+                    <button className="status-viewer-action done" onClick={closeStatusViewer} type="button">Done</button>
                   </div>
                   {activeStatusItem.comments?.length ? (
-                    <div className="status-comment-list">
-                      {activeStatusItem.comments.slice(-3).map((comment) => (
-                        <div className="status-comment-item" key={comment.id}>
-                          <strong>{comment.userId === currentUserId ? 'You' : comment.userId}</strong>
-                          <span>{comment.text}</span>
-                        </div>
-                      ))}
+                    <div className="status-comment-preview">
+                      Latest reply: {activeStatusItem.comments[activeStatusItem.comments.length - 1]?.text}
                     </div>
                   ) : null}
                 </div>
               </div>
               <button className="status-hit-zone right" onClick={() => moveStatus('next')} type="button" />
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {statusComposerVisible ? (
+        <div className="modal-overlay" onClick={() => setStatusComposerVisible(false)}>
+          <div className="dialog-card status-composer-card" onClick={(event) => event.stopPropagation()}>
+            <div className="status-composer-header">
+              <h3>Create Text Status</h3>
+              <button onClick={() => setStatusComposerVisible(false)} type="button">Close</button>
+            </div>
+            <div className="status-composer-preview" style={{ background: statusBackgroundColor }}>
+              <p
+                style={{
+                  fontSize: `${statusFontSize}px`,
+                  fontFamily: statusFontFamily === 'System' ? 'inherit' : statusFontFamily,
+                }}
+              >
+                {statusText || 'Type your status'}
+              </p>
+            </div>
+            <textarea
+              onChange={(event) => setStatusText(event.target.value)}
+              placeholder="Share an update"
+              value={statusText}
+            />
+            <div className="status-composer-options">
+              {['#10233e', '#1b1737', '#234229', '#4b1f1f', '#5a3a12'].map((color) => (
+                <button
+                  key={color}
+                  className={`status-color-chip ${statusBackgroundColor === color ? 'active' : ''}`}
+                  onClick={() => setStatusBackgroundColor(color)}
+                  style={{ background: color }}
+                  type="button"
+                />
+              ))}
+            </div>
+            <div className="status-composer-options">
+              {['System', 'Georgia', 'Courier New', 'Trebuchet MS'].map((font) => (
+                <button
+                  key={font}
+                  className={statusFontFamily === font ? 'active' : ''}
+                  onClick={() => setStatusFontFamily(font)}
+                  type="button"
+                >
+                  <span style={{ fontFamily: font === 'System' ? 'inherit' : font }}>{font}</span>
+                </button>
+              ))}
+            </div>
+            <div className="status-composer-options">
+              {[22, 30, 38].map((size) => (
+                <button
+                  key={size}
+                  className={statusFontSize === size ? 'active' : ''}
+                  onClick={() => setStatusFontSize(size)}
+                  type="button"
+                >
+                  {size}
+                </button>
+              ))}
+            </div>
+            <button className="send-button" onClick={postStatus} type="button">Post Status</button>
           </div>
         </div>
       ) : null}
@@ -1431,6 +2246,159 @@ function App() {
                 <span>{formatClock(viewer.viewedAt)}</span>
               </div>
             )) : <p>No viewers yet.</p>}
+          </div>
+        </div>
+      ) : null}
+
+      {statusReactorsVisible ? (
+        <div className="modal-overlay" onClick={() => setStatusReactorsVisible(false)}>
+          <div className="dialog-card status-viewers-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Reactions</h3>
+            {statusReactors.length ? statusReactors.map((reactor) => (
+              <div className="status-viewer-row" key={`${reactor.userId}-${reactor.reactedAt}`}>
+                <strong>{reactor.emoji} {reactor.name}</strong>
+                <span>{formatClock(reactor.reactedAt)}</span>
+              </div>
+            )) : <p>No reactions yet.</p>}
+          </div>
+        </div>
+      ) : null}
+
+      {statusReplyVisible && activeStatusItem ? (
+        <div className="modal-overlay" onClick={() => setStatusReplyVisible(false)}>
+          <div className="dialog-card status-thread-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Reply</h3>
+            {activeStatusItem.comments?.length ? (
+              <div className="status-comment-sheet-list">
+                {activeStatusItem.comments.slice(-3).map((comment) => {
+                  const meta = getUserMeta(comment.userId);
+                  return (
+                    <div className="status-comment-item polished" key={comment.id}>
+                      <div className="status-comment-author">
+                        <div className="avatar inline-avatar">{meta.avatar}</div>
+                        <div>
+                          <strong>{meta.name}</strong>
+                          <small>{formatClock(comment.updatedAt ?? comment.createdAt)}</small>
+                        </div>
+                      </div>
+                      <span>{comment.text}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+            <div className="status-comment-editor">
+              <textarea
+                onChange={(event) => setStatusCommentDraft(event.target.value)}
+                placeholder="Write a reply"
+                value={statusCommentDraft}
+              />
+              <div className="status-comment-controls">
+                <button className="status-link-button" onClick={() => setStatusReplyVisible(false)} type="button">Discard</button>
+                <button className="status-link-button" onClick={submitStatusComment} type="button">Send</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {statusThreadVisible && activeStatusItem ? (
+        <div className="modal-overlay" onClick={() => setStatusThreadVisible(false)}>
+          <div className="dialog-card status-thread-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Replies</h3>
+            {activeStatusItem.comments?.length ? activeStatusItem.comments.map((comment) => {
+              const meta = getUserMeta(comment.userId);
+              const isMine = comment.userId === currentUserId;
+              const isEditing = editingStatusCommentId === comment.id;
+              return (
+                <div className="status-comment-item polished" key={comment.id}>
+                  <div className="status-comment-topline">
+                    <div className="status-comment-author">
+                      <div className="avatar inline-avatar">{meta.avatar}</div>
+                      <div>
+                        <strong>{meta.name}</strong>
+                        <small>{formatClock(comment.updatedAt ?? comment.createdAt)}{comment.updatedAt ? ' edited' : ''}</small>
+                      </div>
+                    </div>
+                    {isMine ? (
+                      <div className="status-comment-controls">
+                        <button className="status-link-button" onClick={() => startEditingStatusComment(comment.id, comment.text)} type="button">Edit</button>
+                        <button className="status-link-button danger" onClick={() => deleteStatusComment(comment.id)} type="button">Delete</button>
+                      </div>
+                    ) : null}
+                  </div>
+                  {isEditing ? (
+                    <div className="status-comment-editor">
+                      <textarea
+                        onChange={(event) => setEditingStatusCommentText(event.target.value)}
+                        value={editingStatusCommentText}
+                      />
+                      <div className="status-comment-controls">
+                        <button className="status-link-button" onClick={saveStatusCommentEdit} type="button">Save</button>
+                        <button className="status-link-button" onClick={() => { setEditingStatusCommentId(null); setEditingStatusCommentText(''); }} type="button">Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <span>{comment.text}</span>
+                  )}
+                </div>
+              );
+            }) : <p>No replies yet.</p>}
+          </div>
+        </div>
+      ) : null}
+
+      {newChatVisible ? (
+        <div className="modal-overlay" onClick={() => setNewChatVisible(false)}>
+          <div className="dialog-card auth-card" onClick={(event) => event.stopPropagation()}>
+            <h3>New Conversation</h3>
+            <div className="auth-account-list">
+              {users.filter((user) => user.id !== currentUserId).map((user) => (
+                <button key={user.id} onClick={() => void createDirectChat(user.id)} type="button">
+                  {user.name} · {user.phone}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {authVisible ? (
+        <div className="modal-overlay" onClick={() => setAuthVisible(false)}>
+          <div className="dialog-card auth-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Account</h3>
+            <div className="auth-tabs">
+              <button className={authMode === 'switch' ? 'active' : ''} onClick={() => setAuthMode('switch')} type="button">Switch</button>
+              <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">Login</button>
+              <button className={authMode === 'register' ? 'active' : ''} onClick={() => setAuthMode('register')} type="button">Register</button>
+            </div>
+            {authMode === 'switch' ? (
+              <div className="auth-account-list">
+                {users.map((user) => (
+                  <button key={user.id} onClick={() => void switchToUser(user.id)} type="button">
+                    {user.name} · {user.phone}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="auth-form">
+                {authMode === 'register' ? (
+                  <input
+                    onChange={(event) => setAuthForm((current) => ({ ...current, name: event.target.value }))}
+                    placeholder="Full name"
+                    value={authForm.name}
+                  />
+                ) : null}
+                <input
+                  onChange={(event) => setAuthForm((current) => ({ ...current, phone: event.target.value }))}
+                  placeholder="Phone number"
+                  value={authForm.phone}
+                />
+                <button className="send-button" onClick={() => void submitAuth()} type="button">
+                  Continue
+                </button>
+              </div>
+            )}
           </div>
         </div>
       ) : null}
