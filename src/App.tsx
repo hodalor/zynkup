@@ -1916,17 +1916,6 @@ function App() {
         </div>
       </header>
 
-      <div className="updates-composer compact">
-        <div>
-          <strong>Create an update</strong>
-          <p>Use the camera for media or the pen for styled text status.</p>
-        </div>
-        <div className="updates-actions">
-          <button onClick={() => statusInputRef.current?.click()} type="button">Add Photos</button>
-          <button onClick={() => setStatusComposerVisible(true)} type="button">Open Text Composer</button>
-        </div>
-      </div>
-
       <section className="status-board">
         <div className="status-board-header">
           <div>
@@ -2013,14 +2002,16 @@ function App() {
       {activeView === 'settings' ? renderSettingsView() : null}
 
       {callSheetVisible ? (
-        <div className="modal-overlay" onClick={() => setCallSheetVisible(false)}>
-          <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
-            <h3>Choose call type</h3>
-            <p>{calls.length} synced call record{calls.length === 1 ? '' : 's'}</p>
-            <button onClick={() => void startCall('audio')} type="button">Audio Call</button>
-            <button onClick={() => void startCall('video')} type="button">Video Call</button>
-          </div>
+        <div className="call-type-dropdown" onClick={(event) => event.stopPropagation()}>
+          <button onClick={() => void startCall('audio')} type="button">Audio Call</button>
+          <button onClick={() => void startCall('video')} type="button">Video Call</button>
+          <small>{calls.length} synced call record{calls.length === 1 ? '' : 's'}</small>
+          <button className="call-type-close" onClick={() => setCallSheetVisible(false)} type="button">Close</button>
         </div>
+      ) : null}
+
+      {callSheetVisible ? (
+        <div className="call-type-backdrop" onClick={() => setCallSheetVisible(false)} />
       ) : null}
 
       {incomingCall ? (
