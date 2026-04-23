@@ -25,6 +25,15 @@
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.zynkupmobile"
     },
+    "plugins": [
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "cameraPermission": "$(PRODUCT_NAME) requires camera access for video calls",
+          "microphonePermission": "$(PRODUCT_NAME) requires microphone access for audio and video calls"
+        }
+      ]
+    ],
     "web": {
       "favicon": "./assets/favicon.png"
     }

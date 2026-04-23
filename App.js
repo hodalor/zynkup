@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Audio, Video } from 'expo-av';
+import { Audio, ResizeMode, Video } from 'expo-av';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import * as Speech from 'expo-speech';
@@ -19,6 +19,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { mediaDevices, RTCPeerConnection, RTCIceCandidate, RTCSessionDescription, RTCView } from 'react-native-webrtc';
 import { io } from 'socket.io-client';
 
 const AnimatedText = Animated.createAnimatedComponent(Text);
@@ -55,6 +56,9 @@ const API_BASE_URL = Platform.select({
 const DEVICE_STORAGE_KEY = 'zynkup-mobile-device-id';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
+const WEBRTC_CONFIGURATION = {
+  iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+};
 
 const chats = [
   { id: 'c1', name: 'Mr.Hodalor', preview: '📷 Sunday outfit', unread: 0, presence: 'online', time: '19:02' },
@@ -223,14 +227,32 @@ export default function App() {
   const [emojiTrayVisible, setEmojiTrayVisible] = useState(false);
   const [mediaViewer, setMediaViewer] = useState(null);
   const [callSheetVisible, setCallSheetVisible] = useState(false);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [activeCall, setActiveCall] = useState(null);
+  const [activeCallSeconds, setActiveCallSeconds] = useState(0);
+  const [localCallStream, setLocalCallStream] = useState(null);
+  const [remoteCallStream, setRemoteCallStream] = useState(null);
+  const [callError, setCallError] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [recordingLabel, setRecordingLabel] = useState('');
   const [activeStatusGroupIndex, setActiveStatusGroupIndex] = useState(null);
   const [activeStatusItemIndex, setActiveStatusItemIndex] = useState(0);
   const [statusProgress, setStatusProgress] = useState(0);
+  const [statusElapsedMs, setStatusElapsedMs] = useState(0);
   const [statusCommentDraft, setStatusCommentDraft] = useState('');
   const [statusViewersVisible, setStatusViewersVisible] = useState(false);
   const [statusViewers, setStatusViewers] = useState([]);
+  const [statusReactorsVisible, setStatusReactorsVisible] = useState(false);
+  const [statusReactors, setStatusReactors] = useState([]);
+  const [statusThreadVisible, setStatusThreadVisible] = useState(false);
+  const [statusReplyVisible, setStatusReplyVisible] = useState(false);
+  const [statusHoldActive, setStatusHoldActive] = useState(false);
+  const [editingStatusCommentId, setEditingStatusCommentId] = useState(null);
+  const [editingStatusCommentText, setEditingStatusCommentText] = useState('');
+  const [newChatVisible, setNewChatVisible] = useState(false);
+  const [authVisible, setAuthVisible] = useState(false);
+  const [authMode, setAuthMode] = useState('switch');
+  const [authForm, setAuthForm] = useState({ name: '', phone: '' });
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
@@ -238,13 +260,28 @@ export default function App() {
   const autoplayedRef = useRef(new Set());
   const recordingRef = useRef(null);
   const recordingStartedAtRef = useRef(0);
+  const recordingIntervalRef = useRef(null);
   const currentSoundRef = useRef(null);
   const socketRef = useRef(null);
+  const updatesFeedRef = useRef([]);
+  const statusGroupIndexRef = useRef(null);
+  const statusItemIndexRef = useRef(0);
+  const activeCallRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const callMediaStreamRef = useRef(null);
 
   const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? chats[0];
   const messages = messagesByChat[selectedChatId] ?? [];
   const activeStatusGroup = activeStatusGroupIndex === null ? null : updatesFeed[activeStatusGroupIndex] ?? null;
   const activeStatusItem = activeStatusGroup?.items?.[activeStatusItemIndex] ?? null;
+  const statusPlaybackPaused =
+    statusHoldActive ||
+    statusThreadVisible ||
+    statusReplyVisible ||
+    statusViewersVisible ||
+    statusReactorsVisible ||
+    Boolean(statusCommentDraft.trim()) ||
+    Boolean(editingStatusCommentId);
 
   const filteredCatalogItems = useMemo(() => {
     return catalogItems.filter((item) => {
@@ -258,6 +295,67 @@ export default function App() {
       return matchesCategory && matchesSearch;
     });
   }, [catalogCategory, catalogItems, catalogSearch]);
+
+  const closePeerConnection = () => {
+    peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop?.());
+    peerConnectionRef.current?.close?.();
+    peerConnectionRef.current = null;
+    callMediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
+    callMediaStreamRef.current = null;
+    setLocalCallStream(null);
+    setRemoteCallStream(null);
+  };
+
+  const ensureCallMedia = async (kind) => {
+    if (callMediaStreamRef.current) {
+      return callMediaStreamRef.current;
+    }
+
+    const stream = await mediaDevices.getUserMedia({
+      audio: true,
+      video: kind === 'Video',
+    });
+    callMediaStreamRef.current = stream;
+    setLocalCallStream(stream);
+    return stream;
+  };
+
+  const emitCallSignal = (callId, signalType, payload, toUserId) => {
+    socketRef.current?.emit('call:signal', {
+      callId,
+      fromUserId: currentUserId,
+      toUserId,
+      signalType,
+      payload,
+    });
+  };
+
+  const ensurePeerConnection = async (call) => {
+    if (peerConnectionRef.current) {
+      return peerConnectionRef.current;
+    }
+
+    const connection = new RTCPeerConnection(WEBRTC_CONFIGURATION);
+    const remoteStream = await mediaDevices.getUserMedia({ audio: false, video: false }).catch(() => null);
+    connection.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (stream) {
+        setRemoteCallStream(stream);
+      } else if (remoteStream) {
+        remoteStream.addTrack(event.track);
+        setRemoteCallStream(remoteStream);
+      }
+    };
+    connection.onicecandidate = (event) => {
+      if (event.candidate) {
+        emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), call.peerUserId);
+      }
+    };
+    const localStream = await ensureCallMedia(call.kind);
+    localStream.getTracks().forEach((track) => connection.addTrack(track, localStream));
+    peerConnectionRef.current = connection;
+    return connection;
+  };
 
   const uploadUris = async (uris, options = {}) => {
     if (!uris.length) {
@@ -291,6 +389,50 @@ export default function App() {
 
   const getStatusItemDuration = (item) =>
     item.assets?.some((asset) => asset.kind === 'video') ? STATUS_VIDEO_DURATION_MS : STATUS_IMAGE_DURATION_MS;
+
+  const getChatTitle = (chat, userId, userMap) => {
+    if (chat.kind !== 'direct') {
+      return chat.title;
+    }
+
+    const peerId = (chat.participants ?? []).find((participantId) => participantId !== userId);
+    return userMap[peerId]?.name ?? chat.title;
+  };
+
+  const mapChatFromServer = (chat, userId, userMap) => ({
+    id: chat.id,
+    name: getChatTitle(chat, userId, userMap),
+    preview: chat.lastMessagePreview,
+    unread: chat.unreadCount ?? 0,
+    presence: 'online',
+    time: formatClock(chat.updatedAt ?? new Date().toISOString()),
+    peerUserId: chat.kind === 'direct'
+      ? (chat.participants ?? []).find((participantId) => participantId !== userId)
+      : undefined,
+  });
+
+  const mapCallFromServer = (call, userId, userMap) => {
+    const peerUserId = (call.participantIds ?? []).find((participantId) => participantId !== userId);
+    return {
+      id: call.id,
+      participantIds: call.participantIds ?? [],
+      initiatorId: call.initiatorId ?? call.participantIds?.[0] ?? userId,
+      peerUserId,
+      name: userMap[peerUserId]?.name ?? 'Call',
+      kind: call.kind === 'audio' ? 'Audio' : 'Video',
+      state: call.state,
+      time: formatClock(call.startedAt),
+      startedAt: call.startedAt,
+      durationSeconds: call.durationSeconds ?? 0,
+      answeredAt: call.answeredAt,
+      endedAt: call.endedAt,
+    };
+  };
+
+  const getUserMeta = (userId) => ({
+    name: userId === currentUserId ? 'You' : (usersById[userId]?.name ?? userId),
+    avatar: usersById[userId]?.avatar ?? (userId === currentUserId ? profile.name.slice(0, 2).toUpperCase() : 'ZU'),
+  });
 
   const syncReceiptState = async (messageId, state) => {
     await fetch(`${API_BASE_URL}/api/messages/${messageId}/receipt`, {
@@ -373,6 +515,95 @@ export default function App() {
           ],
     );
   };
+
+  const applyBootstrapPayload = (payload) => {
+    const nextCurrentUserId = payload.currentUserId ?? 'u1';
+    const nextUsersById = Object.fromEntries((payload.users ?? []).map((user) => [user.id, user]));
+    setCurrentUserId(nextCurrentUserId);
+    setCurrentDeviceId(payload.currentDeviceId ?? null);
+    setUsersById(nextUsersById);
+    setProfile((current) => ({
+      ...current,
+      name: payload.profile?.name ?? current.name,
+      username: payload.profile?.username ?? current.username,
+      about: payload.profile?.about ?? current.about,
+      phone: payload.profile?.phone ?? current.phone,
+    }));
+    const nextChats = (payload.chats ?? []).map((chat) => mapChatFromServer(chat, nextCurrentUserId, nextUsersById));
+    setChatItems(nextChats);
+    setSelectedChatId((current) => (nextChats.some((chat) => chat.id === current) ? current : nextChats[0]?.id ?? ''));
+    setContactItems(
+      (payload.contacts ?? []).map((contact) => ({
+        id: contact.id,
+        name: contact.name,
+        phone: contact.phone,
+        registered: contact.registered,
+        presence: contact.presence,
+      })),
+    );
+    setMessagesByChat(
+      Object.fromEntries(
+        Object.entries(payload.messagesByChat ?? {}).map(([chatId, list]) => [
+          chatId,
+          list.map((message) => ({
+            id: message.id,
+            clientRef: message.clientRef,
+            mine: message.senderId === nextCurrentUserId,
+            kind: message.kind === 'file' ? 'text' : message.kind,
+            text: message.text,
+            time: formatClock(message.sentAt),
+            imageUri: message.mediaUrls?.[0],
+            audioUri: message.mediaUrls?.[0],
+            durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
+            receiptState: message.state,
+          })),
+        ]),
+      ),
+    );
+    const nextCalls = (payload.calls ?? []).map((call) => mapCallFromServer(call, nextCurrentUserId, nextUsersById));
+    setCalls(nextCalls);
+    const liveCall = nextCalls.find((call) => call.state === 'ongoing' || call.state === 'ringing') ?? null;
+    setActiveCall(liveCall);
+    setIncomingCall(nextCalls.find((call) => call.state === 'ringing' && call.initiatorId !== nextCurrentUserId) ?? null);
+    setStatuses(
+      (payload.statuses ?? []).map((status) => ({
+        ...status,
+        author: payload.users?.find((user) => user.id === status.userId)?.name ?? 'User',
+        text: status.text || status.assets?.[0]?.caption || 'Media status',
+        postedAt: formatClock(status.createdAt),
+        assets: status.assets ?? [],
+      })),
+    );
+    setUpdatesFeed(payload.updatesFeed ?? []);
+    setCatalogItems(
+      (payload.catalogItems ?? []).map((item) => ({
+        id: item.id,
+        title: item.title,
+        price: `${item.currency ?? 'ZMW'} ${item.price}`,
+        category: item.category,
+        seller: payload.users?.find((user) => user.id === item.sellerId)?.name ?? 'Seller',
+        description: item.description,
+        imageUri: item.imageUrls?.[0] ?? null,
+        imageUris: item.imageUrls ?? [],
+      })),
+    );
+  };
+
+  useEffect(() => {
+    updatesFeedRef.current = updatesFeed;
+  }, [updatesFeed]);
+
+  useEffect(() => {
+    statusGroupIndexRef.current = activeStatusGroupIndex;
+  }, [activeStatusGroupIndex]);
+
+  useEffect(() => {
+    statusItemIndexRef.current = activeStatusItemIndex;
+  }, [activeStatusItemIndex]);
+
+  useEffect(() => {
+    activeCallRef.current = activeCall;
+  }, [activeCall]);
 
   const stopEmojiPlayback = () => {
     timeoutsRef.current.forEach((timeout) => clearTimeout(timeout));
@@ -474,89 +705,6 @@ export default function App() {
   }, [messages, chatScreen, selectedChatId]);
 
   useEffect(() => {
-    const applyBootstrap = (payload) => {
-      setCurrentUserId(payload.currentUserId ?? 'u1');
-      setCurrentDeviceId(payload.currentDeviceId ?? null);
-      setUsersById(Object.fromEntries((payload.users ?? []).map((user) => [user.id, user])));
-      setProfile((current) => ({
-        ...current,
-        name: payload.profile?.name ?? current.name,
-        username: payload.profile?.username ?? current.username,
-        about: payload.profile?.about ?? current.about,
-        phone: payload.profile?.phone ?? current.phone,
-      }));
-      setChatItems(
-        (payload.chats ?? []).map((chat) => ({
-          id: chat.id,
-          name: chat.title,
-          preview: chat.lastMessagePreview,
-          unread: chat.unreadCount ?? 0,
-          presence: 'online',
-          time: formatClock(chat.updatedAt ?? new Date().toISOString()),
-        })),
-      );
-      setContactItems(
-        (payload.contacts ?? []).map((contact) => ({
-          id: contact.id,
-          name: contact.name,
-          phone: contact.phone,
-          registered: contact.registered,
-          presence: contact.presence,
-        })),
-      );
-      setMessagesByChat(
-        Object.fromEntries(
-          Object.entries(payload.messagesByChat ?? {}).map(([chatId, list]) => [
-            chatId,
-            list.map((message) => ({
-              id: message.id,
-              clientRef: message.clientRef,
-              mine: message.senderId === (payload.currentUserId ?? 'u1'),
-              kind: message.kind === 'file' ? 'text' : message.kind,
-              text: message.text,
-              time: formatClock(message.sentAt),
-              imageUri: message.mediaUrls?.[0],
-              audioUri: message.mediaUrls?.[0],
-              durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
-              receiptState: message.state,
-            })),
-          ]),
-        ),
-      );
-      setCalls(
-        (payload.calls ?? []).map((call) => ({
-          id: call.id,
-          name: payload.users?.find((user) => call.participantIds.includes(user.id) && user.id !== (payload.currentUserId ?? 'u1'))?.name ?? 'Call',
-          kind: call.kind === 'audio' ? 'Audio' : 'Video',
-          state: call.state.charAt(0).toUpperCase() + call.state.slice(1),
-          time: formatClock(call.startedAt),
-        })),
-      );
-      setStatuses(
-        (payload.statuses ?? []).map((status) => ({
-          id: status.id,
-          userId: status.userId,
-          author: payload.users?.find((user) => user.id === status.userId)?.name ?? 'User',
-          text: status.text || status.assets?.[0]?.caption || 'Media status',
-          postedAt: formatClock(status.createdAt),
-          assets: status.assets ?? [],
-        })),
-      );
-      setUpdatesFeed(payload.updatesFeed ?? []);
-      setCatalogItems(
-        (payload.catalogItems ?? []).map((item) => ({
-          id: item.id,
-          title: item.title,
-          price: `${item.currency ?? 'ZMW'} ${item.price}`,
-          category: item.category,
-          seller: payload.users?.find((user) => user.id === item.sellerId)?.name ?? 'Seller',
-          description: item.description,
-          imageUri: item.imageUrls?.[0] ?? null,
-          imageUris: item.imageUrls ?? [],
-        })),
-      );
-    };
-
     let cancelled = false;
 
     const bootstrapSession = async () => {
@@ -585,7 +733,7 @@ export default function App() {
           setCurrentDeviceId(payload.session.deviceId);
         }
         if (payload.bootstrap) {
-          applyBootstrap(payload.bootstrap);
+          applyBootstrapPayload(payload.bootstrap);
         }
         return;
       } catch {
@@ -594,7 +742,7 @@ export default function App() {
           .then((response) => response.json())
           .then((payload) => {
             if (!cancelled) {
-              applyBootstrap(payload);
+              applyBootstrapPayload(payload);
             }
           })
           .catch(() => undefined);
@@ -607,7 +755,7 @@ export default function App() {
     socketRef.current = socket;
     socket.on('system:ready', (payload) => {
       if (payload.bootstrap && !currentDeviceId) {
-        applyBootstrap(payload.bootstrap);
+        applyBootstrapPayload(payload.bootstrap);
       }
     });
     socket.on('message:new', (message) => {
@@ -633,6 +781,19 @@ export default function App() {
             : item,
         ),
       );
+    });
+    socket.on('chat:created', (chat) => {
+      if (!(chat.participants ?? []).includes(currentUserId)) {
+        return;
+      }
+
+      setChatItems((current) => {
+        const mapped = mapChatFromServer(chat, currentUserId, usersById);
+        if (current.some((item) => item.id === mapped.id)) {
+          return current;
+        }
+        return [mapped, ...current];
+      });
     });
     socket.on('status:new', (status) => {
       upsertStatus(status);
@@ -683,6 +844,71 @@ export default function App() {
     socket.on('status:updated', (status) => {
       upsertStatus(status);
     });
+    socket.on('call:created', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:incoming', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:updated', (call) => {
+      if ((call.participantIds ?? []).includes(currentUserId)) {
+        upsertCall(call);
+      }
+    });
+    socket.on('call:participantJoined', ({ callId, userId }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== callId || currentCall.initiatorId !== currentUserId) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const connection = await ensurePeerConnection(currentCall);
+          const offer = await connection.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: currentCall.kind === 'Video',
+          });
+          await connection.setLocalDescription(offer);
+          emitCallSignal(callId, 'offer', offer, userId);
+        } catch {
+          setCallError('Unable to start call media.');
+        }
+      })();
+    });
+    socket.on('call:signal', ({ callId, fromUserId, signalType, payload }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== callId) {
+        return;
+      }
+
+      void (async () => {
+        try {
+          const connection = await ensurePeerConnection(currentCall);
+          if (signalType === 'offer') {
+            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            const answer = await connection.createAnswer();
+            await connection.setLocalDescription(answer);
+            emitCallSignal(callId, 'answer', answer, fromUserId);
+            return;
+          }
+
+          if (signalType === 'answer') {
+            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            return;
+          }
+
+          if (signalType === 'ice-candidate' && payload) {
+            await connection.addIceCandidate(new RTCIceCandidate(payload));
+          }
+        } catch {
+          setCallError('Call signaling lost sync.');
+        }
+      })();
+    });
 
     return () => {
       cancelled = true;
@@ -712,22 +938,85 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userId: currentUserId }),
     }).catch(() => undefined);
+  }, [activeStatusItem?.id, currentUserId]);
+
+  useEffect(() => {
+    if (!activeStatusItem?.id) {
+      setStatusProgress(0);
+      setStatusElapsedMs(0);
+      return;
+    }
+
+    setStatusProgress(0);
+    setStatusElapsedMs(0);
+  }, [activeStatusItem?.id]);
+
+  useEffect(() => {
+    if (!activeStatusItem || statusPlaybackPaused) {
+      return undefined;
+    }
 
     const duration = getStatusItemDuration(activeStatusItem);
-    const startedAt = Date.now();
-    setStatusProgress(0);
-
     const timer = setInterval(() => {
-      const ratio = Math.min(1, (Date.now() - startedAt) / duration);
-      setStatusProgress(ratio);
-      if (ratio >= 1) {
-        clearInterval(timer);
-        moveStatus('next');
-      }
+      setStatusElapsedMs((current) => {
+        const nextValue = current + 80;
+        if (nextValue >= duration) {
+          clearInterval(timer);
+          setStatusProgress(1);
+          setTimeout(() => moveStatus('next'), 0);
+          return duration;
+        }
+        return nextValue;
+      });
     }, 80);
 
     return () => clearInterval(timer);
-  }, [activeStatusGroupIndex, activeStatusItemIndex, activeStatusItem, currentUserId]);
+  }, [activeStatusItem, statusPlaybackPaused]);
+
+  useEffect(() => {
+    if (!activeStatusItem) {
+      setStatusProgress(0);
+      return;
+    }
+
+    const duration = getStatusItemDuration(activeStatusItem);
+    setStatusProgress(Math.min(1, statusElapsedMs / duration));
+  }, [activeStatusItem, statusElapsedMs]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ongoing') {
+      setActiveCallSeconds(0);
+      return undefined;
+    }
+
+    const baseSeconds = activeCall.durationSeconds ?? 0;
+    setActiveCallSeconds(baseSeconds);
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      setActiveCallSeconds(baseSeconds + Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [activeCall]);
+
+  useEffect(() => {
+    if (!activeCall || !socketRef.current) {
+      return undefined;
+    }
+
+    setCallError('');
+    socketRef.current.emit('call:join', { callId: activeCall.id, userId: currentUserId });
+    if (activeCall.state === 'ringing' || activeCall.state === 'ongoing') {
+      void ensureCallMedia(activeCall.kind).catch(() => {
+        setCallError('Camera or microphone permission was denied.');
+      });
+    }
+
+    return () => {
+      socketRef.current?.emit('call:leave', { callId: activeCall.id, userId: currentUserId });
+      closePeerConnection();
+    };
+  }, [activeCall, currentUserId]);
 
   const appendMessage = (message) => {
     setMessagesByChat((current) => ({
@@ -736,57 +1025,119 @@ export default function App() {
     }));
   };
 
+  const upsertCall = (incomingCallPayload) => {
+    const mapped = mapCallFromServer(incomingCallPayload, currentUserId, usersById);
+    setCalls((current) => {
+      const existingIndex = current.findIndex((item) => item.id === mapped.id);
+      if (existingIndex >= 0) {
+        const next = [...current];
+        next[existingIndex] = mapped;
+        return next;
+      }
+      return [mapped, ...current];
+    });
+
+    if (mapped.state === 'ringing' && mapped.initiatorId !== currentUserId) {
+      setIncomingCall(mapped);
+    }
+    if (mapped.state === 'ringing' || mapped.state === 'ongoing') {
+      setActiveCall(mapped);
+    }
+    if (['completed', 'missed', 'declined'].includes(mapped.state)) {
+      setIncomingCall((current) => (current?.id === mapped.id ? null : current));
+      setActiveCall((current) => (current?.id === mapped.id ? null : current));
+    }
+  };
+
+  const updateCallState = async (callId, state, durationSeconds) => {
+    const response = await fetch(`${API_BASE_URL}/api/calls/${callId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state, durationSeconds }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.call) {
+      upsertCall(payload.call);
+    }
+  };
+
   const closeStatusViewer = () => {
     setActiveStatusGroupIndex(null);
     setActiveStatusItemIndex(0);
     setStatusProgress(0);
+    setStatusElapsedMs(0);
+    setStatusThreadVisible(false);
+    setStatusReplyVisible(false);
+    setStatusViewersVisible(false);
+    setStatusReactorsVisible(false);
+    setStatusHoldActive(false);
+    setStatusCommentDraft('');
+    setEditingStatusCommentId(null);
+    setEditingStatusCommentText('');
   };
 
   const openStatusViewer = (groupIndex) => {
     setActiveStatusGroupIndex(groupIndex);
     setActiveStatusItemIndex(0);
     setStatusProgress(0);
+    setStatusElapsedMs(0);
     setStatusCommentDraft('');
     setStatusViewersVisible(false);
+    setStatusThreadVisible(false);
+    setStatusReplyVisible(false);
+    setStatusReactorsVisible(false);
+    setEditingStatusCommentId(null);
   };
 
   const moveStatus = (direction) => {
-    if (activeStatusGroupIndex === null) {
+    const currentGroupIndex = statusGroupIndexRef.current;
+    const currentItemIndex = statusItemIndexRef.current;
+    const feed = updatesFeedRef.current;
+
+    if (currentGroupIndex === null) {
       return;
     }
 
-    const currentGroup = updatesFeed[activeStatusGroupIndex];
+    const currentGroup = feed[currentGroupIndex];
     if (!currentGroup) {
       closeStatusViewer();
       return;
     }
 
     if (direction === 'previous') {
-      if (activeStatusItemIndex > 0) {
+      if (currentItemIndex > 0) {
         setActiveStatusItemIndex((current) => current - 1);
         setStatusProgress(0);
+        setStatusElapsedMs(0);
         return;
       }
 
-      if (activeStatusGroupIndex > 0) {
-        const previousGroup = updatesFeed[activeStatusGroupIndex - 1];
-        setActiveStatusGroupIndex(activeStatusGroupIndex - 1);
+      if (currentGroupIndex > 0) {
+        const previousGroup = feed[currentGroupIndex - 1];
+        setActiveStatusGroupIndex(currentGroupIndex - 1);
         setActiveStatusItemIndex(Math.max(0, (previousGroup?.items?.length ?? 1) - 1));
         setStatusProgress(0);
+        setStatusElapsedMs(0);
       }
       return;
     }
 
-    if (activeStatusItemIndex < currentGroup.items.length - 1) {
+    if (currentItemIndex < currentGroup.items.length - 1) {
       setActiveStatusItemIndex((current) => current + 1);
       setStatusProgress(0);
+      setStatusElapsedMs(0);
       return;
     }
 
-    if (activeStatusGroupIndex < updatesFeed.length - 1) {
-      setActiveStatusGroupIndex(activeStatusGroupIndex + 1);
+    if (currentGroupIndex < feed.length - 1) {
+      setActiveStatusGroupIndex(currentGroupIndex + 1);
       setActiveStatusItemIndex(0);
       setStatusProgress(0);
+      setStatusElapsedMs(0);
       return;
     }
 
@@ -1041,6 +1392,40 @@ export default function App() {
       body: JSON.stringify({ userId: currentUserId, text: statusCommentDraft.trim() }),
     }).catch(() => undefined);
     setStatusCommentDraft('');
+    setStatusReplyVisible(false);
+  };
+
+  const startEditingStatusComment = (commentId, text) => {
+    setEditingStatusCommentId(commentId);
+    setEditingStatusCommentText(text);
+  };
+
+  const saveStatusCommentEdit = () => {
+    if (!activeStatusItem || !editingStatusCommentId || !editingStatusCommentText.trim()) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/comments/${editingStatusCommentId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, text: editingStatusCommentText.trim() }),
+    }).catch(() => undefined);
+    setEditingStatusCommentId(null);
+    setEditingStatusCommentText('');
+  };
+
+  const removeStatusComment = (commentId) => {
+    if (!activeStatusItem) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/comments/${commentId}?userId=${currentUserId}`, {
+      method: 'DELETE',
+    }).catch(() => undefined);
+    if (editingStatusCommentId === commentId) {
+      setEditingStatusCommentId(null);
+      setEditingStatusCommentText('');
+    }
   };
 
   const openViewerList = () => {
@@ -1057,24 +1442,189 @@ export default function App() {
       .catch(() => undefined);
   };
 
-  const startCall = (kind) => {
-    setCalls((current) => [
-      { id: `call${Date.now()}`, name: activeChat.name, kind, state: 'Ongoing', time: 'Now' },
-      ...current,
-    ]);
-    setCallSheetVisible(false);
-    setActiveView('Calls');
-    setChatScreen('list');
-    fetch(`${API_BASE_URL}/api/calls`, {
+  const openReactorList = () => {
+    if (!activeStatusItem) {
+      return;
+    }
+
+    fetch(`${API_BASE_URL}/api/statuses/${activeStatusItem.id}/reactors`)
+      .then((response) => response.json())
+      .then((payload) => {
+        setStatusReactors(payload.reactors ?? []);
+        setStatusReactorsVisible(true);
+      })
+      .catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (!statusViewersVisible || !activeStatusItem) {
+      return;
+    }
+
+    openViewerList();
+  }, [activeStatusItem?.views?.length, statusViewersVisible]);
+
+  useEffect(() => {
+    if (!statusReactorsVisible || !activeStatusItem) {
+      return;
+    }
+
+    openReactorList();
+  }, [activeStatusItem?.reactions?.length, statusReactorsVisible]);
+
+  const createDirectChat = async (peerUserId, seedMessage) => {
+    const response = await fetch(`${API_BASE_URL}/api/chats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, peerUserId }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    const mappedChat = mapChatFromServer(payload.chat, currentUserId, usersById);
+    setChatItems((current) => (current.some((item) => item.id === mappedChat.id) ? current : [mappedChat, ...current]));
+    setSelectedChatId(mappedChat.id);
+    setChatScreen('detail');
+    setActiveView('Chats');
+    setNewChatVisible(false);
+    if (seedMessage) {
+      setMessageDraft(seedMessage);
+    }
+  };
+
+  const submitAuth = async () => {
+    const endpoint =
+      authMode === 'login'
+        ? '/api/auth/login'
+        : authMode === 'register'
+          ? '/api/auth/register'
+          : '/api/auth/switch';
+    const body =
+      authMode === 'switch'
+        ? {
+            deviceId: currentDeviceId,
+            userId: authForm.phone,
+            platform: Platform.OS,
+            label: `${Platform.OS} device`,
+          }
+        : {
+            deviceId: currentDeviceId,
+            phone: authForm.phone.trim(),
+            name: authForm.name.trim(),
+            platform: Platform.OS,
+            label: `${Platform.OS} device`,
+          };
+
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.session?.deviceId) {
+      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrapPayload(payload.bootstrap);
+    }
+    setAuthVisible(false);
+    setAuthForm({ name: '', phone: '' });
+  };
+
+  const switchToUser = async (userId) => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/switch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        participantIds: [currentUserId, activeChat.id === 'c1' ? 'u2' : activeChat.id === 'c3' ? 'u4' : 'u3'],
+        deviceId: currentDeviceId,
+        userId,
+        platform: Platform.OS,
+        label: `${Platform.OS} device`,
+      }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.session?.deviceId) {
+      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrapPayload(payload.bootstrap);
+    }
+    setAuthVisible(false);
+  };
+
+  const startCall = async (kind) => {
+    setCallSheetVisible(false);
+    if (!activeChat?.peerUserId) {
+      return;
+    }
+
+    try {
+      await ensureCallMedia(kind);
+      setCallError('');
+    } catch {
+      setCallError('Camera or microphone permission was denied.');
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/calls`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        participantIds: [currentUserId, activeChat.peerUserId],
+        initiatorId: currentUserId,
         kind: kind.toLowerCase(),
         direction: 'outgoing',
       }),
-    }).catch(() => undefined);
-    Alert.alert(`${kind} call`, `Starting a ${kind.toLowerCase()} call with ${activeChat.name}.`);
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.call) {
+      upsertCall(payload.call);
+      setActiveView('Calls');
+      setChatScreen('list');
+    }
+  };
+
+  const acceptIncomingCall = async () => {
+    if (!incomingCall) {
+      return;
+    }
+
+    try {
+      await ensureCallMedia(incomingCall.kind);
+      setCallError('');
+    } catch {
+      setCallError('Camera or microphone permission was denied.');
+      return;
+    }
+    await updateCallState(incomingCall.id, 'ongoing', incomingCall.durationSeconds);
+    setIncomingCall(null);
+  };
+
+  const endActiveCall = async () => {
+    if (!activeCall) {
+      return;
+    }
+
+    const finalState =
+      activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? 'declined' : 'completed';
+    await updateCallState(activeCall.id, finalState, activeCallSeconds);
+    closePeerConnection();
   };
 
   const pickEmoji = (emoji) => {
@@ -1124,7 +1674,11 @@ export default function App() {
       const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
       recordingRef.current = recording;
       recordingStartedAtRef.current = Date.now();
-      setRecordingLabel('Recording...');
+      setRecordingLabel('Recording 0:00');
+      recordingIntervalRef.current = setInterval(() => {
+        const durationMs = Date.now() - recordingStartedAtRef.current;
+        setRecordingLabel(`Recording ${getAudioDurationLabel(durationMs)}`);
+      }, 1000);
       setIsRecording(true);
     } catch (error) {
       Alert.alert('Recording failed', 'Voice note recording could not start.');
@@ -1142,6 +1696,10 @@ export default function App() {
       const uri = recording.getURI();
       const duration = Date.now() - recordingStartedAtRef.current;
       recordingRef.current = null;
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
       setIsRecording(false);
       setRecordingLabel('');
       await Audio.setAudioModeAsync({
@@ -1183,6 +1741,10 @@ export default function App() {
         }),
       }).catch(() => undefined);
     } catch (error) {
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
       setIsRecording(false);
       setRecordingLabel('');
       recordingRef.current = null;
@@ -1259,11 +1821,11 @@ export default function App() {
       <Pressable style={styles.dialogOverlay} onPress={() => setCallSheetVisible(false)}>
         <Pressable style={styles.dialog} onPress={() => undefined}>
           <Text style={styles.dialogTitle}>Choose call type</Text>
-          <Pressable style={styles.dialogAction} onPress={() => startCall('Audio')}>
+          <Pressable style={styles.dialogAction} onPress={() => void startCall('Audio')}>
             <Text style={styles.dialogActionTitle}>Audio call</Text>
             <Text style={styles.dialogActionBody}>Start a voice call with {activeChat.name}</Text>
           </Pressable>
-          <Pressable style={styles.dialogAction} onPress={() => startCall('Video')}>
+          <Pressable style={styles.dialogAction} onPress={() => void startCall('Video')}>
             <Text style={styles.dialogActionTitle}>Video call</Text>
             <Text style={styles.dialogActionBody}>Start a video call with {activeChat.name}</Text>
           </Pressable>
@@ -1437,6 +1999,9 @@ export default function App() {
           <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
             <Text style={styles.iconText}>☎</Text>
           </Pressable>
+          <Pressable style={styles.iconCircle} onPress={() => setNewChatVisible(true)}>
+            <Text style={styles.iconText}>✎</Text>
+          </Pressable>
         </View>
       </View>
 
@@ -1466,6 +2031,8 @@ export default function App() {
           onChangeText={setMessageDraft}
           placeholder="Message"
           placeholderTextColor="#7d8b92"
+          multiline
+          textAlignVertical="top"
           style={styles.composerInput}
         />
         {renderComposerActions()}
@@ -1496,7 +2063,7 @@ export default function App() {
       </Pressable>
 
       <ScrollView style={styles.chatList} showsVerticalScrollIndicator={false}>
-        {chatItems.map((chat) => (
+        {chatItems.length ? chatItems.map((chat) => (
           <Pressable key={chat.id} style={styles.chatRow} onPress={() => { setSelectedChatId(chat.id); setChatScreen('detail'); }}>
             <View style={styles.avatarCircle}>
               <Text style={styles.avatarText}>{chat.name.slice(0, 2).toUpperCase()}</Text>
@@ -1516,7 +2083,15 @@ export default function App() {
               </View>
             </View>
           </Pressable>
-        ))}
+        )) : (
+          <View style={styles.emptyChatCard}>
+            <Text style={styles.cardTitle}>No chats yet</Text>
+            <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
+            <Pressable style={styles.sendButtonWide} onPress={() => setNewChatVisible(true)}>
+              <Text style={styles.sendButtonText}>New conversation</Text>
+            </Pressable>
+          </View>
+        )}
       </ScrollView>
     </>
   );
@@ -1527,7 +2102,7 @@ export default function App() {
       {calls.map((call) => (
         <View key={call.id} style={styles.card}>
           <Text style={styles.cardTitle}>{call.name}</Text>
-          <Text style={styles.cardBody}>{call.kind} call · {call.state}</Text>
+          <Text style={styles.cardBody}>{call.kind} call · {call.state.charAt(0).toUpperCase() + call.state.slice(1)}</Text>
           <Text style={styles.cardMeta}>{call.time}</Text>
         </View>
       ))}
@@ -1572,8 +2147,13 @@ export default function App() {
               onPress={() => {
                 setActiveView('Chats');
                 setChatScreen('detail');
-                setSelectedChatId('c4');
-                setMessageDraft(`Hi, I want to buy ${item.title}. `);
+                const seller = Object.values(usersById).find((user) => user.name === item.seller && user.id !== currentUserId);
+                if (seller) {
+                  void createDirectChat(seller.id, `Hi, I want to buy ${item.title}. `);
+                } else {
+                  setSelectedChatId('c4');
+                  setMessageDraft(`Hi, I want to buy ${item.title}. `);
+                }
               }}
             >
               <Text style={styles.catalogButtonText}>Chat seller</Text>
@@ -1678,6 +2258,9 @@ export default function App() {
         {settingsSections.map((section) => (
           <Text key={section} style={styles.settingsLine}>{section}</Text>
         ))}
+        <Pressable style={styles.sendButtonWide} onPress={() => { setAuthMode('switch'); setAuthVisible(true); }}>
+          <Text style={styles.sendButtonText}>Switch or login</Text>
+        </Pressable>
       </View>
 
       <View style={styles.card}>
@@ -1892,17 +2475,22 @@ export default function App() {
 
             <View style={styles.storyBody}>
               <Pressable style={styles.storyNavLeft} onPress={() => moveStatus('previous')} />
-              <View style={styles.storyMediaShell}>
+              <Pressable
+                style={styles.storyMediaShell}
+                onPressIn={() => setStatusHoldActive(true)}
+                onPressOut={() => setStatusHoldActive(false)}
+              >
                 {activeStatusItem?.assets?.[0]?.kind === 'video' && activeStatusItem?.assets?.[0]?.url ? (
                   <Video
                     isLooping={false}
-                    shouldPlay
+                    shouldPlay={!statusPlaybackPaused}
+                    resizeMode={ResizeMode.CONTAIN}
                     source={{ uri: activeStatusItem.assets[0].url }}
                     style={styles.storyMedia}
                     useNativeControls={false}
                   />
                 ) : activeStatusItem?.assets?.[0]?.url ? (
-                  <Image source={{ uri: activeStatusItem.assets[0].url }} style={styles.storyMedia} />
+                  <Image resizeMode="contain" source={{ uri: activeStatusItem.assets[0].url }} style={styles.storyMedia} />
                 ) : (
                   <View style={[styles.storyFallback, { backgroundColor: activeStatusItem?.backgroundColor ?? '#162235' }]}>
                     <Text
@@ -1927,46 +2515,118 @@ export default function App() {
                     <Pressable onPress={openViewerList}>
                       <Text style={styles.storyStatText}>Views {activeStatusItem?.views?.length ?? 0}</Text>
                     </Pressable>
-                    <Text style={styles.storyStatText}>Replies {activeStatusItem?.comments?.length ?? 0}</Text>
-                    <Text style={styles.storyStatText}>Reactions {activeStatusItem?.reactions?.length ?? 0}</Text>
+                    <Pressable onPress={() => setStatusThreadVisible(true)}>
+                      <Text style={styles.storyStatText}>Replies {activeStatusItem?.comments?.length ?? 0}</Text>
+                    </Pressable>
+                    <Pressable onPress={openReactorList}>
+                      <Text style={styles.storyStatText}>Reactions {activeStatusItem?.reactions?.length ?? 0}</Text>
+                    </Pressable>
                   </View>
                   <View style={styles.storyReactionRow}>
                     {statusReactionOptions.map((emoji) => (
-                      <Pressable key={emoji} style={styles.storyReactionChip} onPress={() => submitStatusReaction(emoji)}>
-                        <Text style={styles.storyReactionChipText}>{emoji}</Text>
+                      <Pressable
+                        key={emoji}
+                        style={[
+                          styles.storyReactionChip,
+                          (activeStatusItem?.reactions ?? []).some((reaction) => reaction.userId === currentUserId && reaction.emoji === emoji)
+                            ? styles.storyReactionChipActive
+                            : null,
+                        ]}
+                        onPress={() => submitStatusReaction(emoji)}
+                      >
+                        <Text style={styles.storyReactionChipText}>
+                          {emoji} {(activeStatusItem?.reactions ?? []).filter((reaction) => reaction.emoji === emoji).length}
+                        </Text>
                       </Pressable>
                     ))}
                   </View>
-                  <View style={styles.storyCommentRow}>
-                    <TextInput
-                      value={statusCommentDraft}
-                      onChangeText={setStatusCommentDraft}
-                      placeholder="Reply to status"
-                      placeholderTextColor="#9ab0b8"
-                      style={styles.storyCommentInput}
-                    />
-                    <Pressable style={styles.storyCommentSend} onPress={submitStatusComment}>
-                      <Text style={styles.storyCommentSendText}>Send</Text>
+                  <View style={styles.storyActionRow}>
+                    <Pressable style={styles.storyActionButton} onPress={() => submitStatusReaction('❤️')}>
+                      <Text style={styles.storyActionButtonText}>♡</Text>
+                    </Pressable>
+                    <Pressable style={[styles.storyActionButton, styles.storyActionButtonPrimary]} onPress={() => setStatusReplyVisible(true)}>
+                      <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Reply</Text>
+                    </Pressable>
+                    <Pressable style={[styles.storyActionButton, styles.storyActionButtonDone]} onPress={closeStatusViewer}>
+                      <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Done</Text>
                     </Pressable>
                   </View>
                   {(activeStatusItem?.comments?.length ?? 0) > 0 ? (
-                    <View style={styles.storyCommentList}>
-                      {activeStatusItem.comments.slice(-3).map((comment) => (
-                        <View key={comment.id} style={styles.storyCommentItem}>
-                          <Text style={styles.storyCommentAuthor}>
-                            {comment.userId === currentUserId ? 'You' : (usersById[comment.userId]?.name ?? comment.userId)}
-                          </Text>
-                          <Text style={styles.storyCommentText}>{comment.text}</Text>
-                        </View>
-                      ))}
+                    <View style={styles.storyCommentPreview}>
+                      <Text style={styles.storyCommentText}>
+                        Latest reply: {activeStatusItem.comments[activeStatusItem.comments.length - 1]?.text}
+                      </Text>
                     </View>
                   ) : null}
                 </View>
-              </View>
+              </Pressable>
               <Pressable style={styles.storyNavRight} onPress={() => moveStatus('next')} />
             </View>
           </View>
         </View>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={statusReplyVisible}
+        onRequestClose={() => setStatusReplyVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setStatusReplyVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Reply</Text>
+            {activeStatusItem?.comments?.length ? activeStatusItem.comments.slice(-3).map((comment) => {
+              const meta = getUserMeta(comment.userId);
+              return (
+                <View key={comment.id} style={styles.storyCommentItem}>
+                  <View style={styles.storyCommentIdentity}>
+                    <View style={styles.storyCommentAvatar}>
+                      <Text style={styles.storyCommentAvatarText}>{meta.avatar}</Text>
+                    </View>
+                    <View style={styles.storyCommentCopy}>
+                      <Text style={styles.storyCommentAuthor}>{meta.name}</Text>
+                      <Text style={styles.storyCommentMeta}>{formatClock(comment.updatedAt ?? comment.createdAt)}</Text>
+                    </View>
+                  </View>
+                  <Text style={styles.storyCommentText}>{comment.text}</Text>
+                </View>
+              );
+            }) : null}
+            <TextInput
+              value={statusCommentDraft}
+              onChangeText={setStatusCommentDraft}
+              placeholder="Write a reply"
+              placeholderTextColor="#9ab0b8"
+              multiline
+              style={styles.storyCommentEditor}
+            />
+            <View style={styles.storyCommentActions}>
+              <Pressable onPress={() => setStatusReplyVisible(false)}>
+                <Text style={styles.storyCommentActionText}>Discard</Text>
+              </Pressable>
+              <Pressable onPress={submitStatusComment}>
+                <Text style={styles.storyCommentActionText}>Send</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={statusReactorsVisible}
+        onRequestClose={() => setStatusReactorsVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setStatusReactorsVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Reactions</Text>
+            {statusReactors.length ? statusReactors.map((reactor) => (
+              <View key={`${reactor.userId}-${reactor.reactedAt}`} style={styles.viewerRow}>
+                <Text style={styles.cardBody}>{reactor.emoji} {reactor.name}</Text>
+                <Text style={styles.cardMeta}>{formatClock(reactor.reactedAt)}</Text>
+              </View>
+            )) : <Text style={styles.cardBody}>No reactions yet.</Text>}
+          </Pressable>
+        </Pressable>
       </Modal>
       <Modal
         transparent
@@ -1983,6 +2643,204 @@ export default function App() {
                 <Text style={styles.cardMeta}>{formatClock(viewer.viewedAt)}</Text>
               </View>
             )) : <Text style={styles.cardBody}>No viewers yet.</Text>}
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={statusThreadVisible}
+        onRequestClose={() => setStatusThreadVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setStatusThreadVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Replies</Text>
+            {activeStatusItem?.comments?.length ? activeStatusItem.comments.map((comment) => {
+              const isMine = comment.userId === currentUserId;
+              const isEditing = editingStatusCommentId === comment.id;
+              const meta = getUserMeta(comment.userId);
+              return (
+                <View key={comment.id} style={styles.storyCommentItem}>
+                  <View style={styles.storyCommentHeader}>
+                    <View style={styles.storyCommentIdentity}>
+                      <View style={styles.storyCommentAvatar}>
+                        <Text style={styles.storyCommentAvatarText}>{meta.avatar}</Text>
+                      </View>
+                      <View style={styles.storyCommentCopy}>
+                        <Text style={styles.storyCommentAuthor}>{meta.name}</Text>
+                        <Text style={styles.storyCommentMeta}>
+                          {formatClock(comment.updatedAt ?? comment.createdAt)}{comment.updatedAt ? ' edited' : ''}
+                        </Text>
+                      </View>
+                    </View>
+                    {isMine ? (
+                      <View style={styles.storyCommentActions}>
+                        <Pressable onPress={() => startEditingStatusComment(comment.id, comment.text)}>
+                          <Text style={styles.storyCommentActionText}>Edit</Text>
+                        </Pressable>
+                        <Pressable onPress={() => removeStatusComment(comment.id)}>
+                          <Text style={[styles.storyCommentActionText, styles.storyCommentDeleteText]}>Delete</Text>
+                        </Pressable>
+                      </View>
+                    ) : null}
+                  </View>
+                  {isEditing ? (
+                    <>
+                      <TextInput
+                        value={editingStatusCommentText}
+                        onChangeText={setEditingStatusCommentText}
+                        multiline
+                        style={styles.storyCommentEditor}
+                      />
+                      <View style={styles.storyCommentActions}>
+                        <Pressable onPress={saveStatusCommentEdit}>
+                          <Text style={styles.storyCommentActionText}>Save</Text>
+                        </Pressable>
+                        <Pressable onPress={() => { setEditingStatusCommentId(null); setEditingStatusCommentText(''); }}>
+                          <Text style={styles.storyCommentActionText}>Cancel</Text>
+                        </Pressable>
+                      </View>
+                    </>
+                  ) : (
+                    <Text style={styles.storyCommentText}>{comment.text}</Text>
+                  )}
+                </View>
+              );
+            }) : <Text style={styles.cardBody}>No replies yet.</Text>}
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={newChatVisible}
+        onRequestClose={() => setNewChatVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setNewChatVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>New conversation</Text>
+            <View style={styles.authAccountList}>
+              {Object.values(usersById).filter((user) => user.id !== currentUserId).map((user) => (
+                <Pressable key={user.id} style={styles.sheetOption} onPress={() => void createDirectChat(user.id)}>
+                  <Text style={styles.sheetOptionTitle}>{user.name}</Text>
+                  <Text style={styles.sheetOptionBody}>{user.phone}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={Boolean(incomingCall)}
+        onRequestClose={() => setIncomingCall(null)}
+      >
+        <Pressable style={styles.dialogOverlay}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Incoming {incomingCall?.kind?.toLowerCase()} call</Text>
+            <Text style={styles.cardBody}>{incomingCall?.name} is calling you.</Text>
+            <View style={styles.storyActionRow}>
+              <Pressable style={[styles.storyActionButton, styles.storyActionButtonPrimary]} onPress={() => void acceptIncomingCall()}>
+                <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Answer</Text>
+              </Pressable>
+              <Pressable style={styles.storyActionButton} onPress={() => incomingCall ? void updateCallState(incomingCall.id, 'declined', 0) : undefined}>
+                <Text style={styles.storyActionButtonText}>Decline</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={Boolean(activeCall)}
+        onRequestClose={() => undefined}
+      >
+        <Pressable style={styles.dialogOverlay}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>{activeCall?.kind} call</Text>
+            <Text style={styles.cardBody}>{activeCall?.name}</Text>
+            <Text style={styles.cardMeta}>{activeCall?.state === 'ongoing' ? getAudioDurationLabel(activeCallSeconds * 1000) : 'Ringing...'}</Text>
+            {callError ? <Text style={styles.cardBody}>{callError}</Text> : null}
+            {activeCall?.kind === 'Video' ? (
+              <View style={styles.callVideoRow}>
+                {localCallStream?.toURL ? <RTCView streamURL={localCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Local video</Text></View>}
+                {remoteCallStream?.toURL ? <RTCView streamURL={remoteCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Waiting for peer</Text></View>}
+              </View>
+            ) : (
+              <View style={styles.callAudioRow}>
+                <View style={styles.callAudioPill}><Text style={styles.cardMeta}>Your mic is live</Text></View>
+                <View style={styles.callAudioPill}><Text style={styles.cardMeta}>{remoteCallStream ? `${activeCall?.name} connected` : 'Waiting for peer'}</Text></View>
+              </View>
+            )}
+            <View style={styles.storyActionRow}>
+              {activeCall?.state === 'ringing' && activeCall?.initiatorId !== currentUserId ? (
+                <Pressable style={[styles.storyActionButton, styles.storyActionButtonPrimary]} onPress={() => void acceptIncomingCall()}>
+                  <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Answer</Text>
+                </Pressable>
+              ) : null}
+              <Pressable style={[styles.storyActionButton, styles.storyActionButtonDone]} onPress={() => void endActiveCall()}>
+                <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>
+                  {activeCall?.state === 'ongoing' ? 'End Call' : 'Cancel'}
+                </Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={authVisible}
+        onRequestClose={() => setAuthVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setAuthVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Account</Text>
+            <View style={styles.authTabRow}>
+              {['switch', 'login', 'register'].map((mode) => (
+                <Pressable
+                  key={mode}
+                  onPress={() => setAuthMode(mode)}
+                  style={[styles.authTab, authMode === mode ? styles.authTabActive : null]}
+                >
+                  <Text style={styles.authTabText}>{mode}</Text>
+                </Pressable>
+              ))}
+            </View>
+            {authMode === 'switch' ? (
+              <View style={styles.authAccountList}>
+                {Object.values(usersById).map((user) => (
+                  <Pressable key={user.id} style={styles.sheetOption} onPress={() => void switchToUser(user.id)}>
+                    <Text style={styles.sheetOptionTitle}>{user.name}</Text>
+                    <Text style={styles.sheetOptionBody}>{user.phone}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : (
+              <>
+                {authMode === 'register' ? (
+                  <TextInput
+                    value={authForm.name}
+                    onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
+                    placeholder="Full name"
+                    placeholderTextColor="#7d8b92"
+                    style={styles.input}
+                  />
+                ) : null}
+                <TextInput
+                  value={authForm.phone}
+                  onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
+                  placeholder="Phone number"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void submitAuth()}>
+                  <Text style={styles.sendButtonText}>Continue</Text>
+                </Pressable>
+              </>
+            )}
           </Pressable>
         </Pressable>
       </Modal>
@@ -2210,9 +3068,9 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   messageBubble: {
-    maxWidth: '84%',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    maxWidth: '72%',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     borderRadius: 16,
   },
   messageMine: {
@@ -2238,6 +3096,7 @@ const styles = StyleSheet.create({
     color: '#f6f7f8',
     fontSize: 16,
     lineHeight: 22,
+    flexShrink: 1,
   },
   messageImage: {
     width: 240,
@@ -2338,6 +3197,7 @@ const styles = StyleSheet.create({
   composerInput: {
     flex: 1,
     minHeight: 46,
+    maxHeight: 108,
     borderRadius: 24,
     backgroundColor: '#1b262d',
     color: '#f6f7f8',
@@ -2437,6 +3297,7 @@ const styles = StyleSheet.create({
   recordingBannerText: {
     color: '#ff7070',
     fontWeight: '700',
+    fontSize: 13,
   },
   secondaryScreen: {
     flex: 1,
@@ -2662,6 +3523,15 @@ const styles = StyleSheet.create({
     borderColor: '#233138',
     gap: 8,
   },
+  emptyChatCard: {
+    margin: 16,
+    backgroundColor: '#111b21',
+    borderRadius: 18,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: '#233138',
+    gap: 12,
+  },
   cardTitle: {
     color: '#f1f5f7',
     fontSize: 16,
@@ -2752,6 +3622,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'center',
+    paddingHorizontal: 24,
   },
   dialogTitle: {
     color: '#f6f7f8',
@@ -2963,18 +3834,27 @@ const styles = StyleSheet.create({
   },
   storyBody: {
     flex: 1,
-    flexDirection: 'row',
+    position: 'relative',
   },
   storyNavLeft: {
-    width: '24%',
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: '28%',
     zIndex: 2,
   },
   storyNavRight: {
-    width: '24%',
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: '28%',
     zIndex: 2,
   },
   storyMediaShell: {
     flex: 1,
+    width: '100%',
     position: 'relative',
     backgroundColor: '#070b12',
     alignItems: 'center',
@@ -3033,58 +3913,162 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   storyReactionChip: {
-    width: 42,
+    minWidth: 58,
     height: 42,
     borderRadius: 21,
     backgroundColor: 'rgba(15,24,36,0.72)',
     alignItems: 'center',
     justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  storyReactionChipActive: {
+    backgroundColor: '#1d4ed8',
   },
   storyReactionChipText: {
-    fontSize: 20,
+    fontSize: 16,
+    color: '#edf4ff',
+    fontWeight: '700',
   },
-  storyCommentRow: {
+  storyActionRow: {
     flexDirection: 'row',
     gap: 10,
     marginTop: 14,
     alignItems: 'center',
   },
-  storyCommentInput: {
+  storyActionButton: {
+    minHeight: 44,
+    minWidth: 64,
+    borderRadius: 14,
+    backgroundColor: 'rgba(15,24,36,0.82)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  storyActionButtonPrimary: {
     flex: 1,
-    borderRadius: 999,
-    backgroundColor: 'rgba(12,19,29,0.82)',
-    color: '#f2f4f5',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    backgroundColor: '#2f3640',
   },
-  storyCommentSend: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 999,
-    backgroundColor: '#3b82f6',
+  storyActionButtonDone: {
+    backgroundColor: '#16a34a',
   },
-  storyCommentSendText: {
+  storyActionButtonText: {
     color: '#edf4ff',
     fontWeight: '800',
+    fontSize: 15,
+  },
+  storyActionButtonTextPrimary: {
+    color: '#f8fbff',
+  },
+  callVideoRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 14,
+  },
+  callVideoTile: {
+    flex: 1,
+    minHeight: 180,
+    borderRadius: 18,
+    backgroundColor: '#0a1018',
+  },
+  callVideoTilePlaceholder: {
+    flex: 1,
+    minHeight: 180,
+    borderRadius: 18,
+    backgroundColor: '#0a1018',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  callAudioRow: {
+    gap: 10,
+    marginTop: 14,
+  },
+  callAudioPill: {
+    minHeight: 64,
+    borderRadius: 16,
+    backgroundColor: '#0a1018',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
   },
   storyCommentList: {
     marginTop: 14,
     gap: 8,
+  },
+  storyCommentPreview: {
+    marginTop: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: 'rgba(8,14,24,0.72)',
   },
   storyCommentItem: {
     paddingHorizontal: 12,
     paddingVertical: 10,
     borderRadius: 14,
     backgroundColor: 'rgba(8,14,24,0.72)',
+    gap: 10,
+  },
+  storyCommentHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  storyCommentIdentity: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+  },
+  storyCommentAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#162235',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  storyCommentAvatarText: {
+    color: '#edf4ff',
+    fontWeight: '800',
+    fontSize: 12,
+  },
+  storyCommentCopy: {
+    flex: 1,
+  },
+  storyCommentMeta: {
+    color: '#9ab0b8',
+    fontSize: 12,
+    marginTop: 2,
   },
   storyCommentAuthor: {
     color: '#f6f7f8',
     fontWeight: '700',
-    marginBottom: 2,
   },
   storyCommentText: {
     color: '#dbe5ea',
     lineHeight: 19,
+  },
+  storyCommentActions: {
+    flexDirection: 'row',
+    gap: 12,
+    flexWrap: 'wrap',
+  },
+  storyCommentActionText: {
+    color: '#60a5fa',
+    fontWeight: '700',
+  },
+  storyCommentDeleteText: {
+    color: '#f87171',
+  },
+  storyCommentEditor: {
+    borderRadius: 14,
+    backgroundColor: '#111b21',
+    color: '#f2f4f5',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    minHeight: 88,
+    textAlignVertical: 'top',
   },
   viewerRow: {
     flexDirection: 'row',
@@ -3094,5 +4078,27 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#233138',
+  },
+  authTabRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  authTab: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#172228',
+    alignItems: 'center',
+  },
+  authTabActive: {
+    backgroundColor: '#3b82f6',
+  },
+  authTabText: {
+    color: '#edf4ff',
+    fontWeight: '700',
+    textTransform: 'capitalize',
+  },
+  authAccountList: {
+    gap: 10,
   },
 });
