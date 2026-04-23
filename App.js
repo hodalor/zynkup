@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio, ResizeMode, Video } from 'expo-av';
+import * as ExpoContacts from 'expo-contacts';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import * as Speech from 'expo-speech';
@@ -19,8 +20,28 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { mediaDevices, RTCPeerConnection, RTCIceCandidate, RTCSessionDescription, RTCView } from 'react-native-webrtc';
 import { io } from 'socket.io-client';
+
+let webRtcModule = null;
+try {
+  // Expo Go does not include this native module, so load it lazily.
+  webRtcModule = require('react-native-webrtc');
+} catch {
+  webRtcModule = null;
+}
+
+const mediaDevices = webRtcModule?.mediaDevices ?? null;
+const RTCPeerConnectionNative = webRtcModule?.RTCPeerConnection ?? null;
+const RTCIceCandidateNative = webRtcModule?.RTCIceCandidate ?? null;
+const RTCSessionDescriptionNative = webRtcModule?.RTCSessionDescription ?? null;
+const RTCViewNative = webRtcModule?.RTCView ?? null;
+const CAN_USE_NATIVE_WEBRTC = Boolean(
+  mediaDevices &&
+  RTCPeerConnectionNative &&
+  RTCIceCandidateNative &&
+  RTCSessionDescriptionNative &&
+  RTCViewNative,
+);
 
 const AnimatedText = Animated.createAnimatedComponent(Text);
 const tabs = ['Updates', 'Calls', 'Tools', 'Chats', 'Settings'];
@@ -250,9 +271,18 @@ export default function App() {
   const [editingStatusCommentId, setEditingStatusCommentId] = useState(null);
   const [editingStatusCommentText, setEditingStatusCommentText] = useState('');
   const [newChatVisible, setNewChatVisible] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
   const [authVisible, setAuthVisible] = useState(false);
-  const [authMode, setAuthMode] = useState('switch');
-  const [authForm, setAuthForm] = useState({ name: '', phone: '' });
+  const [authMode, setAuthMode] = useState('phone');
+  const [authForm, setAuthForm] = useState({
+    countryCode: '+260',
+    phone: '',
+    otp: '',
+    challengeId: '',
+    name: '',
+    pin: '',
+    otpHint: '',
+  });
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
@@ -307,6 +337,10 @@ export default function App() {
   };
 
   const ensureCallMedia = async (kind) => {
+    if (!CAN_USE_NATIVE_WEBRTC || !mediaDevices) {
+      throw new Error('native-webrtc-unavailable');
+    }
+
     if (callMediaStreamRef.current) {
       return callMediaStreamRef.current;
     }
@@ -330,12 +364,56 @@ export default function App() {
     });
   };
 
+  const syncPhoneContacts = async (userId) => {
+    const permission = await ExpoContacts.requestPermissionsAsync();
+    if (permission.status !== 'granted') {
+      return;
+    }
+
+    const deviceContacts = await ExpoContacts.getContactsAsync({
+      fields: [ExpoContacts.Fields.PhoneNumbers],
+      pageSize: 2000,
+    });
+    const payloadContacts = (deviceContacts.data ?? [])
+      .flatMap((contact) =>
+        (contact.phoneNumbers ?? []).map((entry) => ({
+          name: contact.name || 'Unknown',
+          phone: entry.number ?? '',
+        })),
+      )
+      .filter((contact) => contact.phone.trim().length >= 4);
+
+    if (!payloadContacts.length) {
+      setContactItems([]);
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/contacts/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId,
+        contacts: payloadContacts,
+      }),
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    setContactItems(payload.contacts ?? []);
+  };
+
   const ensurePeerConnection = async (call) => {
+    if (!CAN_USE_NATIVE_WEBRTC || !RTCPeerConnectionNative) {
+      throw new Error('native-webrtc-unavailable');
+    }
+
     if (peerConnectionRef.current) {
       return peerConnectionRef.current;
     }
 
-    const connection = new RTCPeerConnection(WEBRTC_CONFIGURATION);
+    const connection = new RTCPeerConnectionNative(WEBRTC_CONFIGURATION);
     const remoteStream = await mediaDevices.getUserMedia({ audio: false, video: false }).catch(() => null);
     connection.ontrack = (event) => {
       const [stream] = event.streams;
@@ -517,7 +595,9 @@ export default function App() {
   };
 
   const applyBootstrapPayload = (payload) => {
-    const nextCurrentUserId = payload.currentUserId ?? 'u1';
+    const nextCurrentUserId = payload.currentUserId ?? '';
+    setAuthRequired(Boolean(payload.authRequired));
+    setAuthVisible(Boolean(payload.authRequired));
     const nextUsersById = Object.fromEntries((payload.users ?? []).map((user) => [user.id, user]));
     setCurrentUserId(nextCurrentUserId);
     setCurrentDeviceId(payload.currentDeviceId ?? null);
@@ -587,6 +667,9 @@ export default function App() {
         imageUris: item.imageUrls ?? [],
       })),
     );
+    if (!payload.authRequired && nextCurrentUserId) {
+      void syncPhoneContacts(nextCurrentUserId);
+    }
   };
 
   useEffect(() => {
@@ -889,7 +972,7 @@ export default function App() {
         try {
           const connection = await ensurePeerConnection(currentCall);
           if (signalType === 'offer') {
-            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
             const answer = await connection.createAnswer();
             await connection.setLocalDescription(answer);
             emitCallSignal(callId, 'answer', answer, fromUserId);
@@ -897,12 +980,12 @@ export default function App() {
           }
 
           if (signalType === 'answer') {
-            await connection.setRemoteDescription(new RTCSessionDescription(payload));
+            await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
             return;
           }
 
           if (signalType === 'ice-candidate' && payload) {
-            await connection.addIceCandidate(new RTCIceCandidate(payload));
+            await connection.addIceCandidate(new RTCIceCandidateNative(payload));
           }
         } catch {
           setCallError('Call signaling lost sync.');
@@ -1494,35 +1577,81 @@ export default function App() {
     }
   };
 
-  const submitAuth = async () => {
-    const endpoint =
-      authMode === 'login'
-        ? '/api/auth/login'
-        : authMode === 'register'
-          ? '/api/auth/register'
-          : '/api/auth/switch';
-    const body =
-      authMode === 'switch'
-        ? {
-            deviceId: currentDeviceId,
-            userId: authForm.phone,
-            platform: Platform.OS,
-            label: `${Platform.OS} device`,
-          }
-        : {
-            deviceId: currentDeviceId,
-            phone: authForm.phone.trim(),
-            name: authForm.name.trim(),
-            platform: Platform.OS,
-            label: `${Platform.OS} device`,
-          };
-
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+  const startPhoneAuth = async () => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        countryCode: authForm.countryCode.trim(),
+        phoneNumber: authForm.phone.trim(),
+      }),
     });
     if (!response.ok) {
+      Alert.alert('Phone verification', 'Unable to start phone verification right now.');
+      return;
+    }
+
+    const payload = await response.json();
+    setAuthForm((current) => ({
+      ...current,
+      challengeId: payload.challengeId,
+      otpHint: payload.otpHint ?? '',
+    }));
+    setAuthMode('otp');
+  };
+
+  const verifyPhoneOtp = async () => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        challengeId: authForm.challengeId,
+        code: authForm.otp.trim(),
+        platform: Platform.OS,
+        label: `${Platform.OS} device`,
+      }),
+    });
+    if (!response.ok) {
+      Alert.alert('OTP', 'The OTP is invalid or expired.');
+      return;
+    }
+
+    const payload = await response.json();
+    if (payload.registrationRequired) {
+      setAuthMode('profile');
+      return;
+    }
+
+    if (payload.session?.deviceId) {
+      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrapPayload(payload.bootstrap);
+    }
+    setAuthVisible(false);
+    setAuthRequired(false);
+  };
+
+  const completePhoneRegistration = async () => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        challengeId: authForm.challengeId,
+        countryCode: authForm.countryCode.trim(),
+        phoneNumber: authForm.phone.trim(),
+        name: authForm.name.trim(),
+        pin: authForm.pin.trim() || undefined,
+        platform: Platform.OS,
+        label: `${Platform.OS} device`,
+      }),
+    });
+    if (!response.ok) {
+      Alert.alert('Registration', 'Unable to finish registration right now.');
       return;
     }
 
@@ -1535,7 +1664,16 @@ export default function App() {
       applyBootstrapPayload(payload.bootstrap);
     }
     setAuthVisible(false);
-    setAuthForm({ name: '', phone: '' });
+    setAuthRequired(false);
+    setAuthForm({
+      countryCode: '+260',
+      phone: '',
+      otp: '',
+      challengeId: '',
+      name: '',
+      pin: '',
+      otpHint: '',
+    });
   };
 
   const switchToUser = async (userId) => {
@@ -1574,7 +1712,7 @@ export default function App() {
       await ensureCallMedia(kind);
       setCallError('');
     } catch {
-      setCallError('Camera or microphone permission was denied.');
+      setCallError(CAN_USE_NATIVE_WEBRTC ? 'Camera or microphone permission was denied.' : 'Use a development build for live calls.');
       return;
     }
 
@@ -1609,7 +1747,7 @@ export default function App() {
       await ensureCallMedia(incomingCall.kind);
       setCallError('');
     } catch {
-      setCallError('Camera or microphone permission was denied.');
+      setCallError(CAN_USE_NATIVE_WEBRTC ? 'Camera or microphone permission was denied.' : 'Use a development build for live calls.');
       return;
     }
     await updateCallState(incomingCall.id, 'ongoing', incomingCall.durationSeconds);
@@ -1818,16 +1956,13 @@ export default function App() {
 
   const renderCallSheet = () => (
     <Modal transparent animationType="fade" visible={callSheetVisible} onRequestClose={() => setCallSheetVisible(false)}>
-      <Pressable style={styles.dialogOverlay} onPress={() => setCallSheetVisible(false)}>
-        <Pressable style={styles.dialog} onPress={() => undefined}>
-          <Text style={styles.dialogTitle}>Choose call type</Text>
-          <Pressable style={styles.dialogAction} onPress={() => void startCall('Audio')}>
+      <Pressable style={styles.callDropdownOverlay} onPress={() => setCallSheetVisible(false)}>
+        <Pressable style={styles.callDropdown} onPress={() => undefined}>
+          <Pressable style={styles.callDropdownItem} onPress={() => void startCall('Audio')}>
             <Text style={styles.dialogActionTitle}>Audio call</Text>
-            <Text style={styles.dialogActionBody}>Start a voice call with {activeChat.name}</Text>
           </Pressable>
-          <Pressable style={styles.dialogAction} onPress={() => void startCall('Video')}>
+          <Pressable style={styles.callDropdownItem} onPress={() => void startCall('Video')}>
             <Text style={styles.dialogActionTitle}>Video call</Text>
-            <Text style={styles.dialogActionBody}>Start a video call with {activeChat.name}</Text>
           </Pressable>
         </Pressable>
       </Pressable>
@@ -2765,8 +2900,8 @@ export default function App() {
             {callError ? <Text style={styles.cardBody}>{callError}</Text> : null}
             {activeCall?.kind === 'Video' ? (
               <View style={styles.callVideoRow}>
-                {localCallStream?.toURL ? <RTCView streamURL={localCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Local video</Text></View>}
-                {remoteCallStream?.toURL ? <RTCView streamURL={remoteCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Waiting for peer</Text></View>}
+                {localCallStream?.toURL && RTCViewNative ? <RTCViewNative streamURL={localCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Local video</Text></View>}
+                {remoteCallStream?.toURL && RTCViewNative ? <RTCViewNative streamURL={remoteCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Waiting for peer</Text></View>}
               </View>
             ) : (
               <View style={styles.callAudioRow}>
@@ -2793,13 +2928,21 @@ export default function App() {
         transparent
         animationType="fade"
         visible={authVisible}
-        onRequestClose={() => setAuthVisible(false)}
+        onRequestClose={() => {
+          if (!authRequired) {
+            setAuthVisible(false);
+          }
+        }}
       >
-        <Pressable style={styles.dialogOverlay} onPress={() => setAuthVisible(false)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => {
+          if (!authRequired) {
+            setAuthVisible(false);
+          }
+        }}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>Account</Text>
+            <Text style={styles.dialogTitle}>Phone Registration</Text>
             <View style={styles.authTabRow}>
-              {['switch', 'login', 'register'].map((mode) => (
+              {['phone', 'otp', 'profile'].map((mode) => (
                 <Pressable
                   key={mode}
                   onPress={() => setAuthMode(mode)}
@@ -2809,35 +2952,62 @@ export default function App() {
                 </Pressable>
               ))}
             </View>
-            {authMode === 'switch' ? (
-              <View style={styles.authAccountList}>
-                {Object.values(usersById).map((user) => (
-                  <Pressable key={user.id} style={styles.sheetOption} onPress={() => void switchToUser(user.id)}>
-                    <Text style={styles.sheetOptionTitle}>{user.name}</Text>
-                    <Text style={styles.sheetOptionBody}>{user.phone}</Text>
-                  </Pressable>
-                ))}
-              </View>
-            ) : (
+            {authMode === 'phone' ? (
               <>
-                {authMode === 'register' ? (
-                  <TextInput
-                    value={authForm.name}
-                    onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
-                    placeholder="Full name"
-                    placeholderTextColor="#7d8b92"
-                    style={styles.input}
-                  />
-                ) : null}
+                <TextInput
+                  value={authForm.countryCode}
+                  onChangeText={(value) => setAuthForm((current) => ({ ...current, countryCode: value }))}
+                  placeholder="+260"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
                 <TextInput
                   value={authForm.phone}
                   onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
                   placeholder="Phone number"
                   placeholderTextColor="#7d8b92"
+                  keyboardType="phone-pad"
                   style={styles.input}
                 />
-                <Pressable style={styles.sendButtonWide} onPress={() => void submitAuth()}>
+                <Pressable style={styles.sendButtonWide} onPress={() => void startPhoneAuth()}>
                   <Text style={styles.sendButtonText}>Continue</Text>
+                </Pressable>
+              </>
+            ) : authMode === 'otp' ? (
+              <>
+                <TextInput
+                  value={authForm.otp}
+                  onChangeText={(value) => setAuthForm((current) => ({ ...current, otp: value }))}
+                  placeholder="Enter OTP"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="number-pad"
+                  style={styles.input}
+                />
+                {authForm.otpHint ? <Text style={styles.cardMeta}>Dev OTP: {authForm.otpHint}</Text> : null}
+                <Pressable style={styles.sendButtonWide} onPress={() => void verifyPhoneOtp()}>
+                  <Text style={styles.sendButtonText}>Verify OTP</Text>
+                </Pressable>
+              </>
+            ) : (
+              <>
+                <TextInput
+                  value={authForm.name}
+                  onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
+                  placeholder="Full name"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={authForm.pin}
+                  onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
+                  placeholder="4-digit pin (optional)"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="number-pad"
+                  secureTextEntry
+                  style={styles.input}
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void completePhoneRegistration()}>
+                  <Text style={styles.sendButtonText}>Finish Setup</Text>
                 </Pressable>
               </>
             )}
@@ -3623,6 +3793,28 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'center',
     paddingHorizontal: 24,
+  },
+  callDropdownOverlay: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    alignItems: 'flex-end',
+    paddingTop: 132,
+    paddingRight: 18,
+  },
+  callDropdown: {
+    width: 180,
+    backgroundColor: '#111b21',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#223149',
+    padding: 8,
+    gap: 6,
+  },
+  callDropdownItem: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: '#172228',
   },
   dialogTitle: {
     color: '#f6f7f8',
