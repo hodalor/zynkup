@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "597625475865",
+    "project_id": "zynkup-9f577",
+    "storage_bucket": "zynkup-9f577.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:597625475865:android:39c702b9c60a0662f1ab88",
+        "android_client_info": {
+          "package_name": "com.prynova.zynkup"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBoymOx-JHMOTvmpOof9nvn2XoVPZyzEJM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

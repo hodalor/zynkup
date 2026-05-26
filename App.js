@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio, ResizeMode, Video } from 'expo-av';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ExpoContacts from 'expo-contacts';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import * as Speech from 'expo-speech';
 import { StatusBar } from 'expo-status-bar';
+import { countries } from 'countries-list';
 import {
   Alert,
   Animated,
@@ -21,6 +23,7 @@ import {
   View,
 } from 'react-native';
 import { io } from 'socket.io-client';
+import { firebaseAuth, firebaseConfigReady, nativeFirebaseReady } from './firebaseConfig';
 
 let webRtcModule = null;
 try {
@@ -59,10 +62,10 @@ const settingsSections = [
 const emojiOptions = ['😀', '😂', '🤣', '😍', '🔥', '🙏', '🎉', '❤️'];
 const tabBadges = {
   Updates: 0,
-  Calls: 14,
+  Calls: 0,
   Tools: 0,
-  Chats: 9,
-  Settings: 1,
+  Chats: 0,
+  Settings: 0,
 };
 const categoryOptions = ['All', 'Fashion', 'Electronics', 'Home', 'Phones'];
 const statusBackgroundOptions = ['#10233e', '#1f2937', '#14532d', '#7c2d12', '#581c87'];
@@ -81,82 +84,28 @@ const WEBRTC_CONFIGURATION = {
   iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
 };
 
-const chats = [
-  { id: 'c1', name: 'Mr.Hodalor', preview: '📷 Sunday outfit', unread: 0, presence: 'online', time: '19:02' },
-  { id: 'c2', name: 'Chory', preview: 'Voice note', unread: 0, presence: 'last seen 3m ago', time: '19:01' },
-  { id: 'c3', name: 'Chilenje C.o.C Youth', preview: '~~LEE/🦋🔥💯❣️: Copy the message...', unread: 10, presence: 'typing now', time: '18:49' },
-  { id: 'c4', name: 'Princess', preview: 'New kitchen set just landed', unread: 2, presence: 'online', time: '18:27' },
-];
+const COUNTRY_OPTIONS = Object.entries(countries)
+  .flatMap(([code, country]) =>
+    (country.phone ?? []).map((phoneCode) => ({
+      code,
+      name: country.name,
+      dialCode: `+${phoneCode}`,
+      flag: country.emoji ?? code,
+    })),
+  )
+  .sort((left, right) => left.name.localeCompare(right.name));
 
-const contacts = [
-  { id: 'ct1', name: 'Mr.Hodalor', phone: '+260 97 734 0068', registered: true, presence: 'online' },
-  { id: 'ct2', name: 'Chory', phone: '+260 96 734 0068', registered: true, presence: 'last seen 3m ago' },
-  { id: 'ct3', name: 'Princess', phone: '+260 95 734 0068', registered: true, presence: 'online' },
-  { id: 'ct4', name: 'Vendor Grace', phone: '+260 91 734 0068', registered: false, presence: 'invite needed' },
-];
+const chats = [];
+const contacts = [];
+const initialStatuses = [];
+const initialCalls = [];
+const initialCatalogItems = [];
+const initialMessages = {};
 
-const initialStatuses = [
-  { id: 's1', userId: 'u2', author: 'Aisha', text: 'Shipping onboarding screens today.', postedAt: '50m ago', assets: [] },
-  { id: 's2', userId: 'u1', author: 'You', text: 'Working on catalog, calls, and voice notes.', postedAt: '10m ago', assets: [] },
-];
-
-const initialCalls = [
-  { id: 'call1', name: 'Mr.Hodalor', kind: 'Video', state: 'Completed', time: 'Today, 19:02' },
-  { id: 'call2', name: 'Princess', kind: 'Audio', state: 'Missed', time: 'Today, 18:27' },
-];
-
-const initialCatalogItems = [
-  {
-    id: 'p1',
-    title: 'Church Suit',
-    price: 'K 1,450',
-    category: 'Fashion',
-    seller: 'Temwa Lesa',
-    description: 'Tailored two-piece suit with matching shirt.',
-    imageUri: 'https://images.unsplash.com/photo-1593032465171-f295b07d0b32?auto=format&fit=crop&w=900&q=80',
-  },
-  {
-    id: 'p2',
-    title: 'Samsung S23',
-    price: 'K 12,800',
-    category: 'Phones',
-    seller: 'Tech World Zambia',
-    description: 'Factory unlocked with charger and receipt.',
-    imageUri: 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=900&q=80',
-  },
-  {
-    id: 'p3',
-    title: 'Blender Pro',
-    price: 'K 780',
-    category: 'Home',
-    seller: 'Princess Kitchen Store',
-    description: 'Heavy duty blender for smoothies and sauces.',
-    imageUri: 'https://images.unsplash.com/photo-1570222094114-d054a817e56b?auto=format&fit=crop&w=900&q=80',
-  },
-];
-
-const initialMessages = {
-  c1: [
-    {
-      id: 'm1',
-      mine: false,
-      kind: 'image',
-      text: 'Sunday outfit',
-      time: '19:00',
-      imageUri: 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?auto=format&fit=crop&w=900&q=80',
-    },
-    { id: 'm2', mine: true, kind: 'text', text: 'This one really got me laughing.', time: '19:01' },
-    { id: 'm3', mine: false, kind: 'emoji', text: '🤣😂', time: '19:02' },
-  ],
-  c2: [
-    { id: 'm4', mine: false, kind: 'voice', text: 'Voice note', time: '18:57', durationLabel: '0:14' },
-  ],
-  c3: [
-    { id: 'm5', mine: false, kind: 'text', text: 'Good morning family 😂🤣🔥', time: '18:49' },
-  ],
-  c4: [
-    { id: 'm6', mine: false, kind: 'text', text: 'Let us try the new catalog flow.', time: '18:27' },
-  ],
+const normalizeAuthPhone = (countryCode, phoneNumber) => {
+  const cc = countryCode.startsWith('+') ? countryCode : `+${countryCode}`;
+  const digits = phoneNumber.replace(/[^\d]/g, '');
+  return `${cc}${digits}`;
 };
 
 const extractEmojiTokens = (text) => text.match(EMOJI_REGEX) ?? [];
@@ -208,8 +157,8 @@ const inferMimeType = (uri, fallback = 'application/octet-stream') => {
 export default function App() {
   const [activeView, setActiveView] = useState('Chats');
   const [chatScreen, setChatScreen] = useState('list');
-  const [selectedChatId, setSelectedChatId] = useState('c1');
-  const [currentUserId, setCurrentUserId] = useState('u1');
+  const [selectedChatId, setSelectedChatId] = useState('');
+  const [currentUserId, setCurrentUserId] = useState('');
   const [currentDeviceId, setCurrentDeviceId] = useState(null);
   const [usersById, setUsersById] = useState({});
   const [chatItems, setChatItems] = useState(chats);
@@ -218,14 +167,14 @@ export default function App() {
   const [statusDraft, setStatusDraft] = useState('');
   const [messagesByChat, setMessagesByChat] = useState(initialMessages);
   const [calls, setCalls] = useState(initialCalls);
-  const [statuses, setStatuses] = useState(initialStatuses);
+  const [, setStatuses] = useState(initialStatuses);
   const [catalogItems, setCatalogItems] = useState(initialCatalogItems);
   const [profile, setProfile] = useState({
-    name: 'Temwa Lesa',
-    username: '@temwalesa',
-    about: 'Building a commerce-enabled chat product.',
-    phone: '+260765453163',
-    photoUri: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
+    name: '',
+    username: '',
+    about: '',
+    phone: '',
+    photoUri: '',
   });
   const [catalogForm, setCatalogForm] = useState({
     title: '',
@@ -273,16 +222,24 @@ export default function App() {
   const [newChatVisible, setNewChatVisible] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
   const [authVisible, setAuthVisible] = useState(false);
+  const [bootstrapReady, setBootstrapReady] = useState(false);
   const [authMode, setAuthMode] = useState('phone');
+  const [countryPickerVisible, setCountryPickerVisible] = useState(false);
+  const [countrySearch, setCountrySearch] = useState('');
+  const [deviceScannerVisible, setDeviceScannerVisible] = useState(false);
+  const [deviceLinking, setDeviceLinking] = useState(false);
+  const [linkedDevices, setLinkedDevices] = useState([]);
+  const [deviceLinkMessage, setDeviceLinkMessage] = useState('');
   const [authForm, setAuthForm] = useState({
-    countryCode: '+260',
+    countryCode: '',
     phone: '',
     otp: '',
-    challengeId: '',
+    verifiedPhone: '',
     name: '',
     pin: '',
-    otpHint: '',
   });
+  const phoneAuthConfirmationRef = useRef(null);
+  const phoneAuthIdTokenRef = useRef('');
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
@@ -299,6 +256,7 @@ export default function App() {
   const activeCallRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const callMediaStreamRef = useRef(null);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
 
   const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? chats[0];
   const messages = messagesByChat[selectedChatId] ?? [];
@@ -325,6 +283,16 @@ export default function App() {
       return matchesCategory && matchesSearch;
     });
   }, [catalogCategory, catalogItems, catalogSearch]);
+
+  const filteredCountryOptions = useMemo(() => {
+    const query = countrySearch.trim().toLowerCase();
+    return COUNTRY_OPTIONS.filter((country) =>
+      !query ||
+      country.name.toLowerCase().includes(query) ||
+      country.dialCode.includes(query) ||
+      country.code.toLowerCase().includes(query),
+    );
+  }, [countrySearch]);
 
   const closePeerConnection = () => {
     peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop?.());
@@ -402,6 +370,82 @@ export default function App() {
 
     const payload = await response.json();
     setContactItems(payload.contacts ?? []);
+  };
+
+  const fetchLinkedDevices = async (userId) => {
+    if (!userId) {
+      setLinkedDevices([]);
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/devices?userId=${encodeURIComponent(userId)}`);
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    setLinkedDevices(payload.devices ?? []);
+  };
+
+  const unlinkDevice = async (deviceId) => {
+    const response = await fetch(`${API_BASE_URL}/api/devices/${encodeURIComponent(deviceId)}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      return;
+    }
+
+    await fetchLinkedDevices(currentUserId);
+  };
+
+  const confirmLinkedDesktop = async (rawPayload) => {
+    if (deviceLinking || !currentUserId) {
+      return;
+    }
+
+    let parsedPayload = null;
+    try {
+      parsedPayload = JSON.parse(rawPayload);
+    } catch {
+      parsedPayload = null;
+    }
+
+    if (
+      parsedPayload?.type !== 'zynkup-link-device' ||
+      !parsedPayload?.requestId ||
+      !parsedPayload?.token
+    ) {
+      setDeviceLinkMessage('Invalid desktop QR code.');
+      return;
+    }
+
+    setDeviceLinking(true);
+    setDeviceScannerVisible(false);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/link/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requestId: parsedPayload.requestId,
+          token: parsedPayload.token,
+          userId: currentUserId,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setDeviceLinkMessage(payload.error ?? 'Unable to link this desktop.');
+        return;
+      }
+
+      setDeviceLinkMessage(
+        payload.status === 'pin_required'
+          ? 'Desktop scan accepted. Enter your app pin on desktop to finish linking.'
+          : 'Desktop linked successfully.',
+      );
+      await fetchLinkedDevices(currentUserId);
+    } finally {
+      setDeviceLinking(false);
+    }
   };
 
   const ensurePeerConnection = async (call) => {
@@ -596,8 +640,9 @@ export default function App() {
 
   const applyBootstrapPayload = (payload) => {
     const nextCurrentUserId = payload.currentUserId ?? '';
+    setBootstrapReady(true);
     setAuthRequired(Boolean(payload.authRequired));
-    setAuthVisible(Boolean(payload.authRequired));
+    setAuthVisible(Boolean(payload.authRequired) && !nextCurrentUserId);
     const nextUsersById = Object.fromEntries((payload.users ?? []).map((user) => [user.id, user]));
     setCurrentUserId(nextCurrentUserId);
     setCurrentDeviceId(payload.currentDeviceId ?? null);
@@ -669,6 +714,7 @@ export default function App() {
     );
     if (!payload.authRequired && nextCurrentUserId) {
       void syncPhoneContacts(nextCurrentUserId);
+      void fetchLinkedDevices(nextCurrentUserId);
     }
   };
 
@@ -1578,48 +1624,84 @@ export default function App() {
   };
 
   const startPhoneAuth = async () => {
-    const response = await fetch(`${API_BASE_URL}/api/auth/phone/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        countryCode: authForm.countryCode.trim(),
-        phoneNumber: authForm.phone.trim(),
-      }),
-    });
-    if (!response.ok) {
-      Alert.alert('Phone verification', 'Unable to start phone verification right now.');
+    if (!nativeFirebaseReady || !firebaseAuth) {
+      Alert.alert('Phone verification', 'Firebase native auth is not available in this runtime. Open the installed Zynkup app in the development build, not Expo Go, then try again.');
       return;
     }
 
-    const payload = await response.json();
-    setAuthForm((current) => ({
-      ...current,
-      challengeId: payload.challengeId,
-      otpHint: payload.otpHint ?? '',
-    }));
-    setAuthMode('otp');
+    if (!firebaseConfigReady) {
+      Alert.alert('Phone verification', 'Firebase mobile auth is not configured yet.');
+      return;
+    }
+
+    if (!authForm.countryCode.trim()) {
+      Alert.alert('Phone verification', 'Select your country code first.');
+      setCountryPickerVisible(true);
+      return;
+    }
+
+    const normalizedPhone = normalizeAuthPhone(authForm.countryCode.trim(), authForm.phone.trim());
+    if (normalizedPhone.length < 8) {
+      Alert.alert('Phone verification', 'Enter a valid phone number first.');
+      return;
+    }
+
+    try {
+      phoneAuthConfirmationRef.current = await firebaseAuth.signInWithPhoneNumber(normalizedPhone);
+      setAuthForm((current) => ({
+        ...current,
+        otp: '',
+        verifiedPhone: normalizedPhone,
+      }));
+      setAuthMode('otp');
+    } catch (error) {
+      Alert.alert('Phone verification', 'Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.');
+    }
   };
 
   const verifyPhoneOtp = async () => {
-    const response = await fetch(`${API_BASE_URL}/api/auth/phone/verify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        challengeId: authForm.challengeId,
-        code: authForm.otp.trim(),
-        platform: Platform.OS,
-        label: `${Platform.OS} device`,
-      }),
-    });
-    if (!response.ok) {
+    if (!phoneAuthConfirmationRef.current) {
+      Alert.alert('OTP', 'Start phone verification first.');
+      return;
+    }
+
+    let credential = null;
+    try {
+      credential = await phoneAuthConfirmationRef.current.confirm(authForm.otp.trim());
+    } catch (error) {
       Alert.alert('OTP', 'The OTP is invalid or expired.');
       return;
     }
 
-    const payload = await response.json();
+    const verifiedPhone = credential?.user?.phoneNumber ?? authForm.verifiedPhone;
+    const idToken = await credential?.user?.getIdToken(true);
+    if (!idToken || !verifiedPhone) {
+      Alert.alert('OTP', 'Firebase verification completed, but the secure token could not be read.');
+      return;
+    }
+    phoneAuthIdTokenRef.current = idToken;
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        idToken,
+        phone: verifiedPhone,
+        platform: Platform.OS,
+        label: `${Platform.OS} device`,
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      Alert.alert('OTP', payload.error ?? 'Unable to verify this phone on the server.');
+      return;
+    }
+
     if (payload.registrationRequired) {
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+      }));
       setAuthMode('profile');
       return;
     }
@@ -1636,14 +1718,24 @@ export default function App() {
   };
 
   const completePhoneRegistration = async () => {
-    const response = await fetch(`${API_BASE_URL}/api/auth/phone/complete`, {
+    if (!authForm.verifiedPhone) {
+      Alert.alert('Registration', 'Verify your phone number with the OTP first.');
+      return;
+    }
+
+    if (!phoneAuthIdTokenRef.current) {
+      Alert.alert('Registration', 'The secure Firebase token is missing. Verify your OTP again.');
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         deviceId: currentDeviceId,
-        challengeId: authForm.challengeId,
+        idToken: phoneAuthIdTokenRef.current,
+        phone: authForm.verifiedPhone,
         countryCode: authForm.countryCode.trim(),
-        phoneNumber: authForm.phone.trim(),
         name: authForm.name.trim(),
         pin: authForm.pin.trim() || undefined,
         platform: Platform.OS,
@@ -1651,7 +1743,8 @@ export default function App() {
       }),
     });
     if (!response.ok) {
-      Alert.alert('Registration', 'Unable to finish registration right now.');
+      const payload = await response.json().catch(() => ({}));
+      Alert.alert('Registration', payload.error ?? 'Unable to finish registration right now.');
       return;
     }
 
@@ -1666,40 +1759,15 @@ export default function App() {
     setAuthVisible(false);
     setAuthRequired(false);
     setAuthForm({
-      countryCode: '+260',
+      countryCode: '',
       phone: '',
       otp: '',
-      challengeId: '',
+      verifiedPhone: '',
       name: '',
       pin: '',
-      otpHint: '',
     });
-  };
-
-  const switchToUser = async (userId) => {
-    const response = await fetch(`${API_BASE_URL}/api/auth/switch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        userId,
-        platform: Platform.OS,
-        label: `${Platform.OS} device`,
-      }),
-    });
-    if (!response.ok) {
-      return;
-    }
-
-    const payload = await response.json();
-    if (payload.session?.deviceId) {
-      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-      setCurrentDeviceId(payload.session.deviceId);
-    }
-    if (payload.bootstrap) {
-      applyBootstrapPayload(payload.bootstrap);
-    }
-    setAuthVisible(false);
+    phoneAuthConfirmationRef.current = null;
+    phoneAuthIdTokenRef.current = '';
   };
 
   const startCall = async (kind) => {
@@ -2393,9 +2461,37 @@ export default function App() {
         {settingsSections.map((section) => (
           <Text key={section} style={styles.settingsLine}>{section}</Text>
         ))}
-        <Pressable style={styles.sendButtonWide} onPress={() => { setAuthMode('switch'); setAuthVisible(true); }}>
-          <Text style={styles.sendButtonText}>Switch or login</Text>
+        <Pressable
+          style={styles.sendButtonWide}
+          onPress={async () => {
+            const permission = await requestCameraPermission();
+            if (!permission.granted) {
+              setDeviceLinkMessage('Camera permission is needed to scan a desktop QR code.');
+              return;
+            }
+            setDeviceLinkMessage('');
+            setDeviceScannerVisible(true);
+          }}
+          disabled={deviceLinking}
+        >
+          <Text style={styles.sendButtonText}>{deviceLinking ? 'Linking...' : 'Link devices'}</Text>
         </Pressable>
+        {deviceLinkMessage ? <Text style={styles.cardMeta}>{deviceLinkMessage}</Text> : null}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Linked devices</Text>
+        {linkedDevices.length ? linkedDevices.map((device) => (
+          <View key={device.deviceId} style={styles.deviceRow}>
+            <View style={styles.deviceRowCopy}>
+              <Text style={styles.sheetOptionTitle}>{device.label}</Text>
+              <Text style={styles.sheetOptionBody}>{device.platform} · last seen {formatClock(device.lastSeenAt)}</Text>
+            </View>
+            <Pressable style={styles.ghostButton} onPress={() => void unlinkDevice(device.deviceId)}>
+              <Text style={styles.ghostButtonText}>Log out</Text>
+            </Pressable>
+          </View>
+        )) : <Text style={styles.cardBody}>No extra linked devices yet.</Text>}
       </View>
 
       <View style={styles.card}>
@@ -2440,6 +2536,170 @@ export default function App() {
       </View>
     </ScrollView>
   );
+
+  const renderAuthGate = (dismissible = false) => {
+    const content = (
+      <>
+        <View style={styles.authBackdropPreview} pointerEvents="none">
+          <View style={[styles.authBackdropGlow, styles.authBackdropGlowTop]} />
+          <View style={[styles.authBackdropGlow, styles.authBackdropGlowBottom]} />
+          <Text style={styles.authBackdropWord}>Zynkup</Text>
+          <View style={[styles.authBackdropChip, styles.authBackdropChipTitle]}>
+            <Text style={styles.authBackdropChipText}>Chat sent</Text>
+          </View>
+          <View style={[styles.authBackdropChip, styles.authBackdropChipReply]}>
+            <Text style={styles.authBackdropChipText}>Reply delivered</Text>
+          </View>
+          <View style={[styles.authBackdropChip, styles.authBackdropChipCall]}>
+            <Text style={styles.authBackdropChipText}>Video call connected</Text>
+          </View>
+          <View style={[styles.authBackdropChip, styles.authBackdropChipStatus]}>
+            <Text style={styles.authBackdropChipText}>Status updated</Text>
+          </View>
+        </View>
+        <Pressable style={styles.dialog} onPress={() => undefined}>
+          <Text style={styles.dialogTitle}>Phone Registration</Text>
+          <View style={styles.authTabRow}>
+            {['phone', 'otp', 'profile'].map((mode) => (
+              <Pressable
+                key={mode}
+                onPress={() => setAuthMode(mode)}
+                style={[styles.authTab, authMode === mode ? styles.authTabActive : null]}
+              >
+                <Text style={styles.authTabText}>{mode}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {authMode === 'phone' ? (
+            <>
+              <Pressable style={styles.countryPickerButton} onPress={() => setCountryPickerVisible(true)}>
+                <Text style={styles.countryPickerButtonLabel}>{authForm.countryCode || 'Select'}</Text>
+                <Text style={styles.countryPickerButtonValue}>
+                  {authForm.countryCode ? 'Change country code' : 'Search country code'}
+                </Text>
+              </Pressable>
+              <TextInput
+                value={authForm.phone}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
+                placeholder="Phone number"
+                placeholderTextColor="#7d8b92"
+                keyboardType="phone-pad"
+                style={styles.input}
+              />
+              <Pressable style={styles.sendButtonWide} onPress={() => void startPhoneAuth()}>
+                <Text style={styles.sendButtonText}>Continue</Text>
+              </Pressable>
+            </>
+          ) : authMode === 'otp' ? (
+            <>
+              <TextInput
+                value={authForm.otp}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, otp: value }))}
+                placeholder="Enter OTP"
+                placeholderTextColor="#7d8b92"
+                keyboardType="number-pad"
+                style={styles.input}
+              />
+              <Pressable style={styles.sendButtonWide} onPress={() => void verifyPhoneOtp()}>
+                <Text style={styles.sendButtonText}>Verify OTP</Text>
+              </Pressable>
+            </>
+          ) : (
+            <>
+              <TextInput
+                value={authForm.name}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
+                placeholder="Full name"
+                placeholderTextColor="#7d8b92"
+                style={styles.input}
+              />
+              <TextInput
+                value={authForm.pin}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
+                placeholder="4-digit pin (optional)"
+                placeholderTextColor="#7d8b92"
+                keyboardType="number-pad"
+                secureTextEntry
+                style={styles.input}
+              />
+              <Pressable style={styles.sendButtonWide} onPress={() => void completePhoneRegistration()}>
+                <Text style={styles.sendButtonText}>Finish Setup</Text>
+              </Pressable>
+            </>
+          )}
+        </Pressable>
+      </>
+    );
+
+    if (!dismissible) {
+      return <View style={styles.dialogOverlay}>{content}</View>;
+    }
+
+    return (
+      <Pressable
+        style={styles.dialogOverlay}
+        onPress={() => {
+          if (!authRequired) {
+            setAuthVisible(false);
+          }
+        }}
+      >
+        {content}
+      </Pressable>
+    );
+  };
+
+  if (!bootstrapReady) {
+    return (
+      <View style={styles.screen}>
+        <StatusBar style="light" />
+      </View>
+    );
+  }
+
+  if (authRequired && !currentUserId) {
+    return (
+      <View style={styles.screen}>
+        <StatusBar style="light" />
+        {renderAuthGate()}
+        <Modal
+          transparent
+          animationType="slide"
+          visible={countryPickerVisible}
+          onRequestClose={() => setCountryPickerVisible(false)}
+        >
+          <Pressable style={styles.dialogOverlay} onPress={() => setCountryPickerVisible(false)}>
+            <Pressable style={styles.sheetDialog} onPress={() => undefined}>
+              <Text style={styles.dialogTitle}>Select country code</Text>
+              <TextInput
+                value={countrySearch}
+                onChangeText={setCountrySearch}
+                placeholder="Search country or code"
+                placeholderTextColor="#7d8b92"
+                style={styles.input}
+              />
+              <ScrollView style={styles.countryList}>
+                {filteredCountryOptions.slice(0, 120).map((country) => (
+                  <Pressable
+                    key={`${country.code}-${country.dialCode}`}
+                    style={styles.countryRow}
+                    onPress={() => {
+                      setAuthForm((current) => ({ ...current, countryCode: country.dialCode }));
+                      setCountryPickerVisible(false);
+                      setCountrySearch('');
+                    }}
+                  >
+                    <Text style={styles.sheetOptionTitle}>{country.name}</Text>
+                    <Text style={styles.sheetOptionBody}>{country.dialCode}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </Modal>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.screen}>
@@ -2934,82 +3194,70 @@ export default function App() {
           }
         }}
       >
-        <Pressable style={styles.dialogOverlay} onPress={() => {
-          if (!authRequired) {
-            setAuthVisible(false);
-          }
-        }}>
-          <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>Phone Registration</Text>
-            <View style={styles.authTabRow}>
-              {['phone', 'otp', 'profile'].map((mode) => (
+        {renderAuthGate(true)}
+      </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={countryPickerVisible}
+        onRequestClose={() => setCountryPickerVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setCountryPickerVisible(false)}>
+          <Pressable style={styles.sheetDialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Select country code</Text>
+            <TextInput
+              value={countrySearch}
+              onChangeText={setCountrySearch}
+              placeholder="Search country or code"
+              placeholderTextColor="#7d8b92"
+              style={styles.input}
+            />
+            <ScrollView style={styles.countryList}>
+              {filteredCountryOptions.slice(0, 120).map((country) => (
                 <Pressable
-                  key={mode}
-                  onPress={() => setAuthMode(mode)}
-                  style={[styles.authTab, authMode === mode ? styles.authTabActive : null]}
+                  key={`${country.code}-${country.dialCode}`}
+                  style={styles.countryRow}
+                  onPress={() => {
+                    setAuthForm((current) => ({ ...current, countryCode: country.dialCode }));
+                    setCountryPickerVisible(false);
+                    setCountrySearch('');
+                  }}
                 >
-                  <Text style={styles.authTabText}>{mode}</Text>
+                  <Text style={styles.sheetOptionTitle}>{country.name}</Text>
+                  <Text style={styles.sheetOptionBody}>{country.dialCode}</Text>
                 </Pressable>
               ))}
-            </View>
-            {authMode === 'phone' ? (
-              <>
-                <TextInput
-                  value={authForm.countryCode}
-                  onChangeText={(value) => setAuthForm((current) => ({ ...current, countryCode: value }))}
-                  placeholder="+260"
-                  placeholderTextColor="#7d8b92"
-                  style={styles.input}
-                />
-                <TextInput
-                  value={authForm.phone}
-                  onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
-                  placeholder="Phone number"
-                  placeholderTextColor="#7d8b92"
-                  keyboardType="phone-pad"
-                  style={styles.input}
-                />
-                <Pressable style={styles.sendButtonWide} onPress={() => void startPhoneAuth()}>
-                  <Text style={styles.sendButtonText}>Continue</Text>
-                </Pressable>
-              </>
-            ) : authMode === 'otp' ? (
-              <>
-                <TextInput
-                  value={authForm.otp}
-                  onChangeText={(value) => setAuthForm((current) => ({ ...current, otp: value }))}
-                  placeholder="Enter OTP"
-                  placeholderTextColor="#7d8b92"
-                  keyboardType="number-pad"
-                  style={styles.input}
-                />
-                {authForm.otpHint ? <Text style={styles.cardMeta}>Dev OTP: {authForm.otpHint}</Text> : null}
-                <Pressable style={styles.sendButtonWide} onPress={() => void verifyPhoneOtp()}>
-                  <Text style={styles.sendButtonText}>Verify OTP</Text>
-                </Pressable>
-              </>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="fade"
+        visible={deviceScannerVisible}
+        onRequestClose={() => setDeviceScannerVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setDeviceScannerVisible(false)}>
+          <Pressable style={styles.sheetDialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Link devices</Text>
+            <Text style={styles.cardBody}>
+              {deviceLinking
+                ? 'Finishing secure desktop link...'
+                : 'Scan the desktop QR code from the web login screen.'}
+            </Text>
+            {cameraPermission?.granted ? (
+              <CameraView
+                barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                onBarcodeScanned={deviceLinking ? undefined : ({ data }) => {
+                  if (!deviceScannerVisible) {
+                    return;
+                  }
+                  void confirmLinkedDesktop(data);
+                }}
+                style={styles.scannerView}
+              />
             ) : (
-              <>
-                <TextInput
-                  value={authForm.name}
-                  onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
-                  placeholder="Full name"
-                  placeholderTextColor="#7d8b92"
-                  style={styles.input}
-                />
-                <TextInput
-                  value={authForm.pin}
-                  onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
-                  placeholder="4-digit pin (optional)"
-                  placeholderTextColor="#7d8b92"
-                  keyboardType="number-pad"
-                  secureTextEntry
-                  style={styles.input}
-                />
-                <Pressable style={styles.sendButtonWide} onPress={() => void completePhoneRegistration()}>
-                  <Text style={styles.sendButtonText}>Finish Setup</Text>
-                </Pressable>
-              </>
+              <Text style={styles.cardBody}>Camera permission is required for scanning.</Text>
             )}
           </Pressable>
         </Pressable>
@@ -3773,6 +4021,50 @@ const styles = StyleSheet.create({
     color: '#9ab0b8',
     lineHeight: 19,
   },
+  countryPickerButton: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#223149',
+    backgroundColor: '#0f1620',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 4,
+  },
+  countryPickerButtonLabel: {
+    color: '#edf4ff',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  countryPickerButtonValue: {
+    color: '#8ea1aa',
+  },
+  countryList: {
+    maxHeight: 360,
+  },
+  countryRow: {
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#223149',
+  },
+  scannerView: {
+    width: '100%',
+    aspectRatio: 1,
+    borderRadius: 18,
+    overflow: 'hidden',
+    backgroundColor: '#000000',
+  },
+  deviceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    justifyContent: 'space-between',
+    backgroundColor: '#0f1620',
+    borderRadius: 14,
+    padding: 12,
+  },
+  deviceRowCopy: {
+    flex: 1,
+  },
   sheetBack: {
     alignItems: 'center',
     paddingVertical: 10,
@@ -3782,7 +4074,19 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   dialog: {
+    width: '92%',
+    maxWidth: 560,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(12, 19, 30, 0.96)',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.18)',
+    padding: 24,
+    gap: 14,
+  },
+  sheetDialog: {
     marginHorizontal: 24,
+    maxHeight: '82%',
     backgroundColor: '#111b21',
     borderRadius: 20,
     padding: 20,
@@ -3790,9 +4094,69 @@ const styles = StyleSheet.create({
   },
   dialogOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(2, 6, 14, 0.72)',
     justifyContent: 'center',
-    paddingHorizontal: 24,
+    paddingHorizontal: 16,
+  },
+  authBackdropPreview: {
+    position: 'absolute',
+    inset: 0,
+    backgroundColor: '#01040a',
+    overflow: 'hidden',
+  },
+  authBackdropGlow: {
+    position: 'absolute',
+    width: 280,
+    height: 280,
+    borderRadius: 999,
+    opacity: 0.22,
+  },
+  authBackdropGlowTop: {
+    top: -40,
+    left: -70,
+    backgroundColor: '#2563eb',
+  },
+  authBackdropGlowBottom: {
+    right: -80,
+    bottom: -30,
+    backgroundColor: '#1d4ed8',
+  },
+  authBackdropWord: {
+    position: 'absolute',
+    top: '14%',
+    left: 26,
+    color: '#d9e8ff',
+    fontSize: 38,
+    fontWeight: '900',
+  },
+  authBackdropChip: {
+    position: 'absolute',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 18,
+    backgroundColor: 'rgba(14,23,36,0.72)',
+    borderWidth: 1,
+    borderColor: 'rgba(96,165,250,0.18)',
+  },
+  authBackdropChipTitle: {
+    top: '24%',
+    right: 20,
+  },
+  authBackdropChipReply: {
+    top: '44%',
+    left: 22,
+  },
+  authBackdropChipCall: {
+    bottom: '26%',
+    left: 28,
+  },
+  authBackdropChipStatus: {
+    bottom: '16%',
+    right: 18,
+  },
+  authBackdropChipText: {
+    color: '#dbe5ea',
+    fontWeight: '700',
   },
   callDropdownOverlay: {
     flex: 1,

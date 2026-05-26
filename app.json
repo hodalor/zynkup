@@ -14,7 +14,8 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.zynkup-mobile"
+      "bundleIdentifier": "com.anonymous.zynkup-mobile",
+      "googleServicesFile": "./GoogleService-Info.plist"
     },
     "android": {
       "adaptiveIcon": {
@@ -23,17 +24,36 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.anonymous.zynkupmobile"
+      "package": "com.prynova.zynkup",
+      "googleServicesFile": "./google-services.json"
     },
     "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "$(PRODUCT_NAME) needs camera access to scan desktop QR codes and capture media"
+        }
+      ],
       [
         "@config-plugins/react-native-webrtc",
         {
           "cameraPermission": "$(PRODUCT_NAME) requires camera access for video calls",
           "microphonePermission": "$(PRODUCT_NAME) requires microphone access for audio and video calls"
         }
-      ]
+      ],
+      "@react-native-firebase/app",
+      "@react-native-firebase/auth"
     ],
+    "extra": {
+      "firebase": {
+        "apiKey": "AIzaSyCPxWQs4IqutEG7fzWIdDh85bpVDUCZigk",
+        "authDomain": "zynkup-9f577.firebaseapp.com",
+        "projectId": "zynkup-9f577",
+        "storageBucket": "zynkup-9f577.firebasestorage.app",
+        "messagingSenderId": "597625475865",
+        "appId": "1:597625475865:web:8a3d99339f9a6dcdf1ab88"
+      }
+    },
     "web": {
       "favicon": "./assets/favicon.png"
     }
