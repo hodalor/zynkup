@@ -1,4 +1,5 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import QRCode from 'qrcode';
 import { io, Socket } from 'socket.io-client';
 import './App.css';
 
@@ -91,6 +92,16 @@ type AppUser = {
   phone: string;
 };
 
+type LinkedDevice = {
+  id: string;
+  deviceId: string;
+  userId: string;
+  platform: string;
+  label: string;
+  createdAt: string;
+  lastSeenAt: string;
+};
+
 type UpdateGroup = {
   userId: string;
   name: string;
@@ -116,43 +127,9 @@ const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const STATUS_REACTIONS = ['❤️', '👍', '👎', '🔥', '😂'];
 
-const initialChats: Chat[] = [
-  { id: 'c1', name: 'Mr.Hodalor', preview: '📷 Sunday outfit', time: '7:35 PM', unread: 0, presence: 'online' },
-  { id: 'c2', name: '+260 96 7340068', preview: 'Voice note', time: '1:38 PM', unread: 0, presence: 'last seen recently' },
-  { id: 'c3', name: 'Chilenje C.o.C Youth', preview: '~~LEE/🦋🔥💯❣️: Copy the message...', time: '6:49 PM', unread: 10, presence: 'typing...' },
-  { id: 'c4', name: 'Chory', preview: 'Hi', time: '6:30 PM', unread: 0, presence: 'online' },
-  { id: 'c5', name: 'Princess', preview: '📷 6 photos', time: 'Sunday', unread: 2, presence: 'online' },
-];
+const initialChats: Chat[] = [];
 
-const initialCatalogItems: CatalogItem[] = [
-  {
-    id: 'p1',
-    title: 'Church Suit',
-    price: 'K 1,450',
-    seller: 'Temwa Lesa',
-    category: 'Fashion',
-    description: 'Tailored two-piece suit with same-day fitting available.',
-    imageUrl: 'https://images.unsplash.com/photo-1593032465171-f295b07d0b32?auto=format&fit=crop&w=900&q=80',
-  },
-  {
-    id: 'p2',
-    title: 'Samsung S23',
-    price: 'K 12,800',
-    seller: 'Tech World Zambia',
-    category: 'Phones',
-    description: 'Factory unlocked with charger, case, and receipt.',
-    imageUrl: 'https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=900&q=80',
-  },
-  {
-    id: 'p3',
-    title: 'Blender Pro',
-    price: 'K 780',
-    seller: 'Princess Kitchen Store',
-    category: 'Home',
-    description: 'Heavy-duty blender for smoothies and sauces.',
-    imageUrl: 'https://images.unsplash.com/photo-1570222094114-d054a817e56b?auto=format&fit=crop&w=900&q=80',
-  },
-];
+const initialCatalogItems: CatalogItem[] = [];
 
 const settingsSections = [
   'Favorites',
@@ -200,9 +177,49 @@ const WEBRTC_CONFIGURATION: RTCConfiguration = {
   iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
 };
 
+const getChatTitle = (chat: any, userId: string, userList: AppUser[]) => {
+  if (chat.kind !== 'direct') {
+    return chat.title;
+  }
+
+  const peerId = (chat.participants ?? []).find((participantId: string) => participantId !== userId);
+  return userList.find((user) => user.id === peerId)?.name ?? chat.title;
+};
+
+const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => ({
+  id: chat.id,
+  name: getChatTitle(chat, userId, userList),
+  preview: chat.lastMessagePreview,
+  time: formatClock(chat.updatedAt ?? new Date().toISOString()),
+  unread: chat.unreadCount ?? 0,
+  presence: 'online',
+  peerUserId: chat.kind === 'direct'
+    ? (chat.participants ?? []).find((participantId: string) => participantId !== userId)
+    : undefined,
+});
+
+const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
+  const peerUserId = (call.participantIds ?? []).find((participantId: string) => participantId !== userId);
+  const peerName = userList.find((user) => user.id === peerUserId)?.name ?? 'Call';
+  return {
+    id: call.id,
+    participantIds: call.participantIds ?? [],
+    initiatorId: call.initiatorId ?? call.participantIds?.[0] ?? userId,
+    kind: call.kind,
+    direction: call.initiatorId === userId ? 'outgoing' : 'incoming',
+    state: call.state,
+    startedAt: call.startedAt,
+    durationSeconds: call.durationSeconds ?? 0,
+    answeredAt: call.answeredAt,
+    endedAt: call.endedAt,
+    peerUserId,
+    peerName,
+  };
+};
+
 function App() {
   const [activeView, setActiveView] = useState<View>('chats');
-  const [selectedChatId, setSelectedChatId] = useState<string>('c1');
+  const [selectedChatId, setSelectedChatId] = useState<string>('');
   const [messageDraft, setMessageDraft] = useState('');
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory, setCatalogCategory] = useState('All');
@@ -218,7 +235,7 @@ function App() {
   const [mediaViewer, setMediaViewer] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const [currentUserId, setCurrentUserId] = useState('u1');
+  const [currentUserId, setCurrentUserId] = useState('');
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [users, setUsers] = useState<AppUser[]>([]);
   const [statusText, setStatusText] = useState('');
@@ -245,9 +262,14 @@ function App() {
   const [editingStatusCommentId, setEditingStatusCommentId] = useState<string | null>(null);
   const [editingStatusCommentText, setEditingStatusCommentText] = useState('');
   const [newChatVisible, setNewChatVisible] = useState(false);
-  const [authVisible, setAuthVisible] = useState(false);
-  const [authMode, setAuthMode] = useState<'switch' | 'login' | 'register'>('switch');
-  const [authForm, setAuthForm] = useState({ name: '', phone: '' });
+  const [authRequired, setAuthRequired] = useState(false);
+  const [linkRequestId, setLinkRequestId] = useState('');
+  const [linkToken, setLinkToken] = useState('');
+  const [linkQrDataUrl, setLinkQrDataUrl] = useState('');
+  const [linkStatus, setLinkStatus] = useState<'idle' | 'pending' | 'pin_required' | 'linked' | 'expired'>('idle');
+  const [desktopPin, setDesktopPin] = useState('');
+  const [linkError, setLinkError] = useState('');
+  const [linkedDevices, setLinkedDevices] = useState<LinkedDevice[]>([]);
   const [profile, setProfile] = useState({
     name: 'Temwa Lesa',
     about: 'Seller, founder, and product operator.',
@@ -260,65 +282,7 @@ function App() {
     category: 'Fashion',
     description: '',
   });
-  const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({
-    c1: [
-      {
-        id: 'm1',
-        sender: 'other',
-        kind: 'image',
-        text: 'Sunday outfit',
-        imageUrl:
-          'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?auto=format&fit=crop&w=900&q=80',
-        time: '7:02 PM',
-      },
-      {
-        id: 'm2',
-        sender: 'me',
-        kind: 'text',
-        text: 'Document preview ready',
-        time: '7:02 PM',
-      },
-    ],
-    c2: [
-      {
-        id: 'm3',
-        sender: 'other',
-        kind: 'voice',
-        text: 'Voice note',
-        durationLabel: '0:14',
-        time: '1:38 PM',
-      },
-    ],
-    c3: [
-      {
-        id: 'm4',
-        sender: 'other',
-        kind: 'text',
-        text: '~~LEE/🦋🔥💯❣️: Copy the message and repost',
-        time: '6:49 PM',
-      },
-    ],
-    c4: [
-      {
-        id: 'm5',
-        sender: 'other',
-        kind: 'text',
-        text: 'Hi',
-        time: '6:30 PM',
-      },
-    ],
-    c5: [
-      {
-        id: 'm6',
-        sender: 'other',
-        kind: 'image',
-        text: '6 photos',
-        imageUrl:
-          'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?auto=format&fit=crop&w=900&q=80',
-        time: 'Sunday',
-      },
-    ],
-  });
+  const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({});
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const statusInputRef = useRef<HTMLInputElement | null>(null);
   const catalogInputRef = useRef<HTMLInputElement | null>(null);
@@ -459,46 +423,6 @@ function App() {
     item.assets.some((asset) => asset.kind === 'video') ? STATUS_VIDEO_DURATION_MS : STATUS_IMAGE_DURATION_MS;
   const activeStatusDuration = activeStatusItem ? getStatusItemDuration(activeStatusItem) : null;
 
-  const getChatTitle = (chat: any, userId: string, userList: AppUser[]) => {
-    if (chat.kind !== 'direct') {
-      return chat.title;
-    }
-
-    const peerId = (chat.participants ?? []).find((participantId: string) => participantId !== userId);
-    return userList.find((user) => user.id === peerId)?.name ?? chat.title;
-  };
-
-  const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => ({
-    id: chat.id,
-    name: getChatTitle(chat, userId, userList),
-    preview: chat.lastMessagePreview,
-    time: formatClock(chat.updatedAt ?? new Date().toISOString()),
-    unread: chat.unreadCount ?? 0,
-    presence: 'online',
-    peerUserId: chat.kind === 'direct'
-      ? (chat.participants ?? []).find((participantId: string) => participantId !== userId)
-      : undefined,
-  });
-
-  const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
-    const peerUserId = (call.participantIds ?? []).find((participantId: string) => participantId !== userId);
-    const peerName = userList.find((user) => user.id === peerUserId)?.name ?? 'Call';
-    return {
-      id: call.id,
-      participantIds: call.participantIds ?? [],
-      initiatorId: call.initiatorId ?? call.participantIds?.[0] ?? userId,
-      kind: call.kind,
-      direction: call.initiatorId === userId ? 'outgoing' : 'incoming',
-      state: call.state,
-      startedAt: call.startedAt,
-      durationSeconds: call.durationSeconds ?? 0,
-      answeredAt: call.answeredAt,
-      endedAt: call.endedAt,
-      peerUserId,
-      peerName,
-    };
-  };
-
   const getUserMeta = useCallback((userId: string) => {
     const match = users.find((user) => user.id === userId);
     return {
@@ -590,8 +514,9 @@ function App() {
     }).catch(() => undefined);
   };
 
-  const applyBootstrap = (payload: any) => {
-    setCurrentUserId(payload.currentUserId ?? 'u1');
+  const applyBootstrap = useCallback((payload: any) => {
+    setAuthRequired(Boolean(payload.authRequired));
+    setCurrentUserId(payload.currentUserId ?? '');
     setCurrentDeviceId(payload.currentDeviceId ?? null);
     const nextUsers = payload.users ?? [];
     setUsers(nextUsers);
@@ -647,8 +572,154 @@ function App() {
     );
     setStatuses(payload.statuses ?? []);
     setUpdatesFeed(payload.updatesFeed ?? []);
-  };
+    if (payload.authRequired) {
+      setLinkStatus((current) => (current === 'pin_required' ? current : 'idle'));
+      setDesktopPin('');
+      setLinkedDevices([]);
+      return;
+    }
+
+    setLinkRequestId('');
+    setLinkToken('');
+    setLinkQrDataUrl('');
+    setDesktopPin('');
+    setLinkStatus('linked');
+    setLinkError('');
+  }, []);
   applyBootstrapRef.current = applyBootstrap;
+
+  const fetchLinkedDevices = useCallback(async (userId: string) => {
+    if (!userId) {
+      setLinkedDevices([]);
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/devices?userId=${encodeURIComponent(userId)}`);
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json();
+    setLinkedDevices(payload.devices ?? []);
+  }, []);
+
+  const createDesktopLinkRequest = useCallback(async () => {
+    if (!authRequired || !currentDeviceId) {
+      return;
+    }
+
+    setLinkError('');
+    setDesktopPin('');
+    const response = await fetch(`${API_BASE_URL}/api/link/request`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        deviceId: currentDeviceId,
+        platform: 'web',
+        label: 'Desktop browser',
+      }),
+    });
+    if (!response.ok) {
+      setLinkError('Unable to create a QR link right now.');
+      return;
+    }
+
+    const payload = await response.json();
+    let parsedQrPayload: { token?: string } | null = null;
+    try {
+      parsedQrPayload = JSON.parse(payload.qrPayload ?? '{}');
+    } catch {
+      parsedQrPayload = null;
+    }
+    setLinkRequestId(payload.requestId ?? '');
+    setLinkToken(parsedQrPayload?.token ?? '');
+    setLinkStatus('pending');
+    const qrDataUrl = await QRCode.toDataURL(payload.qrPayload ?? '', {
+      width: 248,
+      margin: 1,
+      color: {
+        dark: '#0f2f33',
+        light: '#f5f7f2',
+      },
+    });
+    setLinkQrDataUrl(qrDataUrl);
+  }, [authRequired, currentDeviceId]);
+
+  const verifyDesktopPin = async () => {
+    if (!linkRequestId || !linkToken || desktopPin.trim().length !== 4) {
+      return;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/api/link/verify-pin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestId: linkRequestId,
+        token: linkToken,
+        pin: desktopPin.trim(),
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      setLinkError(payload.error ?? 'Incorrect pin.');
+      return;
+    }
+
+    if (payload.session?.deviceId) {
+      window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    if (payload.bootstrap) {
+      applyBootstrap(payload.bootstrap);
+    }
+  };
+
+  useEffect(() => {
+    if (authRequired && currentDeviceId && !linkRequestId && linkStatus !== 'pending') {
+      void createDesktopLinkRequest();
+    }
+  }, [authRequired, createDesktopLinkRequest, currentDeviceId, linkRequestId, linkStatus]);
+
+  useEffect(() => {
+    if (!authRequired || !linkRequestId) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      fetch(`${API_BASE_URL}/api/link/request/${encodeURIComponent(linkRequestId)}`)
+        .then((response) => response.json())
+        .then((payload) => {
+          if (payload.status === 'linked') {
+            if (payload.session?.deviceId) {
+              window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+              setCurrentDeviceId(payload.session.deviceId);
+            }
+            if (payload.bootstrap) {
+              applyBootstrapRef.current(payload.bootstrap);
+            }
+            return;
+          }
+
+          if (payload.status === 'pin_required') {
+            setLinkStatus('pin_required');
+            return;
+          }
+
+          if (payload.status === 'expired') {
+            setLinkStatus('expired');
+          }
+        })
+        .catch(() => undefined);
+    }, 1800);
+
+    return () => window.clearInterval(timer);
+  }, [authRequired, linkRequestId]);
+
+  useEffect(() => {
+    if (!authRequired && currentUserId) {
+      void fetchLinkedDevices(currentUserId);
+    }
+  }, [authRequired, currentUserId, fetchLinkedDevices]);
 
   const closeStatusViewer = useCallback(() => {
     setActiveStatusGroupIndex(null);
@@ -1223,76 +1294,6 @@ function App() {
     setCatalogAssetFiles([]);
   };
 
-  const submitAuth = async () => {
-    const endpoint =
-      authMode === 'login'
-        ? '/api/auth/login'
-        : authMode === 'register'
-          ? '/api/auth/register'
-          : '/api/auth/switch';
-    const body =
-      authMode === 'switch'
-        ? {
-            deviceId: currentDeviceId,
-            userId: authForm.phone,
-            platform: 'web',
-            label: 'Web browser',
-          }
-        : {
-            deviceId: currentDeviceId,
-            phone: authForm.phone.trim(),
-            name: authForm.name.trim(),
-            platform: 'web',
-            label: 'Web browser',
-          };
-
-    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      return;
-    }
-
-    const payload = await response.json();
-    if (payload.session?.deviceId) {
-      window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-      setCurrentDeviceId(payload.session.deviceId);
-    }
-    if (payload.bootstrap) {
-      applyBootstrap(payload.bootstrap);
-    }
-    setAuthVisible(false);
-    setAuthForm({ name: '', phone: '' });
-  };
-
-  const switchToUser = async (userId: string) => {
-    const response = await fetch(`${API_BASE_URL}/api/auth/switch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        userId,
-        platform: 'web',
-        label: 'Web browser',
-      }),
-    });
-    if (!response.ok) {
-      return;
-    }
-
-    const payload = await response.json();
-    if (payload.session?.deviceId) {
-      window.localStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-      setCurrentDeviceId(payload.session.deviceId);
-    }
-    if (payload.bootstrap) {
-      applyBootstrap(payload.bootstrap);
-    }
-    setAuthVisible(false);
-  };
-
   const openAttachmentChooser = () => {
     attachmentInputRef.current?.click();
   };
@@ -1639,7 +1640,7 @@ function App() {
         <header className="chat-sidebar-header">
           <h1>Chats</h1>
           <div className="sidebar-header-actions">
-            <button className="compose-square" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">👤</button>
+            <button className="compose-square" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">🖥</button>
             <button className="compose-square" onClick={() => setNewChatVisible(true)} type="button">✎</button>
           </div>
         </header>
@@ -1743,10 +1744,7 @@ function App() {
         ) : (
           <section className="empty-chat-state">
             <h3>No chats yet</h3>
-            <p>Switch account or start a new conversation after login.</p>
-            <button className="send-button" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">
-              Open Account
-            </button>
+            <p>Start a new conversation with one of your synced mobile contacts.</p>
             <button className="send-button secondary-button" onClick={() => setNewChatVisible(true)} type="button">
               New Conversation
             </button>
@@ -1853,8 +1851,8 @@ function App() {
             <button key={section} type="button">{section}</button>
           ))}
         </div>
-        <button className="settings-auth-button" onClick={() => { setAuthMode('switch'); setAuthVisible(true); }} type="button">
-          Switch Or Login
+        <button className="settings-auth-button" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">
+          Refresh Linked Devices
         </button>
       </aside>
 
@@ -1877,6 +1875,30 @@ function App() {
           <span>Phone number</span>
           <input onChange={(event) => setProfile((current) => ({ ...current, phone: event.target.value }))} value={profile.phone} />
         </label>
+
+        <div className="business-panel">
+          <h3>Linked Devices</h3>
+          <div className="linked-device-list">
+            {linkedDevices.length ? linkedDevices.map((device) => (
+              <div className="linked-device-row" key={device.deviceId}>
+                <div>
+                  <strong>{device.label}</strong>
+                  <small>{device.platform} · last seen {formatRelative(device.lastSeenAt)}</small>
+                </div>
+                <button
+                  onClick={() => {
+                    fetch(`${API_BASE_URL}/api/devices/${encodeURIComponent(device.deviceId)}`, { method: 'DELETE' })
+                      .then(() => fetchLinkedDevices(currentUserId))
+                      .catch(() => undefined);
+                  }}
+                  type="button"
+                >
+                  Log out
+                </button>
+              </div>
+            )) : <p>No extra linked devices yet.</p>}
+          </div>
+        </div>
 
         <div className="business-panel">
           <h3>Add Catalog Item</h3>
@@ -1980,13 +2002,59 @@ function App() {
     </main>
   );
 
+  const renderDesktopLinkGate = () => (
+    <div className="desktop-link-gate">
+      <div className="desktop-link-backdrop">
+        <div className="desktop-link-float title">Zynkup</div>
+        <div className="desktop-link-float chat">Chat sent</div>
+        <div className="desktop-link-float reply">Reply delivered</div>
+        <div className="desktop-link-float call">Video call connected</div>
+        <div className="desktop-link-float status">Status updated</div>
+      </div>
+      <div className="desktop-link-overlay" />
+      <div className="desktop-link-card">
+        <div className="desktop-link-copy">
+          <span className="desktop-link-badge">Mobile First</span>
+          <h2>Scan To Log In</h2>
+          <ol>
+            <li>Register and verify your number on mobile.</li>
+            <li>Open `Settings` then `Link devices` on your phone.</li>
+            <li>Scan this QR code to sync chats, contacts, calls, status, and profile.</li>
+          </ol>
+          <p>Desktop mirrors your mobile in real time while both devices stay online.</p>
+          <small>You can link up to 5 devices. If you hit the limit, log out from one of your linked devices first.</small>
+        </div>
+        <div className="desktop-link-qr-panel">
+          {linkQrDataUrl ? <img alt="Link Zynkup desktop" src={linkQrDataUrl} /> : <div className="desktop-link-qr-placeholder">Preparing QR...</div>}
+          {linkStatus === 'pin_required' ? (
+            <div className="desktop-pin-card">
+              <strong>Enter your app pin</strong>
+              <input
+                inputMode="numeric"
+                maxLength={4}
+                onChange={(event) => setDesktopPin(event.target.value.replace(/[^\d]/g, '').slice(0, 4))}
+                placeholder="4-digit pin"
+                value={desktopPin}
+              />
+              <button className="send-button" onClick={() => void verifyDesktopPin()} type="button">Unlock Desktop</button>
+            </div>
+          ) : null}
+          {linkStatus === 'expired' ? (
+            <button className="send-button" onClick={() => void createDesktopLinkRequest()} type="button">Refresh QR</button>
+          ) : null}
+          {linkError ? <p className="desktop-link-error">{linkError}</p> : null}
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="desktop-shell">
       <aside className="rail">
         <div className="rail-icons">
           <button className={`rail-button rail-badged ${activeView === 'chats' ? 'active' : ''}`} onClick={() => setActiveView('chats')} type="button">
             💬
-            <span>25</span>
+            {chatItems.length ? <span>{chatItems.length}</span> : null}
           </button>
           <button className={`rail-button ${activeView === 'updates' ? 'active' : ''}`} onClick={() => setActiveView('updates')} type="button">◌</button>
           <button className={`rail-button ${activeView === 'catalog' ? 'active' : ''}`} onClick={() => setActiveView('catalog')} type="button">🏬</button>
@@ -2354,45 +2422,7 @@ function App() {
         </div>
       ) : null}
 
-      {authVisible ? (
-        <div className="modal-overlay" onClick={() => setAuthVisible(false)}>
-          <div className="dialog-card auth-card" onClick={(event) => event.stopPropagation()}>
-            <h3>Account</h3>
-            <div className="auth-tabs">
-              <button className={authMode === 'switch' ? 'active' : ''} onClick={() => setAuthMode('switch')} type="button">Switch</button>
-              <button className={authMode === 'login' ? 'active' : ''} onClick={() => setAuthMode('login')} type="button">Login</button>
-              <button className={authMode === 'register' ? 'active' : ''} onClick={() => setAuthMode('register')} type="button">Register</button>
-            </div>
-            {authMode === 'switch' ? (
-              <div className="auth-account-list">
-                {users.map((user) => (
-                  <button key={user.id} onClick={() => void switchToUser(user.id)} type="button">
-                    {user.name} · {user.phone}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="auth-form">
-                {authMode === 'register' ? (
-                  <input
-                    onChange={(event) => setAuthForm((current) => ({ ...current, name: event.target.value }))}
-                    placeholder="Full name"
-                    value={authForm.name}
-                  />
-                ) : null}
-                <input
-                  onChange={(event) => setAuthForm((current) => ({ ...current, phone: event.target.value }))}
-                  placeholder="Phone number"
-                  value={authForm.phone}
-                />
-                <button className="send-button" onClick={() => void submitAuth()} type="button">
-                  Continue
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      ) : null}
+      {authRequired ? renderDesktopLinkGate() : null}
     </div>
   );
 }
