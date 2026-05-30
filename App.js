@@ -25,6 +25,32 @@ import {
 import { io } from 'socket.io-client';
 import { firebaseAuth, firebaseConfigReady, nativeFirebaseReady } from './firebaseConfig';
 
+const BODY_FONT_FAMILY = Platform.select({
+  android: 'sans-serif',
+  ios: 'System',
+  default: undefined,
+});
+
+const DISPLAY_FONT_FAMILY = Platform.select({
+  android: 'sans-serif-medium',
+  ios: 'System',
+  default: BODY_FONT_FAMILY,
+});
+
+if (BODY_FONT_FAMILY) {
+  const existingTextStyle = Text.defaultProps?.style;
+  Text.defaultProps = Text.defaultProps || {};
+  Text.defaultProps.style = existingTextStyle
+    ? [{ fontFamily: BODY_FONT_FAMILY }, existingTextStyle]
+    : { fontFamily: BODY_FONT_FAMILY };
+
+  const existingInputStyle = TextInput.defaultProps?.style;
+  TextInput.defaultProps = TextInput.defaultProps || {};
+  TextInput.defaultProps.style = existingInputStyle
+    ? [{ fontFamily: BODY_FONT_FAMILY }, existingInputStyle]
+    : { fontFamily: BODY_FONT_FAMILY };
+}
+
 let webRtcModule = null;
 try {
   // Expo Go does not include this native module, so load it lazily.
@@ -47,7 +73,7 @@ const CAN_USE_NATIVE_WEBRTC = Boolean(
 );
 
 const AnimatedText = Animated.createAnimatedComponent(Text);
-const tabs = ['Updates', 'Calls', 'Tools', 'Chats', 'Settings'];
+const tabs = ['Chats', 'Status', 'Compose', 'Pay', 'Business'];
 const settingsSections = [
   'Favorites',
   'Business tools',
@@ -61,13 +87,12 @@ const settingsSections = [
 ];
 const emojiOptions = ['😀', '😂', '🤣', '😍', '🔥', '🙏', '🎉', '❤️'];
 const tabBadges = {
-  Updates: 0,
-  Calls: 0,
-  Tools: 0,
   Chats: 0,
-  Settings: 0,
+  Status: 0,
+  Compose: 0,
+  Pay: 0,
+  Business: 0,
 };
-const categoryOptions = ['All', 'Fashion', 'Electronics', 'Home', 'Phones'];
 const statusBackgroundOptions = ['#10233e', '#1f2937', '#14532d', '#7c2d12', '#581c87'];
 const statusFontOptions = ['System', 'serif', 'monospace'];
 const statusReactionOptions = ['❤️', '👍', '👎', '🔥', '😂'];
@@ -107,6 +132,16 @@ const normalizeAuthPhone = (countryCode, phoneNumber) => {
   const digits = phoneNumber.replace(/[^\d]/g, '');
   return `${cc}${digits}`;
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const deriveAuthUsername = (value) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '.')
+    .replace(/^\.+|\.+$/g, '')
+    .slice(0, 24);
 
 const extractEmojiTokens = (text) => text.match(EMOJI_REGEX) ?? [];
 
@@ -156,6 +191,7 @@ const inferMimeType = (uri, fallback = 'application/octet-stream') => {
 
 export default function App() {
   const [activeView, setActiveView] = useState('Chats');
+  const [chatMode, setChatMode] = useState('personal');
   const [chatScreen, setChatScreen] = useState('list');
   const [selectedChatId, setSelectedChatId] = useState('');
   const [currentUserId, setCurrentUserId] = useState('');
@@ -182,8 +218,8 @@ export default function App() {
     category: 'Fashion',
     description: '',
   });
-  const [catalogSearch, setCatalogSearch] = useState('');
-  const [catalogCategory, setCatalogCategory] = useState('All');
+  const [catalogSearch] = useState('');
+  const [catalogCategory] = useState('All');
   const [statusAssetUris, setStatusAssetUris] = useState([]);
   const [catalogImageUris, setCatalogImageUris] = useState([]);
   const [updatesFeed, setUpdatesFeed] = useState([]);
@@ -223,7 +259,15 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authVisible, setAuthVisible] = useState(false);
   const [bootstrapReady, setBootstrapReady] = useState(false);
-  const [authMode, setAuthMode] = useState('phone');
+  const [authMode, setAuthMode] = useState('welcome');
+  const [authPendingAction, setAuthPendingAction] = useState('');
+  const [toastState, setToastState] = useState({
+    visible: false,
+    type: 'info',
+    message: '',
+  });
+  const [entryCelebrationVisible, setEntryCelebrationVisible] = useState(false);
+  const [entryCelebrationName, setEntryCelebrationName] = useState('');
   const [countryPickerVisible, setCountryPickerVisible] = useState(false);
   const [countrySearch, setCountrySearch] = useState('');
   const [deviceScannerVisible, setDeviceScannerVisible] = useState(false);
@@ -237,9 +281,14 @@ export default function App() {
     verifiedPhone: '',
     name: '',
     pin: '',
+    username: '',
+    language: 'English (Ghana)  GH',
+    accountType: 'personal',
+    photoUri: '',
   });
   const phoneAuthConfirmationRef = useRef(null);
   const phoneAuthIdTokenRef = useRef('');
+  const toastTimeoutRef = useRef(null);
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
@@ -293,6 +342,242 @@ export default function App() {
       country.code.toLowerCase().includes(query),
     );
   }, [countrySearch]);
+
+  const visibleChatItems = useMemo(() => {
+    const businessMatcher = /(store|shop|business|board|room|receipt|market|kitchen|biz)/i;
+    const personalChats = chatItems.filter((chat) => !businessMatcher.test(chat.name));
+    const businessChats = chatItems.filter((chat) => businessMatcher.test(chat.name));
+    const selectedItems = chatMode === 'business' ? businessChats : personalChats;
+    return (selectedItems.length ? selectedItems : chatItems).slice(0, 8);
+  }, [chatItems, chatMode]);
+
+  const payQuickContacts = useMemo(() => {
+    const merged = [
+      ...contactItems.map((contact) => ({
+        id: contact.id,
+        name: contact.name,
+      })),
+      ...chatItems.map((chat) => ({
+        id: chat.id,
+        name: chat.name,
+      })),
+    ];
+
+    const unique = [];
+    const seen = new Set();
+    merged.forEach((entry) => {
+      const key = entry.name.trim().toLowerCase();
+      if (!key || seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      unique.push(entry);
+    });
+    return unique.slice(0, 5);
+  }, [chatItems, contactItems]);
+
+  const payTransactions = useMemo(() => {
+    const base = payQuickContacts.slice(0, 3);
+    const fallback = ['Afia', 'Maame Sika Store', 'Kwame'];
+    return [0, 1, 2].map((index) => {
+      const name = base[index]?.name ?? fallback[index];
+      if (index === 0) {
+        return { id: `${name}-sent`, title: `Sent to ${name}`, time: 'Today, 10:06 AM', amount: '-GHC 50', positive: false };
+      }
+      if (index === 1) {
+        return { id: `${name}-merchant`, title: name, time: 'Today, 9:50 AM', amount: '-GHC 45', positive: false };
+      }
+      return { id: `${name}-received`, title: `Received from ${name}`, time: 'Yesterday, 3:12 PM', amount: '+GHC 200', positive: true };
+    });
+  }, [payQuickContacts]);
+
+  const selectedAuthCountry = useMemo(
+    () => COUNTRY_OPTIONS.find((country) => country.dialCode === authForm.countryCode) ?? null,
+    [authForm.countryCode],
+  );
+
+  const authStepNumber = useMemo(() => {
+    if (authMode === 'phone') return 1;
+    if (authMode === 'otp') return 2;
+    if (authMode === 'profile') return 3;
+    if (authMode === 'account') return 4;
+    return 0;
+  }, [authMode]);
+
+  const authProgressWidth = authStepNumber ? `${Math.min(100, (authStepNumber / 4) * 100)}%` : '0%';
+  const authOtpDigits = Array.from({ length: 6 }, (_, index) => authForm.otp[index] ?? '');
+  const isAuthBusy = Boolean(authPendingAction);
+  const authPendingLabel =
+    authPendingAction === 'send-code'
+      ? 'Sending verification code...'
+      : authPendingAction === 'verify-otp'
+        ? 'Verifying your code...'
+        : authPendingAction === 'register'
+          ? 'Creating your account...'
+          : '';
+  const celebrationDisplayName =
+    entryCelebrationName ||
+    authForm.name.trim().split(/\s+/)[0] ||
+    profile.name.trim().split(/\s+/)[0] ||
+    'there';
+
+  const dismissToast = () => {
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+      toastTimeoutRef.current = null;
+    }
+    setToastState((current) => ({ ...current, visible: false }));
+  };
+
+  const showToast = (message, type = 'info', duration = 2600) => {
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+      toastTimeoutRef.current = null;
+    }
+    setToastState({
+      visible: true,
+      type,
+      message,
+    });
+    if (duration > 0) {
+      toastTimeoutRef.current = setTimeout(() => {
+        setToastState((current) => ({ ...current, visible: false }));
+        toastTimeoutRef.current = null;
+      }, duration);
+    }
+  };
+
+  const hydrateBootstrapFromDevice = async (deviceIdHint) => {
+    const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
+    const deviceIds = [deviceIdHint, currentDeviceId, storedDeviceId].filter(Boolean);
+    const uniqueDeviceIds = [...new Set(deviceIds)];
+    if (!uniqueDeviceIds.length) {
+      return null;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      for (const deviceId of uniqueDeviceIds) {
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/bootstrap?deviceId=${encodeURIComponent(deviceId)}`);
+          if (!response.ok) {
+            continue;
+          }
+          const payload = await response.json();
+          if (payload?.currentUserId) {
+            applyBootstrapPayload(payload);
+            return payload;
+          }
+        } catch {
+          // Retry below after a short delay.
+        }
+      }
+      if (attempt < 2) {
+        await sleep(400);
+      }
+    }
+
+    return null;
+  };
+
+  const resetAuthForm = () => {
+    setAuthForm({
+      countryCode: '',
+      phone: '',
+      otp: '',
+      verifiedPhone: '',
+      name: '',
+      pin: '',
+      username: '',
+      language: 'English (Ghana)  GH',
+      accountType: '',
+      photoUri: '',
+    });
+    setAuthMode('welcome');
+  };
+
+  const goBackAuthStep = () => {
+    if (authMode === 'phone') {
+      setAuthMode('welcome');
+      return;
+    }
+    if (authMode === 'otp') {
+      setAuthMode('phone');
+      return;
+    }
+    if (authMode === 'profile') {
+      setAuthMode('otp');
+      return;
+    }
+    if (authMode === 'account') {
+      setAuthMode('profile');
+    }
+  };
+
+  const appendOtpDigit = (digit) => {
+    setAuthForm((current) => {
+      if (current.otp.length >= 6) {
+        return current;
+      }
+      return {
+        ...current,
+        otp: `${current.otp}${digit}`,
+      };
+    });
+  };
+
+  const removeOtpDigit = () => {
+    setAuthForm((current) => ({
+      ...current,
+      otp: current.otp.slice(0, -1),
+    }));
+  };
+
+  const pickAuthProfilePhoto = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Permission needed', 'Please allow gallery access to select a profile photo.');
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 1,
+      allowsEditing: true,
+      aspect: [1, 1],
+    });
+
+    if (!result.canceled && result.assets?.length) {
+      setAuthForm((current) => ({
+        ...current,
+        photoUri: result.assets[0].uri,
+      }));
+    }
+  };
+
+  const continueFromProfileStep = () => {
+    const trimmedName = authForm.name.trim();
+    if (!trimmedName) {
+      showToast('Enter your name to continue.', 'error');
+      return;
+    }
+
+    setAuthForm((current) => ({
+      ...current,
+      name: trimmedName,
+      username: current.username.trim() || deriveAuthUsername(trimmedName),
+    }));
+    setAuthMode('account');
+  };
+
+  const submitSelectedAccountType = (accountType) => {
+    if (isAuthBusy) {
+      return;
+    }
+    setAuthForm((current) => ({
+      ...current,
+      accountType,
+    }));
+  };
 
   const closePeerConnection = () => {
     peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop?.());
@@ -867,14 +1152,17 @@ export default function App() {
         return;
       } catch {
         const query = storedDeviceId ? `?deviceId=${encodeURIComponent(storedDeviceId)}` : '';
-        fetch(`${API_BASE_URL}/api/bootstrap${query}`)
-          .then((response) => response.json())
-          .then((payload) => {
-            if (!cancelled) {
-              applyBootstrapPayload(payload);
-            }
-          })
-          .catch(() => undefined);
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/bootstrap${query}`);
+          const payload = await response.json();
+          if (!cancelled) {
+            applyBootstrapPayload(payload);
+          }
+        } catch {
+          if (!cancelled) {
+            setBootstrapReady(true);
+          }
+        }
       }
     };
 
@@ -1601,6 +1889,14 @@ export default function App() {
     openReactorList();
   }, [activeStatusItem?.reactions?.length, statusReactorsVisible]);
 
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) {
+        clearTimeout(toastTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const createDirectChat = async (peerUserId, seedMessage) => {
     const response = await fetch(`${API_BASE_URL}/api/chats`, {
       method: 'POST',
@@ -1624,28 +1920,37 @@ export default function App() {
   };
 
   const startPhoneAuth = async () => {
+    if (isAuthBusy) {
+      return;
+    }
     if (!nativeFirebaseReady || !firebaseAuth) {
-      Alert.alert('Phone verification', 'Firebase native auth is not available in this runtime. Open the installed Zynkup app in the development build, not Expo Go, then try again.');
+      showToast(
+        'Firebase phone auth is not available in this runtime. Open the installed app, not Expo Go.',
+        'error',
+        3600,
+      );
       return;
     }
 
     if (!firebaseConfigReady) {
-      Alert.alert('Phone verification', 'Firebase mobile auth is not configured yet.');
+      showToast('Firebase mobile auth is not configured yet.', 'error');
       return;
     }
 
     if (!authForm.countryCode.trim()) {
-      Alert.alert('Phone verification', 'Select your country code first.');
+      showToast('Select your country code first.', 'error');
       setCountryPickerVisible(true);
       return;
     }
 
     const normalizedPhone = normalizeAuthPhone(authForm.countryCode.trim(), authForm.phone.trim());
     if (normalizedPhone.length < 8) {
-      Alert.alert('Phone verification', 'Enter a valid phone number first.');
+      showToast('Enter a valid phone number first.', 'error');
       return;
     }
 
+    setAuthPendingAction('send-code');
+    showToast('Sending verification code...', 'info', 0);
     try {
       phoneAuthConfirmationRef.current = await firebaseAuth.signInWithPhoneNumber(normalizedPhone);
       setAuthForm((current) => ({
@@ -1654,120 +1959,226 @@ export default function App() {
         verifiedPhone: normalizedPhone,
       }));
       setAuthMode('otp');
+      showToast('Code sent. Enter the OTP to continue.', 'success');
     } catch (error) {
-      Alert.alert('Phone verification', 'Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.');
+      showToast('Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.', 'error', 3600);
+    } finally {
+      setAuthPendingAction('');
     }
   };
 
   const verifyPhoneOtp = async () => {
+    if (isAuthBusy) {
+      return;
+    }
     if (!phoneAuthConfirmationRef.current) {
-      Alert.alert('OTP', 'Start phone verification first.');
+      showToast('Start phone verification first.', 'error');
       return;
     }
 
+    if (authForm.otp.trim().length !== 6) {
+      showToast('Enter the full 6-digit OTP first.', 'error');
+      return;
+    }
+
+    setAuthPendingAction('verify-otp');
+    showToast('Verifying your code...', 'info', 0);
     let credential = null;
     try {
       credential = await phoneAuthConfirmationRef.current.confirm(authForm.otp.trim());
     } catch (error) {
-      Alert.alert('OTP', 'The OTP is invalid or expired.');
+      showToast('The OTP is invalid or expired.', 'error');
+      setAuthPendingAction('');
       return;
     }
 
     const verifiedPhone = credential?.user?.phoneNumber ?? authForm.verifiedPhone;
     const idToken = await credential?.user?.getIdToken(true);
     if (!idToken || !verifiedPhone) {
-      Alert.alert('OTP', 'Firebase verification completed, but the secure token could not be read.');
+      showToast('Firebase verification succeeded, but the secure token could not be read.', 'error', 3600);
+      setAuthPendingAction('');
       return;
     }
     phoneAuthIdTokenRef.current = idToken;
-    const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        idToken,
-        phone: verifiedPhone,
-        platform: Platform.OS,
-        label: `${Platform.OS} device`,
-      }),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      Alert.alert('OTP', payload.error ?? 'Unable to verify this phone on the server.');
-      return;
-    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: currentDeviceId,
+          idToken,
+          phone: verifiedPhone,
+          platform: Platform.OS,
+          label: `${Platform.OS} device`,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error ?? 'Unable to verify this phone on the server.', 'error', 3600);
+        return;
+      }
 
-    if (payload.registrationRequired) {
+      if (payload.registrationRequired) {
+        setAuthForm((current) => ({
+          ...current,
+          verifiedPhone,
+        }));
+        setAuthMode('profile');
+        showToast('Phone verified. Complete your profile to continue.', 'success');
+        return;
+      }
+
+      if (payload.session?.deviceId) {
+        await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+        setCurrentDeviceId(payload.session.deviceId);
+      }
+
+      let bootstrapPayload = payload.bootstrap ?? null;
+      if (bootstrapPayload?.currentUserId) {
+        applyBootstrapPayload(bootstrapPayload);
+      } else {
+        bootstrapPayload = await hydrateBootstrapFromDevice(payload.session?.deviceId ?? currentDeviceId);
+      }
+
+      if (!bootstrapPayload?.currentUserId) {
+        setAuthForm((current) => ({
+          ...current,
+          verifiedPhone,
+        }));
+        setAuthMode('profile');
+        showToast('Phone verified. We could not restore the session yet, so continue registration.', 'success', 3600);
+        return;
+      }
+
+      setAuthVisible(false);
+      setAuthRequired(false);
+      resetAuthForm();
+      showToast('Welcome back. Signing you in...', 'success');
+    } catch {
       setAuthForm((current) => ({
         ...current,
         verifiedPhone,
       }));
       setAuthMode('profile');
+      showToast('Phone verified. Network sync is slow, so continue registration.', 'success', 3600);
+    } finally {
+      setAuthPendingAction('');
+    }
+  };
+
+  const completePhoneRegistration = async (selectedAccountType = authForm.accountType) => {
+    if (isAuthBusy) {
+      return;
+    }
+    const accountType =
+      selectedAccountType === 'business' || selectedAccountType === 'personal' ? selectedAccountType : '';
+    if (!authForm.verifiedPhone) {
+      showToast('Verify your phone number with the OTP first.', 'error');
       return;
     }
 
-    if (payload.session?.deviceId) {
-      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-      setCurrentDeviceId(payload.session.deviceId);
-    }
-    if (payload.bootstrap) {
-      applyBootstrapPayload(payload.bootstrap);
-    }
-    setAuthVisible(false);
-    setAuthRequired(false);
-  };
-
-  const completePhoneRegistration = async () => {
-    if (!authForm.verifiedPhone) {
-      Alert.alert('Registration', 'Verify your phone number with the OTP first.');
+    if (!accountType) {
+      showToast('Choose Personal or Business to continue.', 'error');
+      setAuthMode('account');
       return;
     }
 
     if (!phoneAuthIdTokenRef.current) {
-      Alert.alert('Registration', 'The secure Firebase token is missing. Verify your OTP again.');
+      showToast('The secure Firebase token is missing. Verify your OTP again.', 'error', 3600);
       return;
     }
 
-    const response = await fetch(`${API_BASE_URL}/api/auth/phone/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        deviceId: currentDeviceId,
-        idToken: phoneAuthIdTokenRef.current,
-        phone: authForm.verifiedPhone,
-        countryCode: authForm.countryCode.trim(),
-        name: authForm.name.trim(),
-        pin: authForm.pin.trim() || undefined,
-        platform: Platform.OS,
-        label: `${Platform.OS} device`,
-      }),
-    });
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      Alert.alert('Registration', payload.error ?? 'Unable to finish registration right now.');
+    if (!authForm.name.trim()) {
+      showToast('Enter your name to continue.', 'error');
+      setAuthMode('profile');
       return;
     }
 
-    const payload = await response.json();
-    if (payload.session?.deviceId) {
-      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-      setCurrentDeviceId(payload.session.deviceId);
+    setAuthPendingAction('register');
+    showToast('Creating your account...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/phone/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: currentDeviceId,
+          idToken: phoneAuthIdTokenRef.current,
+          phone: authForm.verifiedPhone,
+          countryCode: authForm.countryCode.trim(),
+          name: authForm.name.trim(),
+          pin: authForm.pin.trim() || undefined,
+          platform: Platform.OS,
+          label: `${Platform.OS} device`,
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        showToast(payload.error ?? 'Unable to finish registration right now.', 'error', 3600);
+        return;
+      }
+
+      const payload = await response.json();
+      if (payload.session?.deviceId) {
+        await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+        setCurrentDeviceId(payload.session.deviceId);
+      }
+
+      let bootstrapPayload = payload.bootstrap ?? null;
+      if (bootstrapPayload?.currentUserId) {
+        applyBootstrapPayload(bootstrapPayload);
+      } else {
+        showToast('Account created. Finalizing your session...', 'info', 0);
+        bootstrapPayload = await hydrateBootstrapFromDevice(payload.session?.deviceId ?? currentDeviceId);
+      }
+
+      if (!bootstrapPayload?.currentUserId) {
+        showToast('Your account was created, but the app could not open the next screen yet. Please reopen the app once.', 'error', 4200);
+        return;
+      }
+
+      const authAvatar =
+        authForm.name
+          .trim()
+          .split(/\s+/)
+          .slice(0, 2)
+          .map((part) => part.slice(0, 1).toUpperCase())
+          .join('')
+          .slice(0, 4) || 'ZU';
+      await fetch(`${API_BASE_URL}/api/profile?userId=${encodeURIComponent(bootstrapPayload.currentUserId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: authForm.name.trim(),
+          username: authForm.username.trim() ? `@${authForm.username.trim().replace(/^@/, '')}` : undefined,
+          avatar: authAvatar,
+          about:
+            accountType === 'business'
+              ? 'Business account on Zynkup.'
+              : 'Personal account on Zynkup.',
+          businessName: accountType === 'business' ? authForm.name.trim() : undefined,
+          businessDescription:
+            accountType === 'business'
+              ? 'Sell products, accept payments, and manage customers.'
+              : undefined,
+        }),
+      }).catch(() => undefined);
+
+      const registeredName = authForm.name.trim().split(/\s+/)[0] || 'there';
+      setEntryCelebrationName(registeredName);
+      setEntryCelebrationVisible(true);
+      setChatMode(accountType === 'business' ? 'business' : 'personal');
+      setActiveView(accountType === 'business' ? 'Business' : 'Chats');
+      setAuthVisible(false);
+      setAuthRequired(false);
+      resetAuthForm();
+      phoneAuthConfirmationRef.current = null;
+      phoneAuthIdTokenRef.current = '';
+      showToast('Registration complete. Opening your account...', 'success');
+    } catch {
+      showToast('Registration could not finish right now. Check your network and try again.', 'error', 3600);
+    } finally {
+      setAuthPendingAction('');
     }
-    if (payload.bootstrap) {
-      applyBootstrapPayload(payload.bootstrap);
-    }
-    setAuthVisible(false);
-    setAuthRequired(false);
-    setAuthForm({
-      countryCode: '',
-      phone: '',
-      otp: '',
-      verifiedPhone: '',
-      name: '',
-      pin: '',
-    });
-    phoneAuthConfirmationRef.current = null;
-    phoneAuthIdTokenRef.current = '';
   };
 
   const startCall = async (kind) => {
@@ -1801,7 +2212,7 @@ export default function App() {
     const payload = await response.json();
     if (payload.call) {
       upsertCall(payload.call);
-      setActiveView('Calls');
+      setActiveView('Chats');
       setChatScreen('list');
     }
   };
@@ -2243,61 +2654,98 @@ export default function App() {
     </View>
   );
 
-  const renderChatList = () => (
-    <>
-      <View style={styles.topBar}>
-        <Pressable style={styles.iconCircle}>
-          <Text style={styles.iconText}>⋯</Text>
-        </Pressable>
-        <Text style={styles.centerTitle}>Chats</Text>
-        <View style={styles.topActions}>
-          <Pressable style={styles.iconCircle} onPress={() => setActiveView('Tools')}>
-            <Text style={styles.iconText}>🏬</Text>
-          </Pressable>
-          <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
-            <Text style={styles.iconText}>☎</Text>
-          </Pressable>
+  const renderChatList = () => {
+    const recentChats = visibleChatItems.slice(0, 4);
+    const earlierChats = visibleChatItems.slice(4);
+    const avatarPalette = ['#dff3ec', '#f8eedb', '#e3edf7', '#f0dff0', '#e6f4f1'];
+
+    const renderChatRow = (chat, index) => (
+      <Pressable
+        key={chat.id}
+        style={styles.chatHomeRow}
+        onPress={() => {
+          setSelectedChatId(chat.id);
+          setChatScreen('detail');
+        }}
+      >
+        <View style={[styles.chatHomeAvatar, { backgroundColor: avatarPalette[index % avatarPalette.length] }]}>
+          <Text style={styles.chatHomeAvatarText}>{chat.name.slice(0, 1).toUpperCase()}</Text>
+          {chat.unread > 0 ? <View style={styles.chatHomePresenceDot} /> : null}
         </View>
-      </View>
-
-      <Pressable style={styles.archiveRow}>
-        <Text style={styles.archiveIcon}>▭</Text>
-        <Text style={styles.archiveText}>Archived</Text>
+        <View style={styles.chatHomeCopy}>
+          <View style={styles.chatHomeTopRow}>
+            <View style={styles.chatHomeNameRow}>
+              <Text numberOfLines={1} style={styles.chatHomeName}>{chat.name}</Text>
+              {/(store|shop|business|biz|kitchen|board)/i.test(chat.name) ? (
+                <Text style={styles.chatHomeBadge}>BIZ</Text>
+              ) : null}
+            </View>
+            <Text style={styles.chatHomeTime}>{chat.time}</Text>
+          </View>
+          <View style={styles.chatHomeBottomRow}>
+            <Text numberOfLines={1} style={styles.chatHomePreview}>{chat.preview}</Text>
+            {chat.unread > 0 ? (
+              <View style={styles.chatHomeUnread}>
+                <Text style={styles.chatHomeUnreadText}>{chat.unread}</Text>
+              </View>
+            ) : (
+              <View style={styles.chatHomeMuted}>
+                <Text style={styles.chatHomeMutedText}>-</Text>
+              </View>
+            )}
+          </View>
+        </View>
       </Pressable>
+    );
 
-      <ScrollView style={styles.chatList} showsVerticalScrollIndicator={false}>
-        {chatItems.length ? chatItems.map((chat) => (
-          <Pressable key={chat.id} style={styles.chatRow} onPress={() => { setSelectedChatId(chat.id); setChatScreen('detail'); }}>
-            <View style={styles.avatarCircle}>
-              <Text style={styles.avatarText}>{chat.name.slice(0, 2).toUpperCase()}</Text>
-            </View>
-            <View style={styles.chatRowCopy}>
-              <View style={styles.chatRowTop}>
-                <Text style={styles.chatName}>{chat.name}</Text>
-                <Text style={[styles.chatTime, chat.unread > 0 ? styles.chatTimeActive : null]}>{chat.time}</Text>
-              </View>
-              <View style={styles.chatRowBottom}>
-                <Text numberOfLines={2} style={styles.chatPreview}>{chat.preview}</Text>
-                {chat.unread > 0 ? (
-                  <View style={styles.unreadBadge}>
-                    <Text style={styles.unreadBadgeText}>{chat.unread}</Text>
-                  </View>
-                ) : null}
-              </View>
-            </View>
-          </Pressable>
-        )) : (
-          <View style={styles.emptyChatCard}>
-            <Text style={styles.cardTitle}>No chats yet</Text>
-            <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
-            <Pressable style={styles.sendButtonWide} onPress={() => setNewChatVisible(true)}>
-              <Text style={styles.sendButtonText}>New conversation</Text>
+    return (
+      <View style={styles.lightScreen}>
+        <View style={styles.lightHeader}>
+          <Text style={styles.appWordmark}>
+            Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
+          </Text>
+          <View style={styles.lightHeaderActions}>
+            <Pressable style={styles.lightHeaderAction}>
+              <Text style={styles.lightHeaderActionText}>⌕</Text>
+            </Pressable>
+            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+              <Text style={styles.lightHeaderActionText}>⌁</Text>
             </Pressable>
           </View>
-        )}
-      </ScrollView>
-    </>
-  );
+        </View>
+
+        <View style={styles.modeSwitch}>
+          {['personal', 'business'].map((mode) => (
+            <Pressable
+              key={mode}
+              style={[styles.modeSwitchButton, chatMode === mode ? styles.modeSwitchButtonActive : null]}
+              onPress={() => setChatMode(mode)}
+            >
+              <Text style={[styles.modeSwitchText, chatMode === mode ? styles.modeSwitchTextActive : null]}>
+                {mode === 'personal' ? 'Personal' : 'Business'}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+          <Text style={styles.lightSectionLabel}>RECENT</Text>
+          {recentChats.length ? recentChats.map((chat, index) => renderChatRow(chat, index)) : (
+            <View style={styles.emptyChatCard}>
+              <Text style={styles.cardTitle}>No chats yet</Text>
+              <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
+              <Pressable style={styles.sendButtonWide} onPress={() => setNewChatVisible(true)}>
+                <Text style={styles.sendButtonText}>New conversation</Text>
+              </Pressable>
+            </View>
+          )}
+
+          {earlierChats.length ? <Text style={styles.lightSectionLabel}>EARLIER TODAY</Text> : null}
+          {earlierChats.map((chat, index) => renderChatRow(chat, index + recentChats.length))}
+        </ScrollView>
+      </View>
+    );
+  };
 
   const renderCalls = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
@@ -2312,119 +2760,220 @@ export default function App() {
     </ScrollView>
   );
 
-  const renderCatalog = () => (
-    <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
-      <Text style={styles.secondaryTitle}>Catalog</Text>
-      <TextInput
-        value={catalogSearch}
-        onChangeText={setCatalogSearch}
-        placeholder="Search products from sellers around the world"
-        placeholderTextColor="#7d8b92"
-        style={styles.input}
-      />
+  const renderPay = () => (
+    <View style={styles.lightScreen}>
+      <View style={styles.lightHeader}>
+        <Text style={styles.payWordmark}>
+          Zynk<Text style={styles.appWordmarkAccent}>Up</Text> Pay
+        </Text>
+        <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+          <Text style={styles.lightHeaderActionText}>◔</Text>
+        </Pressable>
+      </View>
 
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
-        {categoryOptions.map((category) => (
-          <Pressable
-            key={category}
-            onPress={() => setCatalogCategory(category)}
-            style={[styles.categoryChip, catalogCategory === category ? styles.categoryChipActive : null]}
-          >
-            <Text style={[styles.categoryChipText, catalogCategory === category ? styles.categoryChipTextActive : null]}>
-              {category}
-            </Text>
+      <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+        <View style={styles.payHeroCard}>
+          <Text style={styles.payHeroLabel}>Wallet balance</Text>
+          <Text style={styles.payHeroAmount}>GHC 1,240.50</Text>
+          <Text style={styles.payHeroMeta}>MTN MoMo •••• 8821 · Synced now</Text>
+          <View style={styles.payHeroActions}>
+            {[
+              { label: 'Send', icon: '↗' },
+              { label: 'Request', icon: '+' },
+              { label: 'Top up', icon: '▭' },
+              { label: 'History', icon: '◔' },
+            ].map((action) => (
+              <Pressable key={action.label} style={styles.payHeroAction}>
+                <View style={styles.payHeroActionIcon}>
+                  <Text style={styles.payHeroActionIconText}>{action.icon}</Text>
+                </View>
+                <Text style={styles.payHeroActionText}>{action.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+
+        <Text style={styles.lightSectionTitle}>Quick send</Text>
+        <View style={styles.quickSendRow}>
+          {payQuickContacts.slice(0, 4).map((contact, index) => (
+            <Pressable key={contact.id} style={styles.quickSendItem}>
+              <View style={[styles.quickSendAvatar, { backgroundColor: ['#dff3ec', '#f8eedb', '#dbe7f4', '#f0dff0'][index % 4] }]}>
+                <Text style={styles.quickSendAvatarText}>{contact.name.slice(0, 1).toUpperCase()}</Text>
+              </View>
+              <Text numberOfLines={1} style={styles.quickSendName}>{contact.name.split(' ')[0]}</Text>
+            </Pressable>
+          ))}
+          <Pressable style={styles.quickSendItem}>
+            <View style={[styles.quickSendAvatar, styles.quickSendAvatarAdd]}>
+              <Text style={styles.quickSendAvatarAddText}>+</Text>
+            </View>
+            <Text style={styles.quickSendName}>New</Text>
           </Pressable>
-        ))}
-      </ScrollView>
+        </View>
 
-      {filteredCatalogItems.map((item) => (
-        <View key={item.id} style={styles.catalogCard}>
-          <Image source={{ uri: item.imageUri }} style={styles.catalogImage} />
-          <View style={styles.catalogCardBody}>
-            <Text style={styles.catalogTitle}>{item.title}</Text>
-            <Text style={styles.catalogPrice}>{item.price}</Text>
-            <Text style={styles.catalogSeller}>{item.seller}</Text>
-            <Text style={styles.catalogDescription}>{item.description}</Text>
+        <Text style={styles.lightSectionTitle}>Recent transactions</Text>
+        <View style={styles.payTransactionList}>
+          {payTransactions.map((transaction, index) => (
+            <View key={transaction.id} style={[styles.payTransactionRow, index === payTransactions.length - 1 ? styles.payTransactionRowLast : null]}>
+              <View style={[styles.payTransactionAvatar, { backgroundColor: ['#dff3ec', '#dbe7f4', '#e9efe1'][index % 3] }]}>
+                <Text style={styles.payTransactionAvatarText}>{transaction.title.slice(0, 1).toUpperCase()}</Text>
+              </View>
+              <View style={styles.payTransactionCopy}>
+                <Text numberOfLines={1} style={styles.payTransactionTitle}>{transaction.title}</Text>
+                <Text style={styles.payTransactionMeta}>{transaction.time}</Text>
+              </View>
+              <Text style={[styles.payTransactionAmount, transaction.positive ? styles.payTransactionAmountPositive : null]}>
+                {transaction.amount}
+              </Text>
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+    </View>
+  );
+
+  const renderStatus = () => {
+    const myStatus = updatesFeed.find((entry) => entry.userId === currentUserId);
+    const otherUpdates = updatesFeed.filter((entry) => entry.userId !== currentUserId);
+    const avatarPalette = ['#dff3ec', '#f8eedb', '#e3edf7', '#f0dff0'];
+
+    return (
+      <View style={styles.lightScreen}>
+        <View style={styles.lightHeader}>
+          <Text style={styles.appWordmark}>
+            Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
+          </Text>
+          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+            <Text style={styles.lightHeaderActionText}>◌</Text>
+          </Pressable>
+        </View>
+
+        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+          <Pressable style={styles.statusComposerCard} onPress={() => setStatusComposerVisible(true)}>
+            <View style={styles.statusComposerRing}>
+              <Text style={styles.statusComposerPlus}>+</Text>
+            </View>
+            <View style={styles.statusComposerCopy}>
+              <Text style={styles.statusAddTitle}>Add your status</Text>
+              <Text style={styles.statusAddMeta}>Photo · Video · Text · Product</Text>
+            </View>
+          </Pressable>
+
+          <Text style={styles.lightSectionLabel}>RECENT UPDATES</Text>
+          {otherUpdates.map((entry, index) => {
+            const latestStatus = entry.items?.[0];
+            const feedIndex = updatesFeed.findIndex((candidate) => candidate.userId === entry.userId);
+            return (
+              <Pressable key={entry.userId} style={styles.statusFeedCard} onPress={() => openStatusViewer(feedIndex)}>
+                <View style={styles.statusFeedAvatarWrap}>
+                  <View style={styles.statusFeedAvatarRing}>
+                    <View style={[styles.statusFeedAvatar, { backgroundColor: avatarPalette[index % avatarPalette.length] }]}>
+                      <Text style={styles.statusFeedAvatarText}>{entry.name.slice(0, 1).toUpperCase()}</Text>
+                    </View>
+                  </View>
+                </View>
+                <View style={styles.statusFeedCopy}>
+                  <Text numberOfLines={1} style={styles.statusFeedName}>{entry.name}</Text>
+                  <Text style={styles.statusFeedTime}>{latestStatus?.createdAt ? formatClock(latestStatus.createdAt) : 'Just now'}</Text>
+                  <Text numberOfLines={2} style={styles.statusFeedBody}>
+                    {latestStatus?.text || latestStatus?.assets?.[0]?.caption || 'Tap to view latest update'}
+                  </Text>
+                </View>
+                <View style={styles.statusFeedDot} />
+              </Pressable>
+            );
+          })}
+
+          {myStatus?.items?.length ? (
             <Pressable
-              style={styles.catalogButton}
-              onPress={() => {
-                setActiveView('Chats');
-                setChatScreen('detail');
-                const seller = Object.values(usersById).find((user) => user.name === item.seller && user.id !== currentUserId);
-                if (seller) {
-                  void createDirectChat(seller.id, `Hi, I want to buy ${item.title}. `);
-                } else {
-                  setSelectedChatId('c4');
-                  setMessageDraft(`Hi, I want to buy ${item.title}. `);
+              style={styles.statusMineCard}
+              onPress={() => openStatusViewer(updatesFeed.findIndex((entry) => entry.userId === currentUserId))}
+              onLongPress={() => {
+                const latestId = myStatus.items[0]?.id;
+                if (latestId) {
+                  void deleteStatus(latestId);
                 }
               }}
             >
-              <Text style={styles.catalogButtonText}>Chat seller</Text>
+              <Text style={styles.statusMineTitle}>Your latest status</Text>
+              <Text numberOfLines={2} style={styles.statusMineBody}>
+                {myStatus.items[0]?.text || myStatus.items[0]?.assets?.[0]?.caption || 'Open and manage your latest update'}
+              </Text>
+            </Pressable>
+          ) : null}
+        </ScrollView>
+      </View>
+    );
+  };
+
+  const renderBusiness = () => {
+    const businessName = profile.businessName || profile.name || authForm.name || 'Maame Sika Store';
+    const customerCount = Math.max(contactItems.length, visibleChatItems.length, 12);
+    const orderCount = Math.max(chatItems.length, 12);
+    const catalogCount = Math.max(filteredCatalogItems.length, 24);
+    const todaySales = 840 + (filteredCatalogItems.length * 5);
+
+    return (
+      <View style={styles.lightScreen}>
+        <View style={styles.lightHeader}>
+          <Text style={styles.businessModeTitle}>
+            Business <Text style={styles.appWordmarkAccent}>Mode</Text>
+          </Text>
+          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+            <Text style={styles.lightHeaderActionText}>≋</Text>
+          </Pressable>
+        </View>
+
+        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+          <View style={styles.businessAlertCard}>
+            <Text style={styles.businessAlertText}>Low stock alert: Ankara dress (2 left)</Text>
+          </View>
+
+          <View style={styles.businessHeroCard}>
+            <Text numberOfLines={1} style={styles.businessHeroTitle}>{businessName}</Text>
+            <Text style={styles.businessHeroMeta}>Verified business · Accra, Ghana</Text>
+            <View style={styles.businessStatsRow}>
+              <View style={styles.businessStatCard}>
+                <Text style={styles.businessStatValue}>GHC {todaySales}</Text>
+                <Text style={styles.businessStatLabel}>Today's sales</Text>
+              </View>
+              <View style={styles.businessStatCard}>
+                <Text style={styles.businessStatValue}>{orderCount}</Text>
+                <Text style={styles.businessStatLabel}>Orders</Text>
+              </View>
+              <View style={styles.businessStatCard}>
+                <Text style={styles.businessStatValue}>98%</Text>
+                <Text style={styles.businessStatLabel}>Response rate</Text>
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.businessGrid}>
+            <Pressable style={styles.businessGridCard} onPress={() => setActiveView('Settings')}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▤</Text></View>
+              <Text style={styles.businessGridTitle}>My catalog</Text>
+              <Text style={styles.businessGridMeta}>{catalogCount} products live</Text>
+            </Pressable>
+            <Pressable style={styles.businessGridCard} onPress={() => setNewChatVisible(true)}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◌</Text></View>
+              <Text style={styles.businessGridTitle}>Customers</Text>
+              <Text style={styles.businessGridMeta}>{customerCount} total</Text>
+            </Pressable>
+            <Pressable style={styles.businessGridCard} onPress={() => setActiveView('Pay')}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>□</Text></View>
+              <Text style={styles.businessGridTitle}>Receipts</Text>
+              <Text style={styles.businessGridMeta}>Auto-generated</Text>
+            </Pressable>
+            <Pressable style={styles.businessGridCard} onPress={() => setStatusComposerVisible(true)}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◍</Text></View>
+              <Text style={styles.businessGridTitle}>Broadcast</Text>
+              <Text style={styles.businessGridMeta}>Send to all customers</Text>
             </Pressable>
           </View>
-        </View>
-      ))}
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Registered contacts</Text>
-        {contactItems.map((contact) => (
-          <Text key={contact.id} style={styles.contactLine}>
-            {contact.name} · {contact.registered ? 'Registered' : 'Invite needed'}
-          </Text>
-        ))}
+        </ScrollView>
       </View>
-    </ScrollView>
-  );
-
-  const renderStatus = () => (
-    <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
-      <View style={styles.statusHeaderRow}>
-        <Text style={styles.secondaryTitle}>Status</Text>
-        <View style={styles.statusHeaderActions}>
-          <Pressable style={styles.iconCircle} onPress={() => pickMultipleImages('status')}>
-            <Text style={styles.iconText}>📷+</Text>
-          </Pressable>
-          <Pressable style={styles.iconCircle} onPress={() => setStatusComposerVisible(true)}>
-            <Text style={styles.iconText}>✎</Text>
-          </Pressable>
-        </View>
-      </View>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusStrip}>
-        {updatesFeed.map((entry, index) => {
-          const latestStatus = entry.items?.[0];
-          const cover = latestStatus?.assets?.[0]?.url || null;
-          const isMine = entry.userId === currentUserId;
-          return (
-            <View key={entry.userId} style={styles.statusCard}>
-              <Pressable style={styles.statusCardMedia} onPress={() => openStatusViewer(index)}>
-                {cover ? (
-                  <Image source={{ uri: cover }} style={styles.statusCardImage} />
-                ) : (
-                  <View style={styles.statusCardFallback}>
-                    <Text style={styles.statusCardFallbackText}>{entry.name.slice(0, 1)}</Text>
-                  </View>
-                )}
-                <View style={styles.statusAvatarRing}>
-                  <View style={styles.statusAvatarInner}>
-                    <Text style={styles.statusAvatarText}>{entry.name.slice(0, 2).toUpperCase()}</Text>
-                  </View>
-                </View>
-                <View style={styles.statusCountBadge}>
-                  <Text style={styles.statusCountBadgeText}>{entry.items.length}</Text>
-                </View>
-                {isMine && latestStatus ? (
-                  <Pressable style={styles.statusDeleteButton} onPress={() => deleteStatus(latestStatus.id)}>
-                    <Text style={styles.statusDeleteText}>Delete</Text>
-                  </Pressable>
-                ) : null}
-              </Pressable>
-              <Text style={styles.statusCardTitle}>{entry.name}</Text>
-            </View>
-          );
-        })}
-      </ScrollView>
-    </ScrollView>
-  );
+    );
+  };
 
   const renderSettings = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
@@ -2537,107 +3086,404 @@ export default function App() {
     </ScrollView>
   );
 
-  const renderAuthGate = (dismissible = false) => {
-    const content = (
-      <>
-        <View style={styles.authBackdropPreview} pointerEvents="none">
-          <View style={[styles.authBackdropGlow, styles.authBackdropGlowTop]} />
-          <View style={[styles.authBackdropGlow, styles.authBackdropGlowBottom]} />
-          <Text style={styles.authBackdropWord}>Zynkup</Text>
-          <View style={[styles.authBackdropChip, styles.authBackdropChipTitle]}>
-            <Text style={styles.authBackdropChipText}>Chat sent</Text>
+  const renderEntryCelebration = () => {
+    const highlights = [
+      { icon: '💬', title: 'Chat with anyone', body: 'your contacts are already here.' },
+      { icon: '💸', title: 'Send money instantly', body: 'MoMo connected. Zero stress.' },
+      { icon: '🛒', title: 'Shop from status', body: 'tap any product and buy right there.' },
+      { icon: '🤖', title: 'AI is always with you', body: 'replies, translations, scam alerts.' },
+    ];
+
+    return (
+      <View style={styles.celebrationScreen}>
+        <View style={styles.celebrationConfettiOne} />
+        <View style={styles.celebrationConfettiTwo} />
+        <View style={styles.celebrationConfettiThree} />
+        <View style={styles.celebrationCard}>
+          <View style={styles.celebrationCheck}>
+            <Text style={styles.celebrationCheckText}>✓</Text>
           </View>
-          <View style={[styles.authBackdropChip, styles.authBackdropChipReply]}>
-            <Text style={styles.authBackdropChipText}>Reply delivered</Text>
-          </View>
-          <View style={[styles.authBackdropChip, styles.authBackdropChipCall]}>
-            <Text style={styles.authBackdropChipText}>Video call connected</Text>
-          </View>
-          <View style={[styles.authBackdropChip, styles.authBackdropChipStatus]}>
-            <Text style={styles.authBackdropChipText}>Status updated</Text>
-          </View>
-        </View>
-        <Pressable style={styles.dialog} onPress={() => undefined}>
-          <Text style={styles.dialogTitle}>Phone Registration</Text>
-          <View style={styles.authTabRow}>
-            {['phone', 'otp', 'profile'].map((mode) => (
-              <Pressable
-                key={mode}
-                onPress={() => setAuthMode(mode)}
-                style={[styles.authTab, authMode === mode ? styles.authTabActive : null]}
-              >
-                <Text style={styles.authTabText}>{mode}</Text>
-              </Pressable>
+          <Text style={styles.celebrationTitle}>You're in,</Text>
+          <Text style={styles.celebrationAccent}>{celebrationDisplayName}! 🎉</Text>
+          <Text style={styles.celebrationSubtitle}>ZynkUp is ready. Here's everything waiting for you.</Text>
+          <View style={styles.celebrationFeatureList}>
+            {highlights.map((item) => (
+              <View key={item.title} style={styles.celebrationFeatureCard}>
+                <Text style={styles.celebrationFeatureIcon}>{item.icon}</Text>
+                <Text style={styles.celebrationFeatureText}>
+                  <Text style={styles.celebrationFeatureTitle}>{item.title}</Text>
+                  {` — ${item.body}`}
+                </Text>
+              </View>
             ))}
           </View>
-          {authMode === 'phone' ? (
+          <Pressable
+            style={styles.celebrationButton}
+            onPress={() => {
+              setEntryCelebrationVisible(false);
+            }}
+          >
+            <Text style={styles.celebrationButtonText}>Open ZynkUp →</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  };
+
+  const renderToast = () => {
+    if (!toastState.visible || !toastState.message) {
+      return null;
+    }
+
+    return (
+      <View pointerEvents="box-none" style={styles.toastOverlay}>
+        <Pressable
+          style={[
+            styles.toastCard,
+            toastState.type === 'success'
+              ? styles.toastCardSuccess
+              : toastState.type === 'error'
+                ? styles.toastCardError
+                : styles.toastCardInfo,
+          ]}
+          onPress={dismissToast}
+        >
+          <Text style={styles.toastText}>{toastState.message}</Text>
+        </Pressable>
+      </View>
+    );
+  };
+
+  const renderAuthGate = (dismissible = false) => {
+    const authContainerStyle = authMode === 'welcome' ? styles.authWelcomeScreen : styles.authFlowScreen;
+    const authContentStyle = authMode === 'welcome' ? styles.authWelcomeCard : styles.authFlowCard;
+    const authFooter = (() => {
+      if (authMode === 'welcome') {
+        return (
+          <View style={styles.authWelcomeFooter}>
+            <Pressable
+              style={styles.authPrimaryButton}
+              onPress={() => {
+                setAuthMode('phone');
+              }}
+            >
+              <Text style={styles.authPrimaryButtonText}>Get started - it's free</Text>
+            </Pressable>
+            <Pressable
+              style={styles.authSecondaryButton}
+              onPress={() => {
+                setAuthMode('phone');
+              }}
+            >
+              <Text style={styles.authSecondaryButtonText}>I already have an account</Text>
+            </Pressable>
+            <Text style={styles.authLegalText}>
+              By continuing you agree to our <Text style={styles.authLegalLink}>Terms of Service</Text> &amp;{'\n'}
+              <Text style={styles.authLegalLink}>Privacy Policy</Text>
+            </Text>
+          </View>
+        );
+      }
+
+      if (authMode === 'phone') {
+        return (
+          <View style={styles.authStepFooter}>
+            <Pressable
+              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
+              disabled={isAuthBusy}
+              onPress={() => void startPhoneAuth()}
+            >
+              <Text style={styles.authDarkButtonText}>{authPendingAction === 'send-code' ? 'Sending...' : 'Send code'}</Text>
+            </Pressable>
+            {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
+          </View>
+        );
+      }
+
+      if (authMode === 'otp') {
+        return (
+          <View style={styles.authStepFooter}>
+            <Pressable
+              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
+              disabled={isAuthBusy}
+              onPress={() => void verifyPhoneOtp()}
+            >
+              <Text style={styles.authDarkButtonText}>{authPendingAction === 'verify-otp' ? 'Verifying...' : 'Verify code'}</Text>
+            </Pressable>
+            {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
+          </View>
+        );
+      }
+
+      if (authMode === 'profile') {
+        return (
+          <View style={styles.authStepFooter}>
+            <Pressable style={styles.authDarkButton} onPress={continueFromProfileStep}>
+              <Text style={styles.authDarkButtonText}>Continue</Text>
+            </Pressable>
+          </View>
+        );
+      }
+
+      return (
+        <View style={styles.authStepFooter}>
+          <Pressable
+            style={[
+              styles.authDarkButton,
+              !authForm.accountType || isAuthBusy ? styles.authDarkButtonDisabled : null,
+            ]}
+            disabled={!authForm.accountType || isAuthBusy}
+            onPress={() => void completePhoneRegistration()}
+          >
+            <Text style={styles.authDarkButtonText}>{authPendingAction === 'register' ? 'Please wait...' : "Let's go"}</Text>
+          </Pressable>
+          <Text style={styles.authInlineStatusText}>
+            {isAuthBusy
+              ? authPendingLabel
+              : authForm.accountType
+                ? 'Selection saved. Tap the button to continue.'
+                : 'Select Personal or Business, then tap the button.'}
+          </Text>
+        </View>
+      );
+    })();
+
+    const content = (
+      <View style={authContainerStyle}>
+        {authMode === 'welcome' ? (
+          <View style={styles.authWelcomeBackdrop}>
+            <View style={styles.authWelcomeGlowOuter} />
+            <View style={styles.authWelcomeGlowInner} />
+            <View style={styles.authBrandIcon}>
+              <Text style={styles.authBrandIconText}>↑</Text>
+            </View>
+          </View>
+        ) : null}
+        <View style={authContentStyle}>
+          {authMode === 'welcome' ? (
             <>
-              <Pressable style={styles.countryPickerButton} onPress={() => setCountryPickerVisible(true)}>
-                <Text style={styles.countryPickerButtonLabel}>{authForm.countryCode || 'Select'}</Text>
-                <Text style={styles.countryPickerButtonValue}>
-                  {authForm.countryCode ? 'Change country code' : 'Search country code'}
-                </Text>
-              </Pressable>
-              <TextInput
-                value={authForm.phone}
-                onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
-                placeholder="Phone number"
-                placeholderTextColor="#7d8b92"
-                keyboardType="phone-pad"
-                style={styles.input}
-              />
-              <Pressable style={styles.sendButtonWide} onPress={() => void startPhoneAuth()}>
-                <Text style={styles.sendButtonText}>Continue</Text>
-              </Pressable>
-            </>
-          ) : authMode === 'otp' ? (
-            <>
-              <TextInput
-                value={authForm.otp}
-                onChangeText={(value) => setAuthForm((current) => ({ ...current, otp: value }))}
-                placeholder="Enter OTP"
-                placeholderTextColor="#7d8b92"
-                keyboardType="number-pad"
-                style={styles.input}
-              />
-              <Pressable style={styles.sendButtonWide} onPress={() => void verifyPhoneOtp()}>
-                <Text style={styles.sendButtonText}>Verify OTP</Text>
-              </Pressable>
+              <View style={styles.authWelcomeTopSpacer} />
+              <Text style={styles.authBrandWordmark}>
+                Zynk<Text style={styles.authBrandWordmarkAccent}>Up</Text>
+              </Text>
+              <Text style={styles.authWelcomeTagline}>Chat. Pay. Sell. All in one place.</Text>
+              <Text style={styles.authWelcomeSubline}>Built for Africa. Built for you.</Text>
+              <View style={styles.authPillRow}>
+                {['Chat', 'Pay', 'Sell', 'Offline-ready', 'GH Ghana'].map((pill) => (
+                  <View key={pill} style={styles.authFeaturePill}>
+                    <Text style={styles.authFeaturePillText}>{pill}</Text>
+                  </View>
+                ))}
+              </View>
             </>
           ) : (
             <>
-              <TextInput
-                value={authForm.name}
-                onChangeText={(value) => setAuthForm((current) => ({ ...current, name: value }))}
-                placeholder="Full name"
-                placeholderTextColor="#7d8b92"
-                style={styles.input}
-              />
-              <TextInput
-                value={authForm.pin}
-                onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
-                placeholder="4-digit pin (optional)"
-                placeholderTextColor="#7d8b92"
-                keyboardType="number-pad"
-                secureTextEntry
-                style={styles.input}
-              />
-              <Pressable style={styles.sendButtonWide} onPress={() => void completePhoneRegistration()}>
-                <Text style={styles.sendButtonText}>Finish Setup</Text>
-              </Pressable>
+              <View style={styles.authStepHeader}>
+                <Pressable style={styles.authBackButton} onPress={goBackAuthStep}>
+                  <Text style={styles.authBackButtonText}>‹</Text>
+                </Pressable>
+                <View style={styles.authProgressTrack}>
+                  <View style={[styles.authProgressFill, { width: authProgressWidth }]} />
+                </View>
+                <Text style={styles.authProgressLabel}>{authStepNumber} of 4</Text>
+              </View>
+
+              {authMode === 'phone' ? (
+                <>
+                  <Text style={styles.authStepEmoji}>📱</Text>
+                  <Text style={styles.authStepTitle}>What's your</Text>
+                  <Text style={styles.authStepAccent}>phone number?</Text>
+                  <Text style={styles.authStepBody}>We'll send you a quick verification code.</Text>
+                  <Text style={styles.authStepBody}>Your number stays private.</Text>
+                  <View style={styles.authPhoneRow}>
+                    <Pressable style={styles.authCountryChip} onPress={() => setCountryPickerVisible(true)}>
+                      <Text style={styles.authCountryChipText}>
+                        {selectedAuthCountry ? `${selectedAuthCountry.code} ${selectedAuthCountry.dialCode}` : 'GH +233'}
+                      </Text>
+                    </Pressable>
+                    <TextInput
+                      value={authForm.phone}
+                      onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
+                      placeholder="024 812 3456"
+                      placeholderTextColor="#8a8f9d"
+                      keyboardType="phone-pad"
+                      style={styles.authPhoneInput}
+                    />
+                  </View>
+                  <Text style={styles.authStepHint}>Your number is encrypted and never shared with anyone.</Text>
+                </>
+              ) : null}
+
+              {authMode === 'otp' ? (
+                <>
+                  <Text style={styles.authStepEmoji}>🔐</Text>
+                  <Text style={styles.authStepTitle}>Enter the</Text>
+                  <Text style={styles.authStepAccent}>6-digit code</Text>
+                  <Text style={styles.authStepBody}>Sent to {authForm.verifiedPhone || normalizeAuthPhone(authForm.countryCode || '+233', authForm.phone || '')}</Text>
+                  <Text style={styles.authStepBody}>Check your SMS.</Text>
+                  <View style={styles.authOtpRow}>
+                    {authOtpDigits.map((digit, index) => (
+                      <View
+                        key={`otp-${index}`}
+                        style={[styles.authOtpBox, digit ? styles.authOtpBoxFilled : null]}
+                      >
+                        <Text style={[styles.authOtpBoxText, digit ? styles.authOtpBoxTextFilled : null]}>{digit}</Text>
+                      </View>
+                    ))}
+                  </View>
+                  <Text style={styles.authResendText}>Didn't get it? <Text style={styles.authResendAccent}>Resend in 0:45</Text></Text>
+                  <View style={styles.authKeypadGrid}>
+                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map((key) => (
+                      <Pressable
+                        key={`key-${key}`}
+                        style={[styles.authKeypadKey, key === '' ? styles.authKeypadKeyBlank : null]}
+                        onPress={() => {
+                          if (key === '') {
+                            return;
+                          }
+                          if (key === '⌫') {
+                            removeOtpDigit();
+                            return;
+                          }
+                          appendOtpDigit(String(key));
+                        }}
+                      >
+                        <Text style={styles.authKeypadKeyText}>{key}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </>
+              ) : null}
+
+              {authMode === 'profile' ? (
+                <>
+                  <Pressable style={styles.authProfilePhotoWrap} onPress={() => void pickAuthProfilePhoto()}>
+                    {authForm.photoUri ? (
+                      <Image source={{ uri: authForm.photoUri }} style={styles.authProfilePhotoImage} />
+                    ) : (
+                      <View style={styles.authProfilePhotoPlaceholder}>
+                        <Text style={styles.authProfilePhotoEmoji}>😊</Text>
+                        <View style={styles.authProfilePhotoAdd}>
+                          <Text style={styles.authProfilePhotoAddText}>+</Text>
+                        </View>
+                      </View>
+                    )}
+                  </Pressable>
+                  <Text style={styles.authPhotoHelper}>Add a photo or video</Text>
+                  <Text style={styles.authFieldLabel}>YOUR NAME</Text>
+                  <TextInput
+                    value={authForm.name}
+                    onChangeText={(value) =>
+                      setAuthForm((current) => ({
+                        ...current,
+                        name: value,
+                        username: current.username ? current.username : deriveAuthUsername(value),
+                      }))
+                    }
+                    placeholder="Kweku Mensah"
+                    placeholderTextColor="#8a8f9d"
+                    style={styles.authProfileInput}
+                  />
+                  <Text style={styles.authFieldLabel}>YOUR ZYNK ID</Text>
+                  <View style={styles.authUsernameRow}>
+                    <View style={styles.authUsernamePrefix}>
+                      <Text style={styles.authUsernamePrefixText}>@</Text>
+                    </View>
+                    <TextInput
+                      value={authForm.username}
+                      onChangeText={(value) =>
+                        setAuthForm((current) => ({
+                          ...current,
+                          username: value.replace(/[^a-z0-9.]/gi, '').toLowerCase(),
+                        }))
+                      }
+                      placeholder="kweku.mensah"
+                      placeholderTextColor="#8a8f9d"
+                      autoCapitalize="none"
+                      style={styles.authUsernameInput}
+                    />
+                  </View>
+                  <Text style={styles.authUsernameHint}>@{authForm.username || 'your.zynk.id'} is available</Text>
+                  <Text style={styles.authFieldLabel}>LANGUAGE</Text>
+                  <TextInput
+                    value={authForm.language}
+                    onChangeText={(value) => setAuthForm((current) => ({ ...current, language: value }))}
+                    placeholderTextColor="#8a8f9d"
+                    style={styles.authProfileInput}
+                  />
+                  <Text style={styles.authFieldLabel}>CREATE PIN</Text>
+                  <TextInput
+                    value={authForm.pin}
+                    onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
+                    placeholder="4-digit PIN"
+                    placeholderTextColor="#8a8f9d"
+                    keyboardType="number-pad"
+                    secureTextEntry
+                    style={styles.authProfileInput}
+                  />
+                </>
+              ) : null}
+
+              {authMode === 'account' ? (
+                <>
+                  <Text style={styles.authStepTitle}>How will you use</Text>
+                  <Text style={styles.authStepAccent}>ZynkUp?</Text>
+                  <Text style={[styles.authStepBody, styles.authAccountCopy]}>
+                    Pick one to start - you can always switch later.
+                  </Text>
+                  {[
+                    {
+                      key: 'personal',
+                      title: 'Personal',
+                      body: "Chat with friends and family, send and receive money, see what's happening near you.",
+                    },
+                    {
+                      key: 'business',
+                      title: 'Business',
+                      body: 'Sell products, accept payments, manage customers, track your sales - all in one place.',
+                    },
+                  ].map((option) => {
+                    const selected = authForm.accountType === option.key;
+                    return (
+                      <Pressable
+                        key={option.key}
+                        style={[styles.authAccountCard, selected ? styles.authAccountCardSelected : null]}
+                        onPress={() => {
+                          submitSelectedAccountType(option.key);
+                        }}
+                      >
+                        <View style={styles.authAccountCardTop}>
+                          <Text style={styles.authAccountEmoji}>{option.key === 'business' ? '🛒' : '😊'}</Text>
+                          {selected ? (
+                            <View style={styles.authAccountCheck}>
+                              <Text style={styles.authAccountCheckText}>✓</Text>
+                            </View>
+                          ) : null}
+                        </View>
+                        <Text style={styles.authAccountTitle}>{option.title}</Text>
+                        <Text style={styles.authAccountBody}>{option.body}</Text>
+                      </Pressable>
+                    );
+                  })}
+                  <Text style={styles.authAccountFootnote}>ZynkUp is free to use. Business features are always available.</Text>
+                </>
+              ) : null}
+
+              {authFooter}
             </>
           )}
-        </Pressable>
-      </>
+          {authMode === 'welcome' ? authFooter : null}
+        </View>
+      </View>
     );
 
     if (!dismissible) {
-      return <View style={styles.dialogOverlay}>{content}</View>;
+      return content;
     }
 
     return (
       <Pressable
-        style={styles.dialogOverlay}
+        style={styles.authDismissOverlay}
         onPress={() => {
           if (!authRequired) {
             setAuthVisible(false);
@@ -2653,11 +3499,12 @@ export default function App() {
     return (
       <View style={styles.screen}>
         <StatusBar style="light" />
+        {renderToast()}
       </View>
     );
   }
 
-  if (authRequired && !currentUserId) {
+  if (!currentUserId) {
     return (
       <View style={styles.screen}>
         <StatusBar style="light" />
@@ -2697,6 +3544,17 @@ export default function App() {
             </Pressable>
           </Pressable>
         </Modal>
+        {renderToast()}
+      </View>
+    );
+  }
+
+  if (entryCelebrationVisible) {
+    return (
+      <View style={styles.screen}>
+        <StatusBar style="light" />
+        {renderEntryCelebration()}
+        {renderToast()}
       </View>
     );
   }
@@ -2711,31 +3569,44 @@ export default function App() {
         <View style={styles.screen}>
           {activeView === 'Chats' ? renderChatList() : null}
           {activeView === 'Calls' ? renderCalls() : null}
-          {activeView === 'Tools' ? renderCatalog() : null}
-          {activeView === 'Updates' ? renderStatus() : null}
+          {activeView === 'Status' ? renderStatus() : null}
+          {activeView === 'Pay' ? renderPay() : null}
+          {activeView === 'Business' ? renderBusiness() : null}
           {activeView === 'Settings' ? renderSettings() : null}
 
           <View style={styles.bottomNav}>
             {tabs.map((tab) => (
               <Pressable
                 key={tab}
-                style={styles.bottomNavItem}
+                style={tab === 'Compose' ? styles.bottomNavComposeWrap : styles.bottomNavItem}
                 onPress={() => {
+                  if (tab === 'Compose') {
+                    setStatusComposerVisible(true);
+                    return;
+                  }
                   setActiveView(tab);
                   setChatScreen('list');
                 }}
               >
-                <View style={styles.bottomNavIconWrap}>
-                  <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
-                    {tab === 'Updates' ? '◌' : tab === 'Calls' ? '◐' : tab === 'Tools' ? '⌘' : tab === 'Chats' ? '◔' : '⚙'}
-                  </Text>
-                  {tabBadges[tab] ? (
-                    <View style={styles.bottomNavBadge}>
-                      <Text style={styles.bottomNavBadgeText}>{tabBadges[tab]}</Text>
+                {tab === 'Compose' ? (
+                  <View style={styles.bottomNavComposeButton}>
+                    <Text style={styles.bottomNavComposeText}>+</Text>
+                  </View>
+                ) : (
+                  <>
+                    <View style={styles.bottomNavIconWrap}>
+                      <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
+                        {tab === 'Chats' ? '◫' : tab === 'Status' ? '◉' : tab === 'Pay' ? '▭' : '⌂'}
+                      </Text>
+                      {tabBadges[tab] ? (
+                        <View style={styles.bottomNavBadge}>
+                          <Text style={styles.bottomNavBadgeText}>{tabBadges[tab]}</Text>
+                        </View>
+                      ) : null}
                     </View>
-                  ) : null}
-                </View>
-                <Text style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
+                    <Text style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
+                  </>
+                )}
               </Pressable>
             ))}
           </View>
@@ -3262,6 +4133,7 @@ export default function App() {
           </Pressable>
         </Pressable>
       </Modal>
+      {renderToast()}
     </View>
   );
 }
@@ -3270,6 +4142,45 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: '#000000',
+  },
+  toastOverlay: {
+    position: 'absolute',
+    top: 56,
+    left: 16,
+    right: 16,
+    zIndex: 200,
+    alignItems: 'center',
+  },
+  toastCard: {
+    width: '100%',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderWidth: 1,
+    shadowColor: '#000000',
+    shadowOpacity: 0.18,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 8,
+  },
+  toastCardInfo: {
+    backgroundColor: '#111827',
+    borderColor: '#1f2937',
+  },
+  toastCardSuccess: {
+    backgroundColor: '#0f2e25',
+    borderColor: '#10b981',
+  },
+  toastCardError: {
+    backgroundColor: '#32161b',
+    borderColor: '#ef4444',
+  },
+  toastText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   topBar: {
     flexDirection: 'row',
@@ -3396,17 +4307,44 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     paddingTop: 10,
-    paddingBottom: 18,
-    paddingHorizontal: 10,
+    paddingBottom: 16,
+    paddingHorizontal: 14,
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#171717',
-    backgroundColor: '#0d0d0d',
+    borderTopColor: '#d9dde4',
+    backgroundColor: '#ffffff',
   },
   bottomNavItem: {
     flex: 1,
     alignItems: 'center',
     gap: 4,
     position: 'relative',
+  },
+  bottomNavComposeWrap: {
+    flex: 1,
+    alignItems: 'center',
+    marginTop: -28,
+  },
+  bottomNavComposeButton: {
+    width: 84,
+    height: 66,
+    borderRadius: 22,
+    backgroundColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#15c79a',
+    shadowOpacity: 0.25,
+    shadowRadius: 16,
+    shadowOffset: {
+      width: 0,
+      height: 8,
+    },
+    elevation: 10,
+  },
+  bottomNavComposeText: {
+    color: '#ffffff',
+    fontSize: 36,
+    fontWeight: '500',
+    marginTop: -2,
   },
   bottomNavIconWrap: {
     position: 'relative',
@@ -3416,19 +4354,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   bottomNavIcon: {
-    color: '#8b8f94',
+    color: '#8c909b',
     fontSize: 20,
   },
   bottomNavIconActive: {
-    color: '#60a5fa',
+    color: '#15c79a',
   },
   bottomNavLabel: {
-    color: '#8b8f94',
+    color: '#7f8591',
     fontSize: 11,
+    fontWeight: '500',
+    letterSpacing: -0.1,
   },
   bottomNavLabelActive: {
-    color: '#f6f7f8',
-    fontWeight: '700',
+    color: '#15c79a',
+    fontWeight: '600',
   },
   bottomNavBadge: {
     position: 'absolute',
@@ -3445,6 +4385,697 @@ const styles = StyleSheet.create({
   bottomNavBadgeText: {
     color: '#edf4ff',
     fontSize: 10,
+    fontWeight: '800',
+  },
+  lightScreen: {
+    flex: 1,
+    backgroundColor: '#f5f5f7',
+  },
+  lightHeader: {
+    paddingTop: 52,
+    paddingHorizontal: 22,
+    paddingBottom: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  lightHeaderActions: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  lightHeaderAction: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: '#e7f7f1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  lightHeaderActionText: {
+    color: '#15c79a',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  appWordmark: {
+    color: '#101828',
+    fontSize: 24,
+    fontWeight: '800',
+    letterSpacing: -0.9,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  appWordmarkAccent: {
+    color: '#15c79a',
+  },
+  payWordmark: {
+    color: '#101828',
+    fontSize: 25,
+    fontWeight: '900',
+    letterSpacing: -0.6,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  lightScroll: {
+    flex: 1,
+  },
+  lightScrollContent: {
+    paddingHorizontal: 22,
+    paddingBottom: 28,
+  },
+  lightSectionLabel: {
+    color: '#8a8f9d',
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    marginBottom: 12,
+    marginTop: 10,
+  },
+  lightSectionTitle: {
+    color: '#111827',
+    fontSize: 24,
+    fontWeight: '800',
+    marginTop: 8,
+    marginBottom: 14,
+  },
+  modeSwitch: {
+    marginHorizontal: 22,
+    marginBottom: 18,
+    padding: 4,
+    borderRadius: 18,
+    backgroundColor: '#e9eaee',
+    flexDirection: 'row',
+  },
+  modeSwitchButton: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modeSwitchButtonActive: {
+    backgroundColor: '#ffffff',
+    shadowColor: '#101828',
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+    shadowOffset: {
+      width: 0,
+      height: 3,
+    },
+    elevation: 2,
+  },
+  modeSwitchText: {
+    color: '#7f8591',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  modeSwitchTextActive: {
+    color: '#15c79a',
+    fontWeight: '700',
+  },
+  chatHomeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+  },
+  chatHomeAvatar: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 14,
+    position: 'relative',
+  },
+  chatHomeAvatarText: {
+    color: '#111827',
+    fontWeight: '800',
+    fontSize: 18,
+  },
+  chatHomePresenceDot: {
+    position: 'absolute',
+    right: 2,
+    bottom: 4,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#15c79a',
+    borderWidth: 2,
+    borderColor: '#f5f5f7',
+  },
+  chatHomeCopy: {
+    flex: 1,
+  },
+  chatHomeTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 4,
+  },
+  chatHomeNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
+    paddingRight: 8,
+  },
+  chatHomeName: {
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '800',
+    flex: 1,
+  },
+  chatHomeBadge: {
+    color: '#d97706',
+    backgroundColor: '#fff2df',
+    fontSize: 10,
+    fontWeight: '800',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 999,
+    overflow: 'hidden',
+  },
+  chatHomeTime: {
+    color: '#8a8f9d',
+    fontSize: 14,
+  },
+  chatHomeBottomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  chatHomePreview: {
+    flex: 1,
+    color: '#7b8190',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  chatHomeUnread: {
+    minWidth: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+  },
+  chatHomeUnreadText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  chatHomeMuted: {
+    minWidth: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#eceef2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatHomeMutedText: {
+    color: '#9ba1af',
+    fontWeight: '700',
+  },
+  payHeroCard: {
+    backgroundColor: '#15c79a',
+    borderRadius: 30,
+    padding: 22,
+    marginTop: 6,
+    marginBottom: 18,
+  },
+  payHeroLabel: {
+    color: 'rgba(255,255,255,0.84)',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  payHeroAmount: {
+    color: '#ffffff',
+    fontSize: 50,
+    fontWeight: '900',
+    letterSpacing: -1.4,
+    marginTop: 8,
+  },
+  payHeroMeta: {
+    color: 'rgba(255,255,255,0.86)',
+    fontSize: 16,
+    marginTop: 6,
+  },
+  payHeroActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 20,
+    gap: 10,
+  },
+  payHeroAction: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 8,
+  },
+  payHeroActionIcon: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.16)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  payHeroActionIconText: {
+    color: '#ffffff',
+    fontSize: 22,
+    fontWeight: '700',
+  },
+  payHeroActionText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  quickSendRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 24,
+  },
+  quickSendItem: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 8,
+  },
+  quickSendAvatar: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  quickSendAvatarText: {
+    color: '#111827',
+    fontWeight: '800',
+    fontSize: 17,
+  },
+  quickSendAvatarAdd: {
+    borderWidth: 1.5,
+    borderColor: '#15c79a',
+    backgroundColor: '#f5f5f7',
+  },
+  quickSendAvatarAddText: {
+    color: '#15c79a',
+    fontSize: 28,
+    fontWeight: '500',
+  },
+  quickSendName: {
+    color: '#7b8190',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  payTransactionList: {
+    backgroundColor: '#ffffff',
+    borderRadius: 24,
+    paddingHorizontal: 4,
+  },
+  payTransactionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e6e8ee',
+  },
+  payTransactionRowLast: {
+    borderBottomWidth: 0,
+  },
+  payTransactionAvatar: {
+    width: 48,
+    height: 48,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  payTransactionAvatarText: {
+    color: '#111827',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  payTransactionCopy: {
+    flex: 1,
+  },
+  payTransactionTitle: {
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  payTransactionMeta: {
+    color: '#8a8f9d',
+    fontSize: 13,
+    marginTop: 4,
+  },
+  payTransactionAmount: {
+    color: '#ff6f7c',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  payTransactionAmountPositive: {
+    color: '#15a77d',
+  },
+  statusComposerCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 18,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#d9dde4',
+    marginBottom: 14,
+  },
+  statusComposerRing: {
+    width: 58,
+    height: 58,
+    borderRadius: 29,
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 14,
+  },
+  statusComposerPlus: {
+    color: '#15c79a',
+    fontSize: 32,
+    fontWeight: '400',
+    marginTop: -2,
+  },
+  statusComposerCopy: {
+    flex: 1,
+  },
+  statusAddTitle: {
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '700',
+    letterSpacing: -0.2,
+  },
+  statusAddMeta: {
+    color: '#8a8f9d',
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 3,
+  },
+  statusFeedCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    borderRadius: 22,
+    padding: 14,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: '#eaecf0',
+  },
+  statusFeedAvatarWrap: {
+    marginRight: 14,
+  },
+  statusFeedAvatarRing: {
+    width: 62,
+    height: 62,
+    borderRadius: 31,
+    borderWidth: 3,
+    borderColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statusFeedAvatar: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  statusFeedAvatarText: {
+    color: '#111827',
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  statusFeedCopy: {
+    flex: 1,
+  },
+  statusFeedName: {
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '700',
+    letterSpacing: -0.2,
+  },
+  statusFeedTime: {
+    color: '#8a8f9d',
+    fontSize: 12,
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  statusFeedBody: {
+    color: '#7b8190',
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 3,
+  },
+  statusFeedDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#15c79a',
+    marginLeft: 10,
+  },
+  statusMineCard: {
+    borderRadius: 20,
+    padding: 16,
+    backgroundColor: '#eafaf4',
+    borderWidth: 1,
+    borderColor: '#c6efe0',
+  },
+  statusMineTitle: {
+    color: '#0d4f3c',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  statusMineBody: {
+    color: '#37695b',
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 6,
+  },
+  businessModeTitle: {
+    color: '#101828',
+    fontSize: 25,
+    fontWeight: '900',
+    letterSpacing: -0.6,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  businessAlertCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#f2c36b',
+    backgroundColor: '#fff5e6',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 18,
+  },
+  businessAlertText: {
+    color: '#d97706',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  businessHeroCard: {
+    borderRadius: 30,
+    backgroundColor: '#06101d',
+    padding: 22,
+    marginBottom: 20,
+  },
+  businessHeroTitle: {
+    color: '#ffffff',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  businessHeroMeta: {
+    color: '#a0a9b5',
+    fontSize: 15,
+    marginTop: 4,
+  },
+  businessStatsRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 18,
+  },
+  businessStatCard: {
+    flex: 1,
+    backgroundColor: '#171d27',
+    borderRadius: 20,
+    padding: 16,
+    minHeight: 100,
+    justifyContent: 'space-between',
+  },
+  businessStatValue: {
+    color: '#15c79a',
+    fontSize: 23,
+    fontWeight: '900',
+  },
+  businessStatLabel: {
+    color: '#c9d0d8',
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  businessGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    rowGap: 14,
+  },
+  businessGridCard: {
+    width: '48%',
+    borderRadius: 24,
+    backgroundColor: '#ffffff',
+    padding: 18,
+    borderWidth: 1,
+    borderColor: '#eaecf0',
+  },
+  businessGridIconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: 14,
+    backgroundColor: '#e7f7f1',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 18,
+  },
+  businessGridIcon: {
+    color: '#15c79a',
+    fontSize: 22,
+    fontWeight: '700',
+  },
+  businessGridTitle: {
+    color: '#111827',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  businessGridMeta: {
+    color: '#8a8f9d',
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 6,
+  },
+  celebrationScreen: {
+    flex: 1,
+    backgroundColor: '#020817',
+    paddingHorizontal: 20,
+    paddingTop: 54,
+    paddingBottom: 28,
+    justifyContent: 'flex-start',
+  },
+  celebrationCard: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    paddingHorizontal: 4,
+    paddingVertical: 6,
+  },
+  celebrationConfettiOne: {
+    position: 'absolute',
+    top: '20%',
+    left: 26,
+    width: 14,
+    height: 14,
+    borderRadius: 4,
+    backgroundColor: '#ef4444',
+    transform: [{ rotate: '20deg' }],
+  },
+  celebrationConfettiTwo: {
+    position: 'absolute',
+    top: '36%',
+    right: 34,
+    width: 16,
+    height: 10,
+    borderRadius: 4,
+    backgroundColor: '#6366f1',
+    transform: [{ rotate: '-25deg' }],
+  },
+  celebrationConfettiThree: {
+    position: 'absolute',
+    bottom: '28%',
+    left: 44,
+    width: 18,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#14b8a6',
+    transform: [{ rotate: '30deg' }],
+  },
+  celebrationCheck: {
+    width: 92,
+    height: 56,
+    borderRadius: 22,
+    backgroundColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    marginBottom: 26,
+  },
+  celebrationCheckText: {
+    color: '#ffffff',
+    fontSize: 34,
+    fontWeight: '800',
+    marginTop: -2,
+  },
+  celebrationTitle: {
+    color: '#ffffff',
+    fontSize: 34,
+    fontWeight: '900',
+    letterSpacing: -1,
+    textAlign: 'center',
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  celebrationAccent: {
+    color: '#15c79a',
+    fontSize: 34,
+    fontWeight: '900',
+    letterSpacing: -1,
+    textAlign: 'center',
+    marginTop: 2,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  celebrationSubtitle: {
+    color: '#a0a9b5',
+    fontSize: 17,
+    lineHeight: 25,
+    textAlign: 'center',
+    marginTop: 18,
+  },
+  celebrationFeatureList: {
+    gap: 12,
+    marginTop: 24,
+  },
+  celebrationFeatureCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.12)',
+    padding: 16,
+  },
+  celebrationFeatureIcon: {
+    fontSize: 20,
+    marginTop: 2,
+  },
+  celebrationFeatureText: {
+    flex: 1,
+    color: '#d8e4f2',
+    fontSize: 16,
+    lineHeight: 22,
+  },
+  celebrationFeatureTitle: {
+    color: '#ffffff',
+    fontWeight: '800',
+  },
+  celebrationButton: {
+    minHeight: 60,
+    borderRadius: 20,
+    backgroundColor: '#15c79a',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 24,
+  },
+  celebrationButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
     fontWeight: '800',
   },
   detailScreen: {
@@ -3731,6 +5362,7 @@ const styles = StyleSheet.create({
     fontSize: 28,
     fontWeight: '800',
     marginBottom: 6,
+    fontFamily: DISPLAY_FONT_FAMILY,
   },
   statusHeaderRow: {
     flexDirection: 'row',
@@ -4098,9 +5730,509 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: 16,
   },
+  authDismissOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(2, 6, 14, 0.9)',
+  },
+  authWelcomeScreen: {
+    flex: 1,
+    backgroundColor: '#030712',
+    justifyContent: 'flex-start',
+    paddingHorizontal: 24,
+    paddingTop: 54,
+    paddingBottom: 28,
+    overflow: 'hidden',
+  },
+  authFlowScreen: {
+    flex: 1,
+    backgroundColor: '#f4f5f7',
+    justifyContent: 'flex-start',
+    paddingHorizontal: 20,
+    paddingTop: 54,
+    paddingBottom: 18,
+  },
+  authWelcomeCard: {
+    width: '100%',
+    flex: 1,
+    backgroundColor: 'transparent',
+    paddingTop: 8,
+    paddingBottom: 18,
+    overflow: 'visible',
+  },
+  authFlowCard: {
+    width: '100%',
+    flex: 1,
+    backgroundColor: 'transparent',
+    paddingHorizontal: 0,
+    paddingTop: 4,
+    paddingBottom: 20,
+  },
+  authWelcomeBackdrop: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    overflow: 'hidden',
+  },
+  authWelcomeGlowOuter: {
+    position: 'absolute',
+    width: 360,
+    height: 360,
+    borderRadius: 180,
+    backgroundColor: 'rgba(37, 99, 235, 0.26)',
+    top: -120,
+    right: -120,
+  },
+  authWelcomeGlowInner: {
+    position: 'absolute',
+    width: 300,
+    height: 300,
+    borderRadius: 150,
+    backgroundColor: 'rgba(29, 78, 216, 0.22)',
+    bottom: -120,
+    left: -90,
+  },
+  authBrandIcon: {
+    position: 'absolute',
+    top: 32,
+    right: 28,
+    width: 52,
+    height: 52,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authBrandIconText: {
+    color: '#f8fbff',
+    fontSize: 24,
+    fontWeight: '800',
+  },
+  authWelcomeTopSpacer: {
+    flex: 1,
+    minHeight: 120,
+  },
+  authBrandWordmark: {
+    color: '#f8fbff',
+    fontSize: 44,
+    fontWeight: '900',
+    letterSpacing: -1.3,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  authBrandWordmarkAccent: {
+    color: '#60a5fa',
+  },
+  authWelcomeTagline: {
+    color: '#f8fbff',
+    fontSize: 28,
+    fontWeight: '800',
+    lineHeight: 34,
+    marginTop: 18,
+  },
+  authWelcomeSubline: {
+    color: '#b7c7de',
+    fontSize: 16,
+    lineHeight: 24,
+    marginTop: 10,
+  },
+  authPillRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 26,
+  },
+  authFeaturePill: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.18)',
+  },
+  authFeaturePillText: {
+    color: '#d8e4f2',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  authWelcomeFooter: {
+    marginTop: 28,
+    gap: 12,
+  },
+  authPrimaryButton: {
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  authPrimaryButtonText: {
+    color: '#08111f',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  authSecondaryButton: {
+    minHeight: 54,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  authSecondaryButtonText: {
+    color: '#edf4ff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  authLegalText: {
+    color: '#97abc2',
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: 'center',
+    marginTop: 2,
+  },
+  authLegalLink: {
+    color: '#f8fbff',
+    fontWeight: '700',
+  },
+  authStepHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 18,
+  },
+  authBackButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#f3f4f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  authBackButtonText: {
+    color: '#0f172a',
+    fontSize: 24,
+    fontWeight: '500',
+    marginTop: -2,
+  },
+  authProgressTrack: {
+    flex: 1,
+    height: 8,
+    borderRadius: 999,
+    overflow: 'hidden',
+    backgroundColor: '#e5e7eb',
+    marginRight: 12,
+  },
+  authProgressFill: {
+    height: '100%',
+    borderRadius: 999,
+    backgroundColor: '#111827',
+  },
+  authProgressLabel: {
+    color: '#6b7280',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  authStepEmoji: {
+    fontSize: 46,
+    marginBottom: 12,
+  },
+  authStepTitle: {
+    color: '#111827',
+    fontSize: 31,
+    fontWeight: '800',
+    lineHeight: 36,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  authStepAccent: {
+    color: '#111827',
+    fontSize: 31,
+    fontWeight: '800',
+    lineHeight: 36,
+    marginBottom: 10,
+    fontFamily: DISPLAY_FONT_FAMILY,
+  },
+  authStepBody: {
+    color: '#6b7280',
+    fontSize: 15,
+    lineHeight: 22,
+  },
+  authPhoneRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 28,
+    marginBottom: 14,
+  },
+  authCountryChip: {
+    minHeight: 58,
+    minWidth: 106,
+    borderRadius: 18,
+    backgroundColor: '#f3f4f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  authCountryChipText: {
+    color: '#111827',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  authPhoneInput: {
+    flex: 1,
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#f3f4f6',
+    color: '#111827',
+    fontSize: 18,
+    fontWeight: '600',
+    paddingHorizontal: 18,
+  },
+  authStepHint: {
+    color: '#9ca3af',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  authOtpRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 28,
+    marginBottom: 18,
+  },
+  authOtpBox: {
+    flex: 1,
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#f3f4f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authOtpBoxFilled: {
+    backgroundColor: '#e5edff',
+  },
+  authOtpBoxText: {
+    color: '#111827',
+    fontSize: 24,
+    fontWeight: '800',
+  },
+  authOtpBoxTextFilled: {
+    color: '#1d4ed8',
+  },
+  authResendText: {
+    color: '#9ca3af',
+    fontSize: 13,
+    marginBottom: 18,
+  },
+  authResendAccent: {
+    color: '#111827',
+    fontWeight: '700',
+  },
+  authKeypadGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+    justifyContent: 'space-between',
+  },
+  authKeypadKey: {
+    width: '30%',
+    aspectRatio: 1,
+    maxHeight: 72,
+    borderRadius: 22,
+    backgroundColor: '#f8fafc',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authKeypadKeyBlank: {
+    backgroundColor: 'transparent',
+  },
+  authKeypadKeyText: {
+    color: '#111827',
+    fontSize: 24,
+    fontWeight: '700',
+  },
+  authProfilePhotoWrap: {
+    width: 118,
+    height: 118,
+    borderRadius: 34,
+    backgroundColor: '#eef2f7',
+    alignSelf: 'center',
+    marginTop: 8,
+    marginBottom: 12,
+    overflow: 'hidden',
+  },
+  authProfilePhotoImage: {
+    width: '100%',
+    height: '100%',
+  },
+  authProfilePhotoPlaceholder: {
+    flex: 1,
+    backgroundColor: '#eef2f7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authProfilePhotoEmoji: {
+    fontSize: 42,
+  },
+  authProfilePhotoAdd: {
+    position: 'absolute',
+    right: 10,
+    bottom: 10,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authProfilePhotoAddText: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '800',
+    marginTop: -1,
+  },
+  authPhotoHelper: {
+    color: '#6b7280',
+    textAlign: 'center',
+    fontSize: 13,
+    marginBottom: 18,
+  },
+  authFieldLabel: {
+    color: '#111827',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.9,
+    marginBottom: 8,
+    marginTop: 10,
+  },
+  authProfileInput: {
+    minHeight: 54,
+    borderRadius: 16,
+    backgroundColor: '#f3f4f6',
+    color: '#111827',
+    fontSize: 15,
+    paddingHorizontal: 16,
+  },
+  authUsernameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 54,
+    borderRadius: 16,
+    backgroundColor: '#f3f4f6',
+    overflow: 'hidden',
+  },
+  authUsernamePrefix: {
+    width: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authUsernamePrefixText: {
+    color: '#6b7280',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  authUsernameInput: {
+    flex: 1,
+    color: '#111827',
+    fontSize: 15,
+    paddingRight: 16,
+    paddingVertical: 15,
+  },
+  authUsernameHint: {
+    color: '#2563eb',
+    fontSize: 12,
+    marginTop: 8,
+  },
+  authAccountCopy: {
+    marginTop: 2,
+    marginBottom: 20,
+  },
+  authAccountCard: {
+    borderRadius: 22,
+    backgroundColor: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    padding: 18,
+    marginBottom: 12,
+  },
+  authAccountCardSelected: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#60a5fa',
+  },
+  authAccountCardTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  authAccountEmoji: {
+    fontSize: 26,
+  },
+  authAccountCheck: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  authAccountCheckText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  authAccountTitle: {
+    color: '#111827',
+    fontSize: 20,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  authAccountBody: {
+    color: '#6b7280',
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  authAccountFootnote: {
+    color: '#9ca3af',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 4,
+  },
+  authStepFooter: {
+    marginTop: 24,
+  },
+  authDarkButton: {
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#111827',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  authDarkButtonDisabled: {
+    opacity: 0.7,
+  },
+  authDarkButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  authInlineStatusText: {
+    color: '#9ca3af',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 10,
+  },
   authBackdropPreview: {
     position: 'absolute',
-    inset: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
     backgroundColor: '#01040a',
     overflow: 'hidden',
   },
