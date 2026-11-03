@@ -626,7 +626,7 @@ const getMongoClient = async () => {
 
   if (!mongoClientPromise) {
     mongoClientPromise = MongoClient.connect(mongoUri, {
-      serverSelectionTimeoutMS: 20000,
+      serverSelectionTimeoutMS: 8000,
     })
       .then((client) => {
         mongoConnectionState = 'connected';
@@ -635,8 +635,10 @@ const getMongoClient = async () => {
       })
       .catch((error: unknown) => {
         mongoConnectionState = 'failed';
+        mongoClientPromise = null;
         const message = error instanceof Error ? error.message : 'Unknown MongoDB error';
         console.error(`MongoDB connection failed: ${message}`);
+        console.error('Cloud Run has no fixed IP. In Atlas Network Access, allow 0.0.0.0/0, and URL-encode any special characters in the password.');
         return null;
       });
   }
@@ -3428,26 +3430,39 @@ io.on('connection', (socket) => {
 const port = Number(process.env.PORT ?? 4000);
 const host = process.env.HOST ?? '0.0.0.0';
 
-const startServer = async () => {
+const connectMongoInBackground = async () => {
   if (!mongoUri) {
-    console.error('FATAL: MONGODB_ATLAS_URI (or MONGO_URI) is required. Refusing to start with mock/in-memory data.');
-    process.exit(1);
+    console.error('FATAL: MONGODB_ATLAS_URI (or MONGO_URI) is required. API calls will fail until it is set. No mock data.');
+    return;
   }
 
   const client = await getMongoClient();
   if (!client || mongoConnectionState !== 'connected') {
-    console.error('FATAL: Could not connect to MongoDB. Fix network/URI and restart. Mock data is disabled.');
-    process.exit(1);
+    console.error('MongoDB is not connected yet. Retrying in 15s. Requests stay unavailable until Atlas accepts this instance.');
+    setTimeout(() => {
+      void connectMongoInBackground();
+    }, 15000);
+    return;
   }
 
-  await seedDatabaseIfNeeded();
-
-  server.listen(port, host, () => {
-    console.log(`Running on http://${host}:${port}`);
+  try {
+    await seedDatabaseIfNeeded();
     console.log('Connected to MongoDB (persistent mode — no mock data)');
+  } catch (error) {
+    console.error('MongoDB connected, but startup cleanup failed:', error);
+  }
+};
+
+const startServer = () => {
+  // Cloud Run fails the revision if the process does not listen on PORT quickly.
+  // Mongo is connected after the port is open so a slow or blocked Atlas lookup
+  // cannot take the container down before the startup probe.
+  server.listen(port, host, () => {
+    console.log(`Listening on http://${host}:${port}`);
     console.log(`Media storage: ${MEDIA_STORAGE_MODE}${MEDIA_STORAGE_MODE === 'gcs' ? ` (bucket=${GCS_BUCKET || 'unset'})` : ''}`);
     console.log(`Socket.IO running on port ${port}`);
+    void connectMongoInBackground();
   });
 };
 
-void startServer();
+startServer();
