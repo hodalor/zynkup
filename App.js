@@ -1,29 +1,75 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { Audio, ResizeMode, Video } from 'expo-av';
-import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as ExpoContacts from 'expo-contacts';
-import * as DocumentPicker from 'expo-document-picker';
-import * as ImagePicker from 'expo-image-picker';
-import * as Speech from 'expo-speech';
-import { StatusBar } from 'expo-status-bar';
+import {
+  AudioEncoderAndroidType,
+  AudioSourceAndroidType,
+  AVEncoderAudioQualityIOSType,
+  createSound,
+  OutputFormatAndroidType,
+} from 'react-native-nitro-sound';
+import Video from 'react-native-video';
 import { countries } from 'countries-list';
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   Easing,
   Image,
   Modal,
+  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
+  Share,
   StyleSheet,
+  StatusBar,
+  Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { io } from 'socket.io-client';
 import { firebaseAuth, firebaseConfigReady, nativeFirebaseReady } from './firebaseConfig';
+
+const loadOptionalModule = (request) => {
+  try {
+    return request();
+  } catch {
+    return null;
+  }
+};
+
+const cameraKitModule = loadOptionalModule(() => require('react-native-camera-kit'));
+const CameraKit = cameraKitModule?.default ?? cameraKitModule ?? null;
+const Camera = cameraKitModule?.Camera ?? null;
+const Contacts = loadOptionalModule(() => require('react-native-contacts'))?.default
+  ?? loadOptionalModule(() => require('react-native-contacts'));
+const documentPickerModule = loadOptionalModule(() => require('@react-native-documents/picker'));
+const DocumentPickerErrorCodes = documentPickerModule?.errorCodes ?? {};
+const isDocumentPickerErrorWithCode = documentPickerModule?.isErrorWithCode ?? (() => false);
+const pickDocument = documentPickerModule?.pick ?? null;
+const DocumentPickerTypes = documentPickerModule?.types ?? {};
+const launchImageLibrary = loadOptionalModule(() => require('react-native-image-picker'))?.launchImageLibrary
+  ?? null;
+// Not autolinked in the current Android PackageList; keep disabled until linked.
+const Tts = null;
+
+const safeTtsStop = () => {
+  try {
+    Tts?.stop?.();
+  } catch {
+    // Native TTS module is unavailable in this build.
+  }
+};
+
+const safeTtsSpeak = (...args) => {
+  try {
+    Tts?.speak?.(...args);
+  } catch {
+    // Native TTS module is unavailable in this build.
+  }
+};
 
 const BODY_FONT_FAMILY = Platform.select({
   android: 'sans-serif',
@@ -73,23 +119,43 @@ const CAN_USE_NATIVE_WEBRTC = Boolean(
 );
 
 const AnimatedText = Animated.createAnimatedComponent(Text);
-const tabs = ['Chats', 'Status', 'Compose', 'Pay', 'Business'];
-const settingsSections = [
-  'Favorites',
-  'Business tools',
-  'Chat history',
-  'Account',
-  'Privacy',
-  'Chats',
-  'Notifications',
-  'Storage and data',
-  'Help and feedback',
+const tabs = ['Chats', 'Calls', 'Status', 'Pay', 'Business'];
+const SETTINGS_STORAGE_KEY = 'zynkup-mobile-app-settings';
+const FAVORITES_STORAGE_KEY = 'zynkup-mobile-favorite-chats';
+const MUTED_CHATS_STORAGE_KEY = 'zynkup-mobile-muted-chats';
+const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-mobile-archived-chats';
+const APP_LOCK_PIN_KEY = 'zynkup-mobile-app-lock-pin';
+const DEFAULT_APP_SETTINGS = {
+  enterIsSend: true,
+  mediaAutoDownload: true,
+  messageNotifications: true,
+  showNotificationPreview: true,
+  conversationTones: true,
+  saveToCameraRoll: false,
+  lowDataMode: false,
+  lastSeenPrivacy: 'everyone',
+  profilePhotoPrivacy: 'everyone',
+  aboutPrivacy: 'everyone',
+  statusPrivacy: 'contacts',
+  readReceiptsEnabled: true,
+  appLockEnabled: false,
+};
+const SETTINGS_MENU = [
+  { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top', icon: '★' },
+  { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, broadcast', icon: '⌂' },
+  { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations', icon: '▤' },
+  { id: 'account', title: 'Account', subtitle: 'Security, phone number, delete account', icon: '◎' },
+  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, status', icon: '◌' },
+  { id: 'chats', title: 'Chats', subtitle: 'Theme, media, enter is send', icon: '◫' },
+  { id: 'notifications', title: 'Notifications', subtitle: 'Message alerts and previews', icon: '◉' },
+  { id: 'storage', title: 'Storage and data', subtitle: 'Network usage and cache', icon: '▦' },
+  { id: 'help', title: 'Help and feedback', subtitle: 'FAQ and contact support', icon: '?' },
 ];
 const emojiOptions = ['😀', '😂', '🤣', '😍', '🔥', '🙏', '🎉', '❤️'];
 const tabBadges = {
   Chats: 0,
+  Calls: 0,
   Status: 0,
-  Compose: 0,
   Pay: 0,
   Business: 0,
 };
@@ -99,12 +165,14 @@ const statusReactionOptions = ['❤️', '👍', '👎', '🔥', '😂'];
 const EMOJI_REGEX = /\p{Extended_Pictographic}/gu;
 const LAUGHING_EMOJIS = new Set(['😂', '🤣', '😆', '😄', '😹']);
 const API_BASE_URL = Platform.select({
-  android: 'http://10.0.2.2:4000',
+  // Use adb reverse for Android debug runs so the same host works on emulator and physical devices.
+  android: 'http://localhost:4000',
   default: 'http://localhost:4000',
 });
 const DEVICE_STORAGE_KEY = 'zynkup-mobile-device-id';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
+const BOOTSTRAP_TIMEOUT_MS = 5000;
 const WEBRTC_CONFIGURATION = {
   iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
 };
@@ -128,8 +196,21 @@ const initialCatalogItems = [];
 const initialMessages = {};
 
 const normalizeAuthPhone = (countryCode, phoneNumber) => {
-  const cc = countryCode.startsWith('+') ? countryCode : `+${countryCode}`;
-  const digits = phoneNumber.replace(/[^\d]/g, '');
+  const cc = (countryCode.startsWith('+') ? countryCode : `+${countryCode}`).replace(/[^\d+]/g, '');
+  let digits = phoneNumber.replace(/[^\d]/g, '');
+
+  // Users often type a national trunk prefix (e.g. Ghana 024...), which must not
+  // sit after the country code in E.164 (+233024... is invalid).
+  if (cc.length > 1 && digits.startsWith('0')) {
+    digits = digits.replace(/^0+/, '');
+  }
+
+  // If the field already includes the country dial code, avoid doubling it.
+  const ccDigits = cc.replace(/\D/g, '');
+  if (ccDigits && digits.startsWith(ccDigits)) {
+    digits = digits.slice(ccDigits.length);
+  }
+
   return `${cc}${digits}`;
 };
 
@@ -142,6 +223,23 @@ const deriveAuthUsername = (value) =>
     .replace(/[^a-z0-9]+/g, '.')
     .replace(/^\.+|\.+$/g, '')
     .slice(0, 24);
+
+const openImageLibrary = async ({ mediaType = 'photo', selectionLimit = 1 } = {}) => {
+  if (!launchImageLibrary) {
+    return {
+      didCancel: true,
+      errorCode: 'module_unavailable',
+      errorMessage: 'Image picker is not available in this build.',
+    };
+  }
+
+  return launchImageLibrary({
+    mediaType,
+    quality: 1,
+    selectionLimit,
+    includeBase64: false,
+  });
+};
 
 const extractEmojiTokens = (text) => text.match(EMOJI_REGEX) ?? [];
 
@@ -189,7 +287,38 @@ const inferMimeType = (uri, fallback = 'application/octet-stream') => {
   return fallback;
 };
 
-export default function App() {
+const VOICE_RECORDER_AUDIO_SET = {
+  AudioChannels: 1,
+  AudioSamplingRate: 44100,
+  AudioEncodingBitRate: 128000,
+  AudioSourceAndroid: AudioSourceAndroidType.MIC,
+  AudioEncoderAndroid: AudioEncoderAndroidType.AAC,
+  OutputFormatAndroid: OutputFormatAndroidType.MPEG_4,
+  AVEncoderAudioQualityKeyIOS: AVEncoderAudioQualityIOSType.high,
+  AVNumberOfChannelsKeyIOS: 1,
+  AVSampleRateKeyIOS: 44100,
+};
+
+const fetchWithTimeout = async (url, options = {}, timeoutMs = BOOTSTRAP_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+function AppContent() {
+  const insets = useSafeAreaInsets();
+  const navBottomInset = Math.max(insets.bottom, 12);
+  const authBottomInset = Math.max(insets.bottom + 18, 30);
+  const modalBottomInset = Math.max(insets.bottom + 20, 28);
+  const lightContentBottomInset = navBottomInset + 18;
   const [activeView, setActiveView] = useState('Chats');
   const [chatMode, setChatMode] = useState('personal');
   const [chatScreen, setChatScreen] = useState('list');
@@ -212,18 +341,45 @@ export default function App() {
     phone: '',
     photoUri: '',
   });
+  const [settingsPanel, setSettingsPanel] = useState('');
+  const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
+  const [favoriteChatIds, setFavoriteChatIds] = useState([]);
+  const [mutedChatIds, setMutedChatIds] = useState([]);
+  const [archivedChatIds, setArchivedChatIds] = useState([]);
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [showArchivedChats, setShowArchivedChats] = useState(false);
+  const [replyTarget, setReplyTarget] = useState(null);
+  const [messageActionTarget, setMessageActionTarget] = useState(null);
+  const [peerTypingByChat, setPeerTypingByChat] = useState({});
+  const [chatCameraVisible, setChatCameraVisible] = useState(false);
+  const [feedbackDraft, setFeedbackDraft] = useState('');
+  const [accountPinDraft, setAccountPinDraft] = useState('');
+  const [appLockPin, setAppLockPin] = useState('');
+  const [appUnlocked, setAppUnlocked] = useState(true);
+  const [unlockPinDraft, setUnlockPinDraft] = useState('');
+  const chatCameraRef = useRef(null);
+  const typingTimeoutRef = useRef(null);
+  const mutedChatIdsRef = useRef([]);
   const [catalogForm, setCatalogForm] = useState({
     title: '',
     price: '',
     category: 'Fashion',
     description: '',
+    stockQuantity: '10',
   });
-  const [catalogSearch] = useState('');
+  const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory] = useState('All');
   const [statusAssetUris, setStatusAssetUris] = useState([]);
   const [catalogImageUris, setCatalogImageUris] = useState([]);
   const [updatesFeed, setUpdatesFeed] = useState([]);
   const [statusComposerVisible, setStatusComposerVisible] = useState(false);
+  const [statusComposerMode, setStatusComposerMode] = useState('text'); // text | photo | video
+  const [businessPanel, setBusinessPanel] = useState(''); // '' | catalog | customers | receipts | broadcast
+  const [broadcastDraft, setBroadcastDraft] = useState('');
+  const [paySheet, setPaySheet] = useState(''); // '' | send | request | topup | history
+  const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '' });
+  const [payHistoryItems, setPayHistoryItems] = useState([]);
+  const [newChatQuery, setNewChatQuery] = useState('');
   const [statusBackgroundColor, setStatusBackgroundColor] = useState(statusBackgroundOptions[0]);
   const [statusFontFamily, setStatusFontFamily] = useState(statusFontOptions[0]);
   const [statusFontSize, setStatusFontSize] = useState(30);
@@ -275,7 +431,7 @@ export default function App() {
   const [linkedDevices, setLinkedDevices] = useState([]);
   const [deviceLinkMessage, setDeviceLinkMessage] = useState('');
   const [authForm, setAuthForm] = useState({
-    countryCode: '',
+    countryCode: '+233',
     phone: '',
     otp: '',
     verifiedPhone: '',
@@ -283,20 +439,23 @@ export default function App() {
     pin: '',
     username: '',
     language: 'English (Ghana)  GH',
-    accountType: 'personal',
+    accountType: '',
     photoUri: '',
   });
   const phoneAuthConfirmationRef = useRef(null);
   const phoneAuthIdTokenRef = useRef('');
+  const phoneAuthChallengeIdRef = useRef('');
+  const phoneAuthProviderRef = useRef(''); // 'firebase' | 'backend'
+  const forgotPinFlowRef = useRef(false);
   const toastTimeoutRef = useRef(null);
+  const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
   const timeoutsRef = useRef([]);
   const autoplayedRef = useRef(new Set());
   const recordingRef = useRef(null);
-  const recordingStartedAtRef = useRef(0);
-  const recordingIntervalRef = useRef(null);
+  const recordingDurationRef = useRef(0);
   const currentSoundRef = useRef(null);
   const socketRef = useRef(null);
   const updatesFeedRef = useRef([]);
@@ -305,7 +464,7 @@ export default function App() {
   const activeCallRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const callMediaStreamRef = useRef(null);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [cameraPermissionGranted, setCameraPermissionGranted] = useState(false);
 
   const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? chats[0];
   const messages = messagesByChat[selectedChatId] ?? [];
@@ -345,21 +504,36 @@ export default function App() {
 
   const visibleChatItems = useMemo(() => {
     const businessMatcher = /(store|shop|business|board|room|receipt|market|kitchen|biz)/i;
+    const query = chatSearchQuery.trim().toLowerCase();
     const personalChats = chatItems.filter((chat) => !businessMatcher.test(chat.name));
     const businessChats = chatItems.filter((chat) => businessMatcher.test(chat.name));
     const selectedItems = chatMode === 'business' ? businessChats : personalChats;
-    return (selectedItems.length ? selectedItems : chatItems).slice(0, 8);
-  }, [chatItems, chatMode]);
+    const scoped = (selectedItems.length ? selectedItems : chatItems).filter((chat) => {
+      const archived = archivedChatIds.includes(chat.id);
+      if (showArchivedChats ? !archived : archived) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return chat.name.toLowerCase().includes(query) || (chat.preview || '').toLowerCase().includes(query);
+    });
+    const favorites = scoped.filter((chat) => favoriteChatIds.includes(chat.id));
+    const rest = scoped.filter((chat) => !favoriteChatIds.includes(chat.id));
+    return [...favorites, ...rest];
+  }, [archivedChatIds, chatItems, chatMode, chatSearchQuery, favoriteChatIds, showArchivedChats]);
 
   const payQuickContacts = useMemo(() => {
     const merged = [
       ...contactItems.map((contact) => ({
         id: contact.id,
         name: contact.name,
+        phone: contact.phone || '',
       })),
       ...chatItems.map((chat) => ({
         id: chat.id,
         name: chat.name,
+        phone: usersById[chat.peerUserId]?.phone || '',
       })),
     ];
 
@@ -374,7 +548,7 @@ export default function App() {
       unique.push(entry);
     });
     return unique.slice(0, 5);
-  }, [chatItems, contactItems]);
+  }, [chatItems, contactItems, usersById]);
 
   const payTransactions = useMemo(() => {
     const base = payQuickContacts.slice(0, 3);
@@ -398,23 +572,30 @@ export default function App() {
 
   const authStepNumber = useMemo(() => {
     if (authMode === 'phone') return 1;
-    if (authMode === 'otp') return 2;
-    if (authMode === 'profile') return 3;
+    if (authMode === 'pin' || authMode === 'otp') return 2;
+    if (authMode === 'reset-pin' || authMode === 'profile') return 3;
     if (authMode === 'account') return 4;
     return 0;
   }, [authMode]);
 
   const authProgressWidth = authStepNumber ? `${Math.min(100, (authStepNumber / 4) * 100)}%` : '0%';
   const authOtpDigits = Array.from({ length: 6 }, (_, index) => authForm.otp[index] ?? '');
+  const authPinDigits = Array.from({ length: 6 }, (_, index) => authForm.pin[index] ?? '');
   const isAuthBusy = Boolean(authPendingAction);
   const authPendingLabel =
-    authPendingAction === 'send-code'
-      ? 'Sending verification code...'
-      : authPendingAction === 'verify-otp'
-        ? 'Verifying your code...'
-        : authPendingAction === 'register'
-          ? 'Creating your account...'
-          : '';
+    authPendingAction === 'lookup'
+      ? 'Checking your number...'
+      : authPendingAction === 'send-code'
+        ? 'Sending verification code...'
+        : authPendingAction === 'verify-otp'
+          ? 'Verifying your code...'
+          : authPendingAction === 'pin-login'
+            ? 'Signing you in...'
+            : authPendingAction === 'reset-pin'
+              ? 'Saving your PIN...'
+              : authPendingAction === 'register'
+                ? 'Creating your account...'
+                : '';
   const celebrationDisplayName =
     entryCelebrationName ||
     authForm.name.trim().split(/\s+/)[0] ||
@@ -446,6 +627,344 @@ export default function App() {
       }, duration);
     }
   };
+
+  const persistAppSettings = async (nextSettings) => {
+    appSettingsRef.current = nextSettings;
+    setAppSettings(nextSettings);
+    await AsyncStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings)).catch(() => undefined);
+  };
+
+  const persistFavorites = async (nextFavorites) => {
+    setFavoriteChatIds(nextFavorites);
+    await AsyncStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(nextFavorites)).catch(() => undefined);
+  };
+
+  const toggleFavoriteChat = (chatId) => {
+    const exists = favoriteChatIds.includes(chatId);
+    const next = exists ? favoriteChatIds.filter((id) => id !== chatId) : [chatId, ...favoriteChatIds];
+    void persistFavorites(next);
+    showToast(exists ? 'Removed from favorites' : 'Added to favorites', 'success', 1600);
+  };
+
+  const persistMutedChats = async (nextMuted) => {
+    mutedChatIdsRef.current = nextMuted;
+    setMutedChatIds(nextMuted);
+    await AsyncStorage.setItem(MUTED_CHATS_STORAGE_KEY, JSON.stringify(nextMuted)).catch(() => undefined);
+  };
+
+  const persistArchivedChats = async (nextArchived) => {
+    setArchivedChatIds(nextArchived);
+    await AsyncStorage.setItem(ARCHIVED_CHATS_STORAGE_KEY, JSON.stringify(nextArchived)).catch(() => undefined);
+  };
+
+  const toggleMuteChat = (chatId) => {
+    const exists = mutedChatIds.includes(chatId);
+    const next = exists ? mutedChatIds.filter((id) => id !== chatId) : [chatId, ...mutedChatIds];
+    void persistMutedChats(next);
+    showToast(exists ? 'Chat unmuted' : 'Chat muted', 'success', 1400);
+  };
+
+  const toggleArchiveChat = (chatId) => {
+    const exists = archivedChatIds.includes(chatId);
+    const next = exists ? archivedChatIds.filter((id) => id !== chatId) : [chatId, ...archivedChatIds];
+    void persistArchivedChats(next);
+    showToast(exists ? 'Chat unarchived' : 'Chat archived', 'success', 1400);
+  };
+
+  const mapServerMessage = (message, userId = currentUserId) => ({
+    id: message.id,
+    clientRef: message.clientRef,
+    mine: message.senderId === userId,
+    kind: message.deletedForEveryone ? 'text' : message.kind === 'file' ? 'text' : message.kind,
+    text: message.text,
+    time: formatClock(message.sentAt),
+    imageUri: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
+    audioUri: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
+    videoUri: message.deletedForEveryone ? undefined : message.kind === 'video' ? message.mediaUrls?.[0] : undefined,
+    durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
+    receiptState: message.state,
+    replyToMessageId: message.replyToMessageId,
+    replyPreview: message.replyPreview,
+    deletedForEveryone: Boolean(message.deletedForEveryone),
+  });
+
+  const clearChatUnread = (chatId) => {
+    if (!chatId || !currentUserId) {
+      return;
+    }
+    setChatItems((current) =>
+      current.map((chat) => (chat.id === chatId ? { ...chat, unread: 0 } : chat)),
+    );
+    fetch(`${API_BASE_URL}/api/chats/${encodeURIComponent(chatId)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId }),
+    }).catch(() => undefined);
+  };
+
+  const emitTyping = (typing) => {
+    if (!socketRef.current || !selectedChatId || !currentUserId) {
+      return;
+    }
+    socketRef.current.emit('typing:update', {
+      chatId: selectedChatId,
+      userId: currentUserId,
+      typing: Boolean(typing),
+    });
+  };
+
+  const copyMessageText = async (text) => {
+    if (!text) {
+      return;
+    }
+    try {
+      const RNClipboard = require('react-native').Clipboard;
+      if (RNClipboard?.setString) {
+        RNClipboard.setString(text);
+        showToast('Copied', 'success', 1200);
+        return;
+      }
+    } catch {
+      // Fall through to Share.
+    }
+    try {
+      await Share.share({ message: text });
+    } catch {
+      showToast('Could not copy message', 'error');
+    }
+  };
+
+  const deleteMessage = async (message, scope = 'me') => {
+    if (!message?.id || !currentUserId) {
+      return;
+    }
+    if (scope === 'me') {
+      setMessagesByChat((current) => ({
+        ...current,
+        [selectedChatId]: (current[selectedChatId] ?? []).filter((item) => item.id !== message.id),
+      }));
+    }
+    const response = await fetch(`${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, scope }),
+    }).catch(() => null);
+    if (!response?.ok && scope === 'everyone') {
+      showToast('Could not delete for everyone', 'error');
+      return;
+    }
+    showToast(scope === 'everyone' ? 'Deleted for everyone' : 'Deleted for you', 'success', 1400);
+    setMessageActionTarget(null);
+  };
+
+  const forwardMessage = async (message) => {
+    const peers = chatItems.filter((chat) => chat.id !== selectedChatId).slice(0, 8);
+    if (!peers.length) {
+      showToast('No other chat to forward into yet.', 'error');
+      return;
+    }
+    Alert.alert(
+      'Forward message',
+      'Choose a chat',
+      [
+        ...peers.map((chat) => ({
+          text: chat.name,
+          onPress: () => {
+            fetch(`${API_BASE_URL}/api/messages`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chatId: chat.id,
+                senderId: currentUserId,
+                clientRef: `fwd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                kind: message.kind === 'image' || message.kind === 'voice' || message.kind === 'video' ? message.kind : 'text',
+                text: message.text || 'Forwarded message',
+                mediaUrls: message.imageUri || message.audioUri || message.videoUri
+                  ? [message.imageUri || message.audioUri || message.videoUri].filter(Boolean)
+                  : [],
+              }),
+            }).catch(() => undefined);
+            showToast(`Forwarded to ${chat.name}`, 'success', 1600);
+            setMessageActionTarget(null);
+          },
+        })),
+        { text: 'Cancel', style: 'cancel' },
+      ],
+    );
+  };
+
+  const getPresenceLabel = (chat) => {
+    if (peerTypingByChat[chat?.id]) {
+      return 'typing…';
+    }
+    const peer = usersById[chat?.peerUserId];
+    if (!peer) {
+      return chat?.presence || 'offline';
+    }
+    if (peer.presence === 'online' || peer.presence === 'typing') {
+      return peer.presence === 'typing' ? 'typing…' : 'online';
+    }
+    if (peer.lastSeenAt) {
+      return `last seen ${formatClock(peer.lastSeenAt)}`;
+    }
+    return 'offline';
+  };
+
+  const saveProfileToServer = async (overrides = {}, settingsOverrides = {}, options = {}) => {
+    if (!currentUserId) {
+      showToast('Sign in first to sync profile settings.', 'error');
+      return false;
+    }
+
+    const nextProfile = { ...profile, ...overrides };
+    const nextSettings = { ...appSettingsRef.current, ...settingsOverrides };
+    const pinToSave = typeof options.pin === 'string' ? options.pin.trim() : '';
+    const avatar =
+      nextProfile.name
+        .trim()
+        .split(/\s+/)
+        .slice(0, 2)
+        .map((part) => part.slice(0, 1).toUpperCase())
+        .join('')
+        .slice(0, 4) || 'ZU';
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/profile?userId=${encodeURIComponent(currentUserId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: nextProfile.name.trim() || undefined,
+          about: nextProfile.about.trim() || 'Hey there! I am using ZynkUp.',
+          phone: nextProfile.phone.trim() || undefined,
+          username: nextProfile.username?.trim() || undefined,
+          avatar,
+          photoUri: nextProfile.photoUri || '',
+          lastSeenPrivacy: nextSettings.lastSeenPrivacy,
+          profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
+          aboutPrivacy: nextSettings.aboutPrivacy,
+          statusPrivacy: nextSettings.statusPrivacy,
+          readReceiptsEnabled: nextSettings.readReceiptsEnabled,
+          appLockEnabled: nextSettings.appLockEnabled,
+          ...(pinToSave.length === 4 ? { pin: pinToSave } : {}),
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        showToast(getBackendErrorMessage(payload, 'Could not save profile.'), 'error', 3600);
+        return false;
+      }
+      const payload = await response.json();
+      if (payload.profile) {
+        setProfile((current) => ({
+          ...current,
+          name: payload.profile.name ?? current.name,
+          username: payload.profile.username ?? current.username,
+          about: payload.profile.about ?? current.about,
+          phone: payload.profile.phone ?? current.phone,
+          photoUri: payload.profile.photoUri ?? current.photoUri,
+        }));
+      }
+      if (pinToSave.length === 4) {
+        setAppLockPin(pinToSave);
+        await AsyncStorage.setItem(APP_LOCK_PIN_KEY, pinToSave).catch(() => undefined);
+      }
+      if (nextSettings.appLockEnabled === false) {
+        setAppLockPin('');
+        setAppUnlocked(true);
+        await AsyncStorage.removeItem(APP_LOCK_PIN_KEY).catch(() => undefined);
+      }
+      if (!options.quiet) {
+        showToast('Settings saved', 'success');
+      }
+      return true;
+    } catch {
+      showToast('Network error while saving settings.', 'error');
+      return false;
+    }
+  };
+
+  const updateAppSetting = (key, value, options = {}) => {
+    const nextSettings = { ...appSettingsRef.current, [key]: value };
+    void persistAppSettings(nextSettings);
+    if (!options.silent) {
+      showToast('Setting updated', 'success', 1400);
+    }
+    if (options.syncProfile) {
+      void saveProfileToServer({}, { [key]: value }, { quiet: true });
+    }
+    return nextSettings;
+  };
+
+  const pickProfilePhoto = async () => {
+    const result = await openImageLibrary({ mediaType: 'photo', selectionLimit: 1 });
+    if (result.errorCode) {
+      Alert.alert('Permission needed', result.errorMessage || 'Allow gallery access to update your photo.');
+      return;
+    }
+    if (result.didCancel || !result.assets?.length) {
+      return;
+    }
+
+    showToast('Uploading profile photo...', 'info', 0);
+    try {
+      const uploaded = await uploadUris([result.assets[0].uri], {
+        names: [`profile-${Date.now()}.jpg`],
+        fallbackType: 'image/jpeg',
+      });
+      const photoUri = uploaded[0] || result.assets[0].uri;
+      setProfile((current) => ({ ...current, photoUri }));
+      await saveProfileToServer({ photoUri });
+    } catch {
+      showToast('Could not upload profile photo.', 'error');
+    }
+  };
+
+  const clearChatHistory = () => {
+    Alert.alert(
+      'Clear chat history?',
+      'This removes local message history on this device. Your contacts stay.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: () => {
+            setMessagesByChat({});
+            setChatItems((current) =>
+              current.map((chat) => ({ ...chat, preview: 'No messages yet', unread: 0, time: '' })),
+            );
+            showToast('Chat history cleared on this device', 'success');
+            setSettingsPanel('');
+          },
+        },
+      ],
+    );
+  };
+
+  const clearLocalMediaCache = () => {
+    setStatusAssetUris([]);
+    setCatalogImageUris([]);
+    setMediaViewer(null);
+    showToast('Local media cache cleared', 'success');
+  };
+
+  const getBackendErrorMessage = (payload, fallback) => {
+    const fieldErrors = Object.values(payload?.details?.fieldErrors ?? {})
+      .flat()
+      .find(Boolean);
+    const formError = payload?.details?.formErrors?.find(Boolean);
+    const detail = fieldErrors || formError || '';
+    if (payload?.error && detail && payload.error !== detail) {
+      return `${payload.error}: ${detail}`;
+    }
+    return payload?.error || detail || fallback;
+  };
+
+  const authDevicePayload = () => (
+    currentDeviceId && String(currentDeviceId).length >= 8
+      ? { deviceId: currentDeviceId }
+      : {}
+  );
 
   const hydrateBootstrapFromDevice = async (deviceIdHint) => {
     const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
@@ -481,7 +1000,7 @@ export default function App() {
 
   const resetAuthForm = () => {
     setAuthForm({
-      countryCode: '',
+      countryCode: '+233',
       phone: '',
       otp: '',
       verifiedPhone: '',
@@ -500,8 +1019,12 @@ export default function App() {
       setAuthMode('welcome');
       return;
     }
-    if (authMode === 'otp') {
+    if (authMode === 'pin' || authMode === 'otp') {
       setAuthMode('phone');
+      return;
+    }
+    if (authMode === 'reset-pin') {
+      setAuthMode('otp');
       return;
     }
     if (authMode === 'profile') {
@@ -532,21 +1055,34 @@ export default function App() {
     }));
   };
 
+  const appendPinDigit = (digit) => {
+    setAuthForm((current) => {
+      if (current.pin.length >= 6) {
+        return current;
+      }
+      return {
+        ...current,
+        pin: `${current.pin}${digit}`,
+      };
+    });
+  };
+
+  const removePinDigit = () => {
+    setAuthForm((current) => ({
+      ...current,
+      pin: current.pin.slice(0, -1),
+    }));
+  };
+
+  const isValidAuthPin = (pin) => /^\d{4,6}$/.test(String(pin || '').trim());
+
   const pickAuthProfilePhoto = async () => {
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert('Permission needed', 'Please allow gallery access to select a profile photo.');
+    const result = await openImageLibrary({ mediaType: 'photo' });
+    if (result.errorCode) {
+      Alert.alert('Permission needed', result.errorMessage || 'Please allow gallery access to select a profile photo.');
       return;
     }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 1,
-      allowsEditing: true,
-      aspect: [1, 1],
-    });
-
-    if (!result.canceled && result.assets?.length) {
+    if (!result.didCancel && result.assets?.length) {
       setAuthForm((current) => ({
         ...current,
         photoUri: result.assets[0].uri,
@@ -560,6 +1096,10 @@ export default function App() {
       showToast('Enter your name to continue.', 'error');
       return;
     }
+    if (!isValidAuthPin(authForm.pin)) {
+      showToast('Create a 4–6 digit PIN to secure your account.', 'error');
+      return;
+    }
 
     setAuthForm((current) => ({
       ...current,
@@ -567,6 +1107,164 @@ export default function App() {
       username: current.username.trim() || deriveAuthUsername(trimmedName),
     }));
     setAuthMode('account');
+  };
+
+  const finishAuthenticatedSession = async (payload, pinToStore) => {
+    if (payload.session?.deviceId) {
+      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+    let bootstrapPayload = payload.bootstrap ?? null;
+    if (bootstrapPayload?.currentUserId) {
+      applyBootstrapPayload(bootstrapPayload);
+    } else {
+      bootstrapPayload = await hydrateBootstrapFromDevice(payload.session?.deviceId ?? currentDeviceId);
+    }
+    if (!bootstrapPayload?.currentUserId) {
+      showToast('Signed in, but session sync failed. Reopen the app once.', 'error', 4200);
+      return false;
+    }
+    if (pinToStore && isValidAuthPin(pinToStore)) {
+      setAppLockPin(String(pinToStore));
+      await AsyncStorage.setItem(APP_LOCK_PIN_KEY, String(pinToStore)).catch(() => undefined);
+    }
+    setAuthVisible(false);
+    setAuthRequired(false);
+    resetAuthForm();
+    showToast('Welcome back', 'success');
+    return true;
+  };
+
+  const loginWithPin = async () => {
+    if (isAuthBusy) {
+      return;
+    }
+    if (!isValidAuthPin(authForm.pin)) {
+      showToast('Enter your 4–6 digit PIN.', 'error');
+      return;
+    }
+    setAuthPendingAction('pin-login');
+    showToast('Signing you in...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...authDevicePayload(),
+          countryCode: authForm.countryCode.trim(),
+          phoneNumber: authForm.phone.trim(),
+          phone: normalizeAuthPhone(authForm.countryCode.trim(), authForm.phone.trim()),
+          pin: authForm.pin.trim(),
+          platform: Platform.OS,
+          label: `${Platform.OS} device`,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, 'Incorrect PIN.'), 'error');
+        return;
+      }
+      await finishAuthenticatedSession(payload, authForm.pin.trim());
+    } catch {
+      showToast('Network error while signing in.', 'error');
+    } finally {
+      setAuthPendingAction('');
+    }
+  };
+
+  const resetPinAfterOtp = async () => {
+    if (isAuthBusy) {
+      return;
+    }
+    if (!isValidAuthPin(authForm.pin)) {
+      showToast('Enter a new 4–6 digit PIN.', 'error');
+      return;
+    }
+    if (!phoneAuthChallengeIdRef.current) {
+      showToast('Verify OTP first, then set a new PIN.', 'error');
+      return;
+    }
+    setAuthPendingAction('reset-pin');
+    showToast('Saving new PIN...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/pin/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...authDevicePayload(),
+          challengeId: phoneAuthChallengeIdRef.current,
+          pin: authForm.pin.trim(),
+          platform: Platform.OS,
+          label: `${Platform.OS} device`,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, 'Could not reset PIN.'), 'error');
+        return;
+      }
+      await finishAuthenticatedSession(payload, authForm.pin.trim());
+    } catch {
+      showToast('Network error while resetting PIN.', 'error');
+    } finally {
+      setAuthPendingAction('');
+    }
+  };
+
+  const continueWithPhone = async () => {
+    if (isAuthBusy) {
+      return;
+    }
+    if (!authForm.countryCode.trim()) {
+      showToast('Select your country code first.', 'error');
+      setCountryPickerVisible(true);
+      return;
+    }
+    const countryCode = authForm.countryCode.trim();
+    const phoneNumber = authForm.phone.trim();
+    const normalizedPhone = normalizeAuthPhone(countryCode, phoneNumber);
+    if (normalizedPhone.length < 8) {
+      showToast('Enter a valid phone number first.', 'error');
+      return;
+    }
+
+    setAuthPendingAction('lookup');
+    showToast('Checking your number...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/phone/lookup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ countryCode, phoneNumber }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, 'Could not check this phone number.'), 'error');
+        return;
+      }
+
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone: payload.phone || normalizedPhone,
+        pin: '',
+        otp: '',
+      }));
+
+      if (payload.registered && payload.hasPin) {
+        forgotPinFlowRef.current = false;
+        setAuthMode('pin');
+        showToast('Welcome back. Enter your PIN.', 'success', 2200);
+        return;
+      }
+
+      // New user or account without PIN — verify via OTP.
+      forgotPinFlowRef.current = false;
+      phoneAuthProviderRef.current = 'backend';
+      await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
+    } catch {
+      showToast('Network error while checking this phone number.', 'error');
+    } finally {
+      setAuthPendingAction('');
+    }
   };
 
   const submitSelectedAccountType = (accountType) => {
@@ -618,19 +1316,27 @@ export default function App() {
   };
 
   const syncPhoneContacts = async (userId) => {
-    const permission = await ExpoContacts.requestPermissionsAsync();
-    if (permission.status !== 'granted') {
+    if (!Contacts?.getAll) {
       return;
     }
 
-    const deviceContacts = await ExpoContacts.getContactsAsync({
-      fields: [ExpoContacts.Fields.PhoneNumbers],
-      pageSize: 2000,
-    });
-    const payloadContacts = (deviceContacts.data ?? [])
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        return;
+      }
+    } else {
+      const permission = await Contacts.requestPermission();
+      if (permission !== 'authorized') {
+        return;
+      }
+    }
+
+    const deviceContacts = await Contacts.getAll();
+    const payloadContacts = deviceContacts
       .flatMap((contact) =>
         (contact.phoneNumbers ?? []).map((entry) => ({
-          name: contact.name || 'Unknown',
+          name: contact.displayName || 'Unknown',
           phone: entry.number ?? '',
         })),
       )
@@ -806,17 +1512,22 @@ export default function App() {
     return userMap[peerId]?.name ?? chat.title;
   };
 
-  const mapChatFromServer = (chat, userId, userMap) => ({
-    id: chat.id,
-    name: getChatTitle(chat, userId, userMap),
-    preview: chat.lastMessagePreview,
-    unread: chat.unreadCount ?? 0,
-    presence: 'online',
-    time: formatClock(chat.updatedAt ?? new Date().toISOString()),
-    peerUserId: chat.kind === 'direct'
+  const mapChatFromServer = (chat, userId, userMap) => {
+    const peerUserId = chat.kind === 'direct'
       ? (chat.participants ?? []).find((participantId) => participantId !== userId)
-      : undefined,
-  });
+      : undefined;
+    const peer = peerUserId ? userMap[peerUserId] : null;
+    return {
+      id: chat.id,
+      name: getChatTitle(chat, userId, userMap),
+      preview: chat.lastMessagePreview,
+      unread: chat.unreadCount ?? 0,
+      presence: peer?.presence ?? 'offline',
+      lastSeenAt: peer?.lastSeenAt,
+      time: formatClock(chat.updatedAt ?? new Date().toISOString()),
+      peerUserId,
+    };
+  };
 
   const mapCallFromServer = (call, userId, userMap) => {
     const peerUserId = (call.participantIds ?? []).find((participantId) => participantId !== userId);
@@ -857,18 +1568,7 @@ export default function App() {
           item.id === incomingMessage.id ||
           (incomingMessage.clientRef && item.clientRef === incomingMessage.clientRef),
       );
-      const mapped = {
-        id: incomingMessage.id,
-        clientRef: incomingMessage.clientRef,
-        mine: incomingMessage.senderId === currentUserId,
-        kind: incomingMessage.kind === 'file' ? 'text' : incomingMessage.kind,
-        text: incomingMessage.text,
-        time: formatClock(incomingMessage.sentAt),
-        imageUri: incomingMessage.mediaUrls?.[0],
-        audioUri: incomingMessage.mediaUrls?.[0],
-        durationLabel: incomingMessage.durationSeconds ? getAudioDurationLabel(incomingMessage.durationSeconds * 1000) : undefined,
-        receiptState: incomingMessage.state,
-      };
+      const mapped = mapServerMessage(incomingMessage, currentUserId);
 
       if (existingIndex >= 0) {
         const next = [...existing];
@@ -938,7 +1638,30 @@ export default function App() {
       username: payload.profile?.username ?? current.username,
       about: payload.profile?.about ?? current.about,
       phone: payload.profile?.phone ?? current.phone,
+      photoUri: payload.profile?.photoUri || current.photoUri,
     }));
+    if (payload.profile) {
+      setAppSettings((current) => {
+        const next = {
+          ...current,
+          lastSeenPrivacy: payload.profile.lastSeenPrivacy ?? current.lastSeenPrivacy,
+          profilePhotoPrivacy: payload.profile.profilePhotoPrivacy ?? current.profilePhotoPrivacy,
+          aboutPrivacy: payload.profile.aboutPrivacy ?? current.aboutPrivacy,
+          statusPrivacy: payload.profile.statusPrivacy ?? current.statusPrivacy,
+          readReceiptsEnabled:
+            payload.profile.readReceiptsEnabled == null
+              ? current.readReceiptsEnabled
+              : Boolean(payload.profile.readReceiptsEnabled),
+          appLockEnabled:
+            payload.profile.appLockEnabled == null
+              ? current.appLockEnabled
+              : Boolean(payload.profile.appLockEnabled),
+        };
+        appSettingsRef.current = next;
+        void AsyncStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
+        return next;
+      });
+    }
     const nextChats = (payload.chats ?? []).map((chat) => mapChatFromServer(chat, nextCurrentUserId, nextUsersById));
     setChatItems(nextChats);
     setSelectedChatId((current) => (nextChats.some((chat) => chat.id === current) ? current : nextChats[0]?.id ?? ''));
@@ -955,18 +1678,7 @@ export default function App() {
       Object.fromEntries(
         Object.entries(payload.messagesByChat ?? {}).map(([chatId, list]) => [
           chatId,
-          list.map((message) => ({
-            id: message.id,
-            clientRef: message.clientRef,
-            mine: message.senderId === nextCurrentUserId,
-            kind: message.kind === 'file' ? 'text' : message.kind,
-            text: message.text,
-            time: formatClock(message.sentAt),
-            imageUri: message.mediaUrls?.[0],
-            audioUri: message.mediaUrls?.[0],
-            durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
-            receiptState: message.state,
-          })),
+          list.map((message) => mapServerMessage(message, nextCurrentUserId)),
         ]),
       ),
     );
@@ -989,10 +1701,11 @@ export default function App() {
       (payload.catalogItems ?? []).map((item) => ({
         id: item.id,
         title: item.title,
-        price: `${item.currency ?? 'ZMW'} ${item.price}`,
+        price: `${item.currency ?? 'GHS'} ${item.price}`,
         category: item.category,
         seller: payload.users?.find((user) => user.id === item.sellerId)?.name ?? 'Seller',
         description: item.description,
+        stockQuantity: item.stockQuantity ?? 0,
         imageUri: item.imageUrls?.[0] ?? null,
         imageUris: item.imageUrls ?? [],
       })),
@@ -1026,7 +1739,7 @@ export default function App() {
       animationRef.current.stop();
       animationRef.current = null;
     }
-    Speech.stop();
+    safeTtsStop();
     emojiAnim.setValue(0);
     setEmojiPlayback(null);
   };
@@ -1076,12 +1789,11 @@ export default function App() {
           currentToken: token,
         });
 
-        Speech.stop();
+        safeTtsStop();
         if (LAUGHING_EMOJIS.has(token)) {
-          Speech.speak('ha ha ha ha', {
-            language: 'en',
-            rate: 1.0,
-            pitch: 1.3,
+          safeTtsSpeak('ha ha ha ha', {
+            iosVoiceId: undefined,
+            rate: 0.5,
           });
         }
       }, index * duration);
@@ -1112,11 +1824,38 @@ export default function App() {
     return () => {
       stopEmojiPlayback();
       if (currentSoundRef.current) {
-        currentSoundRef.current.unloadAsync();
+        currentSoundRef.current.removePlayBackListener();
+        currentSoundRef.current.removePlaybackEndListener();
+        currentSoundRef.current.stopPlayer().catch(() => undefined);
         currentSoundRef.current = null;
       }
     };
   }, [messages, chatScreen, selectedChatId]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    if (!CameraKit?.checkDeviceCameraAuthorizationStatus) {
+      setCameraPermissionGranted(false);
+      return undefined;
+    }
+
+    CameraKit.checkDeviceCameraAuthorizationStatus()
+      .then((granted) => {
+        if (mounted) {
+          setCameraPermissionGranted(Boolean(granted));
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setCameraPermissionGranted(false);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1124,7 +1863,7 @@ export default function App() {
     const bootstrapSession = async () => {
       const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
       try {
-        const response = await fetch(`${API_BASE_URL}/api/session/ensure`, {
+        const response = await fetchWithTimeout(`${API_BASE_URL}/api/session/ensure`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1153,7 +1892,7 @@ export default function App() {
       } catch {
         const query = storedDeviceId ? `?deviceId=${encodeURIComponent(storedDeviceId)}` : '';
         try {
-          const response = await fetch(`${API_BASE_URL}/api/bootstrap${query}`);
+          const response = await fetchWithTimeout(`${API_BASE_URL}/api/bootstrap${query}`);
           const payload = await response.json();
           if (!cancelled) {
             applyBootstrapPayload(payload);
@@ -1168,6 +1907,12 @@ export default function App() {
 
     void bootstrapSession();
 
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     const socket = io(API_BASE_URL, { transports: ['websocket', 'polling'] });
     socketRef.current = socket;
     socket.on('system:ready', (payload) => {
@@ -1179,13 +1924,71 @@ export default function App() {
       reconcileIncomingMessage(message.chatId, message);
 
       if (message.senderId !== currentUserId) {
-        void syncReceiptState(
-          message.id,
-          chatScreen === 'detail' && selectedChatId === message.chatId ? 'read' : 'delivered',
-        );
+        const settings = appSettingsRef.current;
+        const viewingChat = chatScreen === 'detail' && selectedChatId === message.chatId;
+        const nextReceipt =
+          viewingChat && settings.readReceiptsEnabled ? 'read' : 'delivered';
+        void syncReceiptState(message.id, nextReceipt);
+
+        if (
+          settings.messageNotifications &&
+          !viewingChat &&
+          !mutedChatIdsRef.current.includes(message.chatId)
+        ) {
+          const senderName = usersById[message.senderId]?.name || 'New message';
+          const preview = settings.showNotificationPreview
+            ? (message.text || (message.kind === 'image' ? 'Photo' : message.kind === 'voice' ? 'Voice message' : 'New message'))
+            : 'New message';
+          showToast(`${senderName}: ${preview}`, 'info', settings.conversationTones ? 2800 : 1800);
+        }
       }
     });
+    socket.on('message:deleted', ({ message, scope, userId }) => {
+      if (!message?.chatId) {
+        return;
+      }
+      if (scope === 'me' && userId !== currentUserId) {
+        return;
+      }
+      if (scope === 'me') {
+        setMessagesByChat((current) => ({
+          ...current,
+          [message.chatId]: (current[message.chatId] ?? []).filter((item) => item.id !== message.id),
+        }));
+        return;
+      }
+      reconcileIncomingMessage(message.chatId, message);
+    });
+    socket.on('typing:update', ({ chatId, userId, typing }) => {
+      if (!chatId || userId === currentUserId) {
+        return;
+      }
+      setPeerTypingByChat((current) => ({ ...current, [chatId]: Boolean(typing) }));
+    });
+    socket.on('presence:changed', ({ userId, presence, lastSeenAt }) => {
+      if (!userId) {
+        return;
+      }
+      setUsersById((current) => ({
+        ...current,
+        [userId]: {
+          ...(current[userId] ?? { id: userId, name: 'Contact', avatar: 'CT' }),
+          presence,
+          lastSeenAt: lastSeenAt ?? current[userId]?.lastSeenAt,
+        },
+      }));
+      setChatItems((current) =>
+        current.map((chat) =>
+          chat.peerUserId === userId
+            ? { ...chat, presence, lastSeenAt: lastSeenAt ?? chat.lastSeenAt }
+            : chat,
+        ),
+      );
+    });
     socket.on('chat:updated', (chat) => {
+      if (chat.viewerUserId && chat.viewerUserId !== currentUserId) {
+        return;
+      }
       setChatItems((current) =>
         current.map((item) =>
           item.id === chat.id
@@ -1231,19 +2034,43 @@ export default function App() {
       );
     });
     socket.on('catalog:itemCreated', (item) => {
-      setCatalogItems((current) => [
-        {
-          id: item.id,
-          title: item.title,
-          price: `${item.currency ?? 'ZMW'} ${item.price}`,
-          category: item.category,
-          seller: profile.name,
-          description: item.description,
-          imageUri: item.imageUrls?.[0] ?? null,
-          imageUris: item.imageUrls ?? [],
-        },
-        ...current,
-      ]);
+      setCatalogItems((current) => {
+        if (current.some((entry) => entry.id === item.id)) {
+          return current;
+        }
+        return [
+          {
+            id: item.id,
+            title: item.title,
+            price: `${item.currency ?? 'GHS'} ${item.price}`,
+            category: item.category,
+            seller: profile.name,
+            description: item.description,
+            stockQuantity: item.stockQuantity ?? 0,
+            imageUri: item.imageUrls?.[0] ?? null,
+            imageUris: item.imageUrls ?? [],
+          },
+          ...current,
+        ];
+      });
+    });
+    socket.on('catalog:itemUpdated', (item) => {
+      setCatalogItems((current) =>
+        current.map((entry) =>
+          entry.id === item.id
+            ? {
+                ...entry,
+                title: item.title ?? entry.title,
+                price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
+                category: item.category ?? entry.category,
+                description: item.description ?? entry.description,
+                stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
+                imageUri: item.imageUrls?.[0] ?? entry.imageUri,
+                imageUris: item.imageUrls ?? entry.imageUris,
+              }
+            : entry,
+        ),
+      );
     });
     socket.on('message:receiptUpdated', (message) => {
       setMessagesByChat((current) => ({
@@ -1327,14 +2154,80 @@ export default function App() {
       })();
     });
 
+    if (currentUserId) {
+      socket.emit('presence:update', { userId: currentUserId, presence: 'online' });
+    }
+
     return () => {
-      cancelled = true;
+      if (currentUserId) {
+        socket.emit('presence:update', { userId: currentUserId, presence: 'offline' });
+      }
       socket.disconnect();
     };
   }, [chatScreen, currentDeviceId, currentUserId, profile.name, selectedChatId, usersById]);
 
   useEffect(() => {
-    if (chatScreen !== 'detail') {
+    void (async () => {
+      try {
+        const [storedSettings, storedFavorites, storedMuted, storedArchived, storedPin] = await Promise.all([
+          AsyncStorage.getItem(SETTINGS_STORAGE_KEY),
+          AsyncStorage.getItem(FAVORITES_STORAGE_KEY),
+          AsyncStorage.getItem(MUTED_CHATS_STORAGE_KEY),
+          AsyncStorage.getItem(ARCHIVED_CHATS_STORAGE_KEY),
+          AsyncStorage.getItem(APP_LOCK_PIN_KEY),
+        ]);
+        let nextSettings = { ...DEFAULT_APP_SETTINGS };
+        if (storedSettings) {
+          nextSettings = { ...nextSettings, ...JSON.parse(storedSettings) };
+          appSettingsRef.current = nextSettings;
+          setAppSettings(nextSettings);
+        }
+        if (storedFavorites) {
+          const parsed = JSON.parse(storedFavorites);
+          if (Array.isArray(parsed)) {
+            setFavoriteChatIds(parsed);
+          }
+        }
+        if (storedMuted) {
+          const parsed = JSON.parse(storedMuted);
+          if (Array.isArray(parsed)) {
+            mutedChatIdsRef.current = parsed;
+            setMutedChatIds(parsed);
+          }
+        }
+        if (storedArchived) {
+          const parsed = JSON.parse(storedArchived);
+          if (Array.isArray(parsed)) {
+            setArchivedChatIds(parsed);
+          }
+        }
+        if (storedPin && storedPin.length === 4) {
+          setAppLockPin(storedPin);
+        }
+        if (nextSettings.appLockEnabled && storedPin && storedPin.length === 4) {
+          setAppUnlocked(false);
+        }
+      } catch {
+        // Keep defaults when storage is unavailable.
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || chatScreen !== 'detail' || !selectedChatId) {
+      return undefined;
+    }
+    socket.emit('chat:join', selectedChatId);
+    clearChatUnread(selectedChatId);
+    return () => {
+      socket.emit('chat:leave', selectedChatId);
+      emitTyping(false);
+    };
+  }, [chatScreen, selectedChatId]);
+
+  useEffect(() => {
+    if (chatScreen !== 'detail' || !appSettings.readReceiptsEnabled) {
       return;
     }
 
@@ -1343,7 +2236,7 @@ export default function App() {
       .forEach((message) => {
         void syncReceiptState(message.id, 'read');
       });
-  }, [chatScreen, messagesByChat, selectedChatId]);
+  }, [appSettings.readReceiptsEnabled, chatScreen, messagesByChat, selectedChatId]);
 
   useEffect(() => {
     if (!activeStatusItem) {
@@ -1577,9 +2470,12 @@ export default function App() {
       text,
       time: 'Now',
       receiptState: 'sent',
+      replyToMessageId: replyTarget?.id,
+      replyPreview: replyTarget?.text?.slice(0, 140),
     };
 
     appendMessage(message);
+    emitTyping(false);
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1590,9 +2486,12 @@ export default function App() {
         kind,
         text,
         mediaUrls: [],
+        replyToMessageId: replyTarget?.id,
+        replyPreview: replyTarget?.text?.slice(0, 140),
       }),
     }).catch(() => undefined);
     setMessageDraft('');
+    setReplyTarget(null);
     setEmojiTrayVisible(false);
 
     if (kind === 'emoji') {
@@ -1606,33 +2505,183 @@ export default function App() {
       return;
     }
 
+    showToast('Saving catalog item...', 'info', 0);
     const uploadedImageUrls = await uploadUris(catalogImageUris, {
       names: catalogImageUris.map((_, index) => `catalog-${Date.now()}-${index}.jpg`),
       fallbackType: 'image/jpeg',
     }).catch(() => []);
 
-    fetch(`${API_BASE_URL}/api/catalog`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sellerId: currentUserId,
-        title: catalogForm.title.trim(),
-        price: Number.parseFloat(catalogForm.price) || 0,
-        currency: 'ZMW',
-        category: catalogForm.category,
-        description: catalogForm.description.trim() || 'New item from your business catalog.',
-        imageUrls: uploadedImageUrls.length
-          ? uploadedImageUrls
-          : ['https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=900&q=80'],
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sellerId: currentUserId,
+          title: catalogForm.title.trim(),
+          price: Number.parseFloat(catalogForm.price) || 0,
+          currency: 'GHS',
+          category: catalogForm.category,
+          description: catalogForm.description.trim() || 'New item from your business catalog.',
+          stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
+          imageUrls: uploadedImageUrls.length
+            ? uploadedImageUrls
+            : ['https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=900&q=80'],
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        showToast(getBackendErrorMessage(payload, 'Could not save catalog item.'), 'error', 3600);
+        return;
+      }
+      showToast('Catalog item published.', 'success');
+      setCatalogForm({
+        title: '',
+        price: '',
+        category: 'Fashion',
+        description: '',
+        stockQuantity: '10',
+      });
+      setCatalogImageUris([]);
+    } catch {
+      showToast('Network error while saving catalog item.', 'error');
+    }
+  };
+
+  const adjustCatalogStock = async (itemId, nextStock) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(itemId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stockQuantity: Math.max(0, nextStock) }),
+      });
+      if (!response.ok) {
+        showToast('Could not update stock.', 'error');
+        return;
+      }
+      const payload = await response.json();
+      if (payload.item) {
+        setCatalogItems((current) =>
+          current.map((item) => (item.id === payload.item.id ? { ...item, ...payload.item } : item)),
+        );
+      }
+    } catch {
+      showToast('Network error while updating stock.', 'error');
+    }
+  };
+
+  const submitPayAction = async () => {
+    const amount = Number.parseFloat(payForm.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast('Enter a valid amount first.', 'error');
+      return;
+    }
+    if ((paySheet === 'send' || paySheet === 'request') && !payForm.phone.trim()) {
+      showToast('Enter the recipient phone number.', 'error');
+      return;
+    }
+
+    showToast('Preparing payment...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/payments/intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: paySheet === 'topup' ? 'topup' : paySheet,
+          amount,
+          currency: 'GHS',
+          phone: payForm.phone.trim() || undefined,
+          note: payForm.note.trim() || undefined,
+          provider: 'mtn_momo',
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, 'Payment could not start.'), 'error', 3600);
+        return;
+      }
+
+      const entry = {
+        id: payload.intent?.id ?? `local-${Date.now()}`,
+        title:
+          paySheet === 'send'
+            ? `Sent to ${payForm.phone.trim()}`
+            : paySheet === 'request'
+              ? `Requested from ${payForm.phone.trim()}`
+              : 'Wallet top up',
+        time: 'Just now',
+        amount: `${paySheet === 'request' ? '+' : '-'}GHC ${amount.toFixed(2)}`,
+        positive: paySheet === 'request' || paySheet === 'topup',
+      };
+      setPayHistoryItems((current) => [entry, ...current]);
+      showToast(payload.message || 'Payment flow ready.', 'success', 4200);
+      setPayForm({ amount: '', phone: '', note: '' });
+      setPaySheet(paySheet === 'history' ? 'history' : '');
+    } catch {
+      showToast('Network error while starting payment.', 'error');
+    }
+  };
+
+  const sendBroadcast = async () => {
+    const text = broadcastDraft.trim();
+    if (!text) {
+      showToast('Write a broadcast message first.', 'error');
+      return;
+    }
+
+    const recipients = [
+      ...new Set(
+        [
+          ...contactItems.map((contact) => contact.linkedUserId).filter(Boolean),
+          ...Object.keys(usersById).filter((id) => id !== currentUserId),
+        ],
+      ),
+    ];
+
+    if (!recipients.length) {
+      showToast('No registered customers yet. Sync contacts first.', 'error', 3600);
+      return;
+    }
+
+    showToast(`Broadcasting to ${recipients.length} customers...`, 'info', 0);
+    let sent = 0;
+    await Promise.all(
+      recipients.map(async (peerUserId) => {
+        try {
+          const chatResponse = await fetch(`${API_BASE_URL}/api/chats`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: currentUserId, peerUserId }),
+          });
+          if (!chatResponse.ok) {
+            return;
+          }
+          const chatPayload = await chatResponse.json();
+          const chatId = chatPayload.chat?.id;
+          if (!chatId) {
+            return;
+          }
+          await fetch(`${API_BASE_URL}/api/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chatId,
+              senderId: currentUserId,
+              clientRef: `broadcast-${Date.now()}-${peerUserId}`,
+              kind: 'text',
+              text,
+              mediaUrls: [],
+            }),
+          });
+          sent += 1;
+        } catch {
+          // Keep broadcasting to remaining recipients.
+        }
       }),
-    }).catch(() => undefined);
-    setCatalogForm({
-      title: '',
-      price: '',
-      category: 'Fashion',
-      description: '',
-    });
-    setCatalogImageUris([]);
+    );
+
+    setBroadcastDraft('');
+    setBusinessPanel('');
+    showToast(sent ? `Broadcast sent to ${sent} customer${sent === 1 ? '' : 's'}.` : 'Broadcast could not be delivered.', sent ? 'success' : 'error', 4200);
   };
 
   const addAttachmentMessage = (kind, name, source, uri = null) => {
@@ -1678,18 +2727,12 @@ export default function App() {
   };
 
   const openGallery = async (kind) => {
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert('Permission needed', 'Please allow gallery access to send media.');
+    const result = await openImageLibrary({ mediaType: kind === 'video' ? 'video' : 'photo' });
+    if (result.errorCode) {
+      Alert.alert('Permission needed', result.errorMessage || 'Please allow gallery access to send media.');
       return;
     }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: kind === 'video' ? ImagePicker.MediaTypeOptions.Videos : ImagePicker.MediaTypeOptions.Images,
-      quality: 1,
-    });
-
-    if (!result.canceled && result.assets?.length) {
+    if (!result.didCancel && result.assets?.length) {
       const asset = result.assets[0];
       persistAttachmentMessage(
         kind,
@@ -1701,16 +2744,28 @@ export default function App() {
   };
 
   const openFiles = async (kind) => {
-    const type = kind === 'image' ? 'image/*' : kind === 'video' ? 'video/*' : '*/*';
-    const result = await DocumentPicker.getDocumentAsync({
-      type,
-      multiple: false,
-      copyToCacheDirectory: true,
-    });
+    if (!pickDocument) {
+      Alert.alert('Unavailable', 'Document picker is not available in this build.');
+      return;
+    }
 
-    if (!result.canceled && result.assets?.length) {
-      const asset = result.assets[0];
+    const type =
+      kind === 'image'
+        ? [DocumentPickerTypes.images]
+        : kind === 'video'
+          ? [DocumentPickerTypes.video]
+          : [DocumentPickerTypes.allFiles];
+    try {
+      const [asset] = await pickDocument({
+        type,
+        copyTo: 'cachesDirectory',
+        allowMultiSelection: false,
+      });
       persistAttachmentMessage(kind, asset.name, 'file manager', asset.uri);
+    } catch (error) {
+      if (!(isDocumentPickerErrorWithCode(error) && error.code === DocumentPickerErrorCodes.OPERATION_CANCELED)) {
+        Alert.alert('Files', 'Unable to open the file picker right now.');
+      }
     }
   };
 
@@ -1724,21 +2779,16 @@ export default function App() {
     await openFiles(attachmentType);
   };
 
-  const pickMultipleImages = async (target) => {
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert('Permission needed', 'Please allow gallery access to select images.');
+  const pickMultipleImages = async (target, mediaType = 'photo') => {
+    const result = await openImageLibrary({
+      mediaType: mediaType === 'video' ? 'video' : 'photo',
+      selectionLimit: mediaType === 'video' ? 1 : 10,
+    });
+    if (result.errorCode) {
+      Alert.alert('Permission needed', result.errorMessage || 'Please allow gallery access to select media.');
       return;
     }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 1,
-      allowsMultipleSelection: true,
-      selectionLimit: 10,
-    });
-
-    if (!result.canceled && result.assets?.length) {
+    if (!result.didCancel && result.assets?.length) {
       const uris = result.assets.map((asset) => asset.uri);
       if (target === 'status') {
         setStatusAssetUris(uris);
@@ -1749,35 +2799,66 @@ export default function App() {
   };
 
   const postStatus = async () => {
-    if (!statusDraft.trim() && !statusAssetUris.length) {
+    const text = statusDraft.trim();
+    const wantsMedia = statusComposerMode === 'photo' || statusComposerMode === 'video';
+
+    if (statusComposerMode === 'text' && !text) {
+      showToast('Type a text status first.', 'error');
+      return;
+    }
+    if (wantsMedia && !statusAssetUris.length) {
+      showToast(`Pick at least one ${statusComposerMode} first.`, 'error');
+      return;
+    }
+    if (!text && !statusAssetUris.length) {
+      showToast('Add text or media before posting.', 'error');
       return;
     }
 
-    const uploadedUrls = await uploadUris(statusAssetUris, {
-      names: statusAssetUris.map((_, index) => `status-${Date.now()}-${index}.jpg`),
-      fallbackType: 'image/jpeg',
-    }).catch(() => []);
+    showToast('Posting your status...', 'info', 0);
+    const uploadedUrls = statusAssetUris.length
+      ? await uploadUris(statusAssetUris, {
+          names: statusAssetUris.map((_, index) => `status-${Date.now()}-${index}.${statusComposerMode === 'video' ? 'mp4' : 'jpg'}`),
+          fallbackType: statusComposerMode === 'video' ? 'video/mp4' : 'image/jpeg',
+        }).catch(() => [])
+      : [];
 
-    fetch(`${API_BASE_URL}/api/statuses`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: currentUserId,
-        text: statusDraft.trim(),
-        assets: uploadedUrls.map((uri, index) => ({
-          kind: 'image',
-          url: uri,
-          caption: index === 0 ? statusDraft.trim() : '',
-        })),
-        backgroundColor: statusBackgroundColor,
-        fontFamily: statusFontFamily,
-        fontSize: statusFontSize,
-        audience: 'contacts',
-      }),
-    }).catch(() => undefined);
-    setStatusDraft('');
-    setStatusAssetUris([]);
-    setStatusComposerVisible(false);
+    if (wantsMedia && !uploadedUrls.length) {
+      showToast('Could not upload media. Check your connection and try again.', 'error', 3600);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/statuses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          assets: uploadedUrls.map((uri, index) => ({
+            kind: statusComposerMode === 'video' ? 'video' : 'image',
+            url: uri,
+            caption: index === 0 ? text : '',
+          })),
+          backgroundColor: statusComposerMode === 'text' ? statusBackgroundColor : undefined,
+          fontFamily: statusComposerMode === 'text' ? statusFontFamily : undefined,
+          fontSize: statusComposerMode === 'text' ? statusFontSize : undefined,
+          audience: 'contacts',
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        showToast(getBackendErrorMessage(payload, 'Could not post status.'), 'error', 3600);
+        return;
+      }
+      setStatusDraft('');
+      setStatusAssetUris([]);
+      setStatusComposerMode('text');
+      setStatusComposerVisible(false);
+      showToast('Status posted.', 'success');
+    } catch {
+      showToast('Network error while posting status.', 'error');
+    }
   };
 
   const deleteStatus = (statusId) => {
@@ -1919,21 +3000,38 @@ export default function App() {
     }
   };
 
-  const startPhoneAuth = async () => {
-    if (isAuthBusy) {
-      return;
-    }
-    if (!nativeFirebaseReady || !firebaseAuth) {
-      showToast(
-        'Firebase phone auth is not available in this runtime. Open the installed app, not Expo Go.',
-        'error',
-        3600,
-      );
-      return;
+  const startBackendPhoneAuth = async (countryCode, phoneNumber, normalizedPhone) => {
+    const response = await fetch(`${API_BASE_URL}/api/auth/phone/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ countryCode, phoneNumber }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(getBackendErrorMessage(payload, 'Unable to start phone verification.'));
     }
 
-    if (!firebaseConfigReady) {
-      showToast('Firebase mobile auth is not configured yet.', 'error');
+    phoneAuthProviderRef.current = 'backend';
+    phoneAuthConfirmationRef.current = null;
+    phoneAuthIdTokenRef.current = '';
+    phoneAuthChallengeIdRef.current = payload.challengeId ?? '';
+    setAuthForm((current) => ({
+      ...current,
+      otp: '',
+      verifiedPhone: normalizedPhone,
+    }));
+    setAuthMode('otp');
+    showToast(
+      payload.otpHint
+        ? `Dev OTP ready. Use code ${payload.otpHint}.`
+        : 'Code sent. Enter the OTP to continue.',
+      'success',
+      4200,
+    );
+  };
+
+  const startPhoneAuth = async () => {
+    if (isAuthBusy) {
       return;
     }
 
@@ -1943,7 +3041,9 @@ export default function App() {
       return;
     }
 
-    const normalizedPhone = normalizeAuthPhone(authForm.countryCode.trim(), authForm.phone.trim());
+    const countryCode = authForm.countryCode.trim();
+    const phoneNumber = authForm.phone.trim();
+    const normalizedPhone = normalizeAuthPhone(countryCode, phoneNumber);
     if (normalizedPhone.length < 8) {
       showToast('Enter a valid phone number first.', 'error');
       return;
@@ -1951,8 +3051,34 @@ export default function App() {
 
     setAuthPendingAction('send-code');
     showToast('Sending verification code...', 'info', 0);
+
+    // Emulators cannot complete Firebase reCAPTCHA/Play Integrity reliably, so
+    // development builds use the backend OTP challenge (code 123456).
+    const preferBackendOtp = typeof __DEV__ !== 'undefined' && __DEV__;
+
     try {
+      if (preferBackendOtp) {
+        await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
+        return;
+      }
+
+      if (!nativeFirebaseReady || !firebaseAuth) {
+        showToast(
+          'Firebase phone auth is not available in this runtime. Open the installed app, not Expo Go.',
+          'error',
+          3600,
+        );
+        return;
+      }
+
+      if (!firebaseConfigReady) {
+        showToast('Firebase mobile auth is not configured yet.', 'error');
+        return;
+      }
+
       phoneAuthConfirmationRef.current = await firebaseAuth.signInWithPhoneNumber(normalizedPhone);
+      phoneAuthProviderRef.current = 'firebase';
+      phoneAuthChallengeIdRef.current = '';
       setAuthForm((current) => ({
         ...current,
         otp: '',
@@ -1961,18 +3087,121 @@ export default function App() {
       setAuthMode('otp');
       showToast('Code sent. Enter the OTP to continue.', 'success');
     } catch (error) {
-      showToast('Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.', 'error', 3600);
+      const firebaseCode = error?.code ?? '';
+      const firebaseMessage = error?.message ?? '';
+      console.warn('Phone auth send failed', firebaseCode, firebaseMessage, normalizedPhone);
+
+      if (!preferBackendOtp) {
+        try {
+          await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
+          return;
+        } catch (backendError) {
+          console.warn('Backend OTP fallback failed', backendError);
+        }
+      }
+
+      const friendlyMessage =
+        firebaseCode === 'auth/invalid-phone-number'
+          ? `That phone number looks invalid (${normalizedPhone}). Check the country code and drop any leading 0.`
+          : firebaseCode === 'auth/too-many-requests'
+            ? 'Too many SMS attempts. Wait a bit, or use a Firebase test phone number on the emulator.'
+            : firebaseCode === 'auth/missing-client-identifier' || firebaseCode === 'auth/app-not-authorized'
+              ? 'Firebase rejected this Android app. Add the debug SHA-1/SHA-256 in the Firebase console.'
+              : firebaseCode === 'auth/quota-exceeded'
+                ? 'Firebase SMS quota exceeded for this project.'
+                : firebaseMessage || error?.message
+                  ? `Unable to send OTP: ${firebaseMessage || error.message}`
+                  : 'Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.';
+      showToast(friendlyMessage, 'error', 4800);
     } finally {
       setAuthPendingAction('');
     }
   };
 
-  const verifyPhoneOtp = async () => {
-    if (isAuthBusy) {
+  const applyVerifiedPhoneSession = async (payload, verifiedPhone) => {
+    if (payload.pinResetRequired) {
+      forgotPinFlowRef.current = false;
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+        pin: '',
+      }));
+      setAuthMode('reset-pin');
+      showToast('OTP verified. Choose a new PIN.', 'success');
       return;
     }
-    if (!phoneAuthConfirmationRef.current) {
-      showToast('Start phone verification first.', 'error');
+
+    if (payload.pinLoginRequired) {
+      forgotPinFlowRef.current = false;
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+        pin: '',
+      }));
+      setAuthMode('pin');
+      showToast('Enter your PIN to sign in.', 'success');
+      return;
+    }
+
+    if (payload.registrationRequired) {
+      forgotPinFlowRef.current = false;
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+      }));
+      setAuthMode('profile');
+      showToast('Phone verified. Complete your profile to continue.', 'success');
+      return;
+    }
+
+    if (payload.session?.deviceId) {
+      await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
+      setCurrentDeviceId(payload.session.deviceId);
+    }
+
+    let bootstrapPayload = payload.bootstrap ?? null;
+    if (bootstrapPayload?.currentUserId) {
+      applyBootstrapPayload(bootstrapPayload);
+    } else {
+      bootstrapPayload = await hydrateBootstrapFromDevice(payload.session?.deviceId ?? currentDeviceId);
+    }
+
+    if (!bootstrapPayload?.currentUserId) {
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+      }));
+      setAuthMode('profile');
+      showToast('Phone verified. We could not restore the session yet, so continue registration.', 'success', 3600);
+      return;
+    }
+
+    if (payload.pinSetupRequired) {
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+        pin: '',
+      }));
+      setAuthMode('reset-pin');
+      showToast('Create a PIN to finish signing in.', 'success');
+      return;
+    }
+
+    forgotPinFlowRef.current = false;
+    setAuthVisible(false);
+    setAuthRequired(false);
+    resetAuthForm();
+    showToast('Welcome back. Signing you in...', 'success');
+  };
+
+  const startForgotPinAuth = async () => {
+    forgotPinFlowRef.current = true;
+    setAuthForm((current) => ({ ...current, otp: '', pin: '' }));
+    await startPhoneAuth();
+  };
+
+  const verifyPhoneOtp = async () => {
+    if (isAuthBusy) {
       return;
     }
 
@@ -1981,31 +3210,74 @@ export default function App() {
       return;
     }
 
-    setAuthPendingAction('verify-otp');
-    showToast('Verifying your code...', 'info', 0);
-    let credential = null;
-    try {
-      credential = await phoneAuthConfirmationRef.current.confirm(authForm.otp.trim());
-    } catch (error) {
-      showToast('The OTP is invalid or expired.', 'error');
-      setAuthPendingAction('');
+    const usingBackend = phoneAuthProviderRef.current === 'backend' || Boolean(phoneAuthChallengeIdRef.current);
+    if (!usingBackend && !phoneAuthConfirmationRef.current) {
+      showToast('Start phone verification first.', 'error');
+      return;
+    }
+    if (usingBackend && !phoneAuthChallengeIdRef.current) {
+      showToast('Verification expired. Tap Resend to get a new code.', 'error', 3600);
       return;
     }
 
-    const verifiedPhone = credential?.user?.phoneNumber ?? authForm.verifiedPhone;
-    const idToken = await credential?.user?.getIdToken(true);
-    if (!idToken || !verifiedPhone) {
-      showToast('Firebase verification succeeded, but the secure token could not be read.', 'error', 3600);
-      setAuthPendingAction('');
-      return;
-    }
-    phoneAuthIdTokenRef.current = idToken;
+    setAuthPendingAction('verify-otp');
+    showToast('Verifying your code...', 'info', 0);
+
     try {
+      if (usingBackend) {
+        const response = await fetch(`${API_BASE_URL}/api/auth/phone/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...authDevicePayload(),
+            challengeId: phoneAuthChallengeIdRef.current,
+            code: authForm.otp.trim(),
+            forcePinReset: forgotPinFlowRef.current || undefined,
+            platform: Platform.OS,
+            label: `${Platform.OS} device`,
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          showToast(getBackendErrorMessage(payload, 'The OTP is invalid or expired.'), 'error');
+          return;
+        }
+
+        if (payload.challengeId) {
+          phoneAuthChallengeIdRef.current = payload.challengeId;
+        }
+        const verifiedPhone = payload.phone || authForm.verifiedPhone;
+        await applyVerifiedPhoneSession(payload, verifiedPhone);
+        return;
+      }
+
+      let credential = null;
+      try {
+        credential = await phoneAuthConfirmationRef.current.confirm(authForm.otp.trim());
+      } catch (error) {
+        const firebaseCode = error?.code ?? '';
+        showToast(
+          firebaseCode === 'auth/invalid-verification-code'
+            ? 'Firebase rejected that code. Check the test number/code in Firebase and try again.'
+            : 'The OTP is invalid or expired.',
+          'error',
+        );
+        return;
+      }
+
+      const verifiedPhone = credential?.user?.phoneNumber ?? authForm.verifiedPhone;
+      const idToken = await credential?.user?.getIdToken(true);
+      if (!idToken || !verifiedPhone) {
+        showToast('Firebase verification succeeded, but the secure token could not be read.', 'error', 3600);
+        return;
+      }
+      phoneAuthIdTokenRef.current = idToken;
+
       const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          deviceId: currentDeviceId,
+          ...authDevicePayload(),
           idToken,
           phone: verifiedPhone,
           platform: Platform.OS,
@@ -2014,50 +3286,15 @@ export default function App() {
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showToast(payload.error ?? 'Unable to verify this phone on the server.', 'error', 3600);
+        showToast(getBackendErrorMessage(payload, 'Unable to verify this phone on the server.'), 'error', 4200);
         return;
       }
 
-      if (payload.registrationRequired) {
-        setAuthForm((current) => ({
-          ...current,
-          verifiedPhone,
-        }));
-        setAuthMode('profile');
-        showToast('Phone verified. Complete your profile to continue.', 'success');
-        return;
-      }
-
-      if (payload.session?.deviceId) {
-        await AsyncStorage.setItem(DEVICE_STORAGE_KEY, payload.session.deviceId);
-        setCurrentDeviceId(payload.session.deviceId);
-      }
-
-      let bootstrapPayload = payload.bootstrap ?? null;
-      if (bootstrapPayload?.currentUserId) {
-        applyBootstrapPayload(bootstrapPayload);
-      } else {
-        bootstrapPayload = await hydrateBootstrapFromDevice(payload.session?.deviceId ?? currentDeviceId);
-      }
-
-      if (!bootstrapPayload?.currentUserId) {
-        setAuthForm((current) => ({
-          ...current,
-          verifiedPhone,
-        }));
-        setAuthMode('profile');
-        showToast('Phone verified. We could not restore the session yet, so continue registration.', 'success', 3600);
-        return;
-      }
-
-      setAuthVisible(false);
-      setAuthRequired(false);
-      resetAuthForm();
-      showToast('Welcome back. Signing you in...', 'success');
+      await applyVerifiedPhoneSession(payload, verifiedPhone);
     } catch {
       setAuthForm((current) => ({
         ...current,
-        verifiedPhone,
+        verifiedPhone: authForm.verifiedPhone,
       }));
       setAuthMode('profile');
       showToast('Phone verified. Network sync is slow, so continue registration.', 'success', 3600);
@@ -2083,8 +3320,14 @@ export default function App() {
       return;
     }
 
-    if (!phoneAuthIdTokenRef.current) {
+    const usingBackend = phoneAuthProviderRef.current === 'backend' || Boolean(phoneAuthChallengeIdRef.current);
+    if (!usingBackend && !phoneAuthIdTokenRef.current) {
       showToast('The secure Firebase token is missing. Verify your OTP again.', 'error', 3600);
+      return;
+    }
+    if (usingBackend && !phoneAuthChallengeIdRef.current) {
+      showToast('Phone verification expired. Send a new code and try again.', 'error', 3600);
+      setAuthMode('phone');
       return;
     }
 
@@ -2094,26 +3337,48 @@ export default function App() {
       return;
     }
 
+    if (!isValidAuthPin(authForm.pin)) {
+      showToast('Create a 4–6 digit PIN to continue.', 'error');
+      setAuthMode('profile');
+      return;
+    }
+
     setAuthPendingAction('register');
     showToast('Creating your account...', 'info', 0);
     try {
-      const response = await fetch(`${API_BASE_URL}/api/auth/phone/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: currentDeviceId,
-          idToken: phoneAuthIdTokenRef.current,
-          phone: authForm.verifiedPhone,
-          countryCode: authForm.countryCode.trim(),
-          name: authForm.name.trim(),
-          pin: authForm.pin.trim() || undefined,
-          platform: Platform.OS,
-          label: `${Platform.OS} device`,
-        }),
-      });
+      const response = await fetch(
+        usingBackend ? `${API_BASE_URL}/api/auth/phone/complete` : `${API_BASE_URL}/api/auth/phone/register`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            usingBackend
+              ? {
+                  ...authDevicePayload(),
+                  challengeId: phoneAuthChallengeIdRef.current,
+                  name: authForm.name.trim(),
+                  countryCode: authForm.countryCode.trim(),
+                  phoneNumber: authForm.phone.trim(),
+                  pin: authForm.pin.trim(),
+                  platform: Platform.OS,
+                  label: `${Platform.OS} device`,
+                }
+              : {
+                  ...authDevicePayload(),
+                  idToken: phoneAuthIdTokenRef.current,
+                  phone: authForm.verifiedPhone,
+                  countryCode: authForm.countryCode.trim(),
+                  name: authForm.name.trim(),
+                  pin: authForm.pin.trim(),
+                  platform: Platform.OS,
+                  label: `${Platform.OS} device`,
+                },
+          ),
+        },
+      );
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
-        showToast(payload.error ?? 'Unable to finish registration right now.', 'error', 3600);
+        showToast(getBackendErrorMessage(payload, 'Unable to finish registration right now.'), 'error', 4200);
         return;
       }
 
@@ -2163,6 +3428,10 @@ export default function App() {
         }),
       }).catch(() => undefined);
 
+      if (isValidAuthPin(authForm.pin)) {
+        setAppLockPin(authForm.pin.trim());
+        await AsyncStorage.setItem(APP_LOCK_PIN_KEY, authForm.pin.trim()).catch(() => undefined);
+      }
       const registeredName = authForm.name.trim().split(/\s+/)[0] || 'there';
       setEntryCelebrationName(registeredName);
       setEntryCelebrationVisible(true);
@@ -2173,6 +3442,9 @@ export default function App() {
       resetAuthForm();
       phoneAuthConfirmationRef.current = null;
       phoneAuthIdTokenRef.current = '';
+      phoneAuthChallengeIdRef.current = '';
+      phoneAuthProviderRef.current = '';
+      forgotPinFlowRef.current = false;
       showToast('Registration complete. Opening your account...', 'success');
     } catch {
       showToast('Registration could not finish right now. Check your network and try again.', 'error', 3600);
@@ -2256,6 +3528,18 @@ export default function App() {
     });
   };
 
+  const stopVoicePlayback = async () => {
+    if (!currentSoundRef.current) {
+      return;
+    }
+
+    const sound = currentSoundRef.current;
+    currentSoundRef.current = null;
+    sound.removePlayBackListener();
+    sound.removePlaybackEndListener();
+    await sound.stopPlayer().catch(() => undefined);
+  };
+
   const playVoiceMessage = async (message) => {
     if (!message.audioUri) {
       Alert.alert('Voice note', 'This is a placeholder voice note preview.');
@@ -2263,13 +3547,17 @@ export default function App() {
     }
 
     try {
-      if (currentSoundRef.current) {
-        await currentSoundRef.current.unloadAsync();
-      }
-
-      const { sound } = await Audio.Sound.createAsync({ uri: message.audioUri });
+      await stopVoicePlayback();
+      const sound = createSound();
       currentSoundRef.current = sound;
-      await sound.playAsync();
+      sound.addPlaybackEndListener(() => {
+        sound.removePlayBackListener();
+        sound.removePlaybackEndListener();
+        if (currentSoundRef.current === sound) {
+          currentSoundRef.current = null;
+        }
+      });
+      await sound.startPlayer(message.audioUri);
     } catch (error) {
       Alert.alert('Voice note', 'Unable to play this recording on the current device.');
     }
@@ -2277,27 +3565,34 @@ export default function App() {
 
   const startVoiceRecording = async () => {
     try {
-      const permission = await Audio.requestPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert('Permission needed', 'Allow microphone access to send voice notes.');
-        return;
+      if (Platform.OS === 'android') {
+        const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          Alert.alert('Permission needed', 'Allow microphone access to send voice notes.');
+          return;
+        }
       }
 
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-      recordingRef.current = recording;
-      recordingStartedAtRef.current = Date.now();
-      setRecordingLabel('Recording 0:00');
-      recordingIntervalRef.current = setInterval(() => {
-        const durationMs = Date.now() - recordingStartedAtRef.current;
+      const recorder = createSound();
+      recorder.setSubscriptionDuration(0.25);
+      recorder.addRecordBackListener((event) => {
+        const durationMs = event.currentPosition ?? 0;
+        recordingDurationRef.current = durationMs;
         setRecordingLabel(`Recording ${getAudioDurationLabel(durationMs)}`);
-      }, 1000);
+      });
+      await recorder.startRecorder(undefined, VOICE_RECORDER_AUDIO_SET);
+      recordingRef.current = recorder;
+      recordingDurationRef.current = 0;
+      setRecordingLabel('Recording 0:00');
       setIsRecording(true);
     } catch (error) {
+      if (recordingRef.current) {
+        recordingRef.current.removeRecordBackListener();
+        recordingRef.current = null;
+      }
+      recordingDurationRef.current = 0;
+      setRecordingLabel('');
+      setIsRecording(false);
       Alert.alert('Recording failed', 'Voice note recording could not start.');
     }
   };
@@ -2308,21 +3603,14 @@ export default function App() {
     }
 
     try {
-      const recording = recordingRef.current;
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      const duration = Date.now() - recordingStartedAtRef.current;
+      const recorder = recordingRef.current;
+      const duration = recordingDurationRef.current;
+      const uri = await recorder.stopRecorder();
+      recorder.removeRecordBackListener();
       recordingRef.current = null;
-      if (recordingIntervalRef.current) {
-        clearInterval(recordingIntervalRef.current);
-        recordingIntervalRef.current = null;
-      }
+      recordingDurationRef.current = 0;
       setIsRecording(false);
       setRecordingLabel('');
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-      });
 
       if (!uri) {
         return;
@@ -2341,8 +3629,8 @@ export default function App() {
         durationLabel: getAudioDurationLabel(duration),
       });
       const uploadedUrls = await uploadUris([uri], {
-        names: [`voice-${Date.now()}.m4a`],
-        fallbackType: inferMimeType(uri, 'audio/m4a'),
+        names: [`voice-${Date.now()}.mp4`],
+        fallbackType: inferMimeType(uri, 'audio/mp4'),
       }).catch(() => []);
       fetch(`${API_BASE_URL}/api/messages`, {
         method: 'POST',
@@ -2358,14 +3646,36 @@ export default function App() {
         }),
       }).catch(() => undefined);
     } catch (error) {
-      if (recordingIntervalRef.current) {
-        clearInterval(recordingIntervalRef.current);
-        recordingIntervalRef.current = null;
+      if (recordingRef.current) {
+        recordingRef.current.removeRecordBackListener();
+        recordingRef.current = null;
       }
+      recordingDurationRef.current = 0;
       setIsRecording(false);
       setRecordingLabel('');
-      recordingRef.current = null;
       Alert.alert('Recording failed', 'Voice note recording could not be completed.');
+    }
+  };
+
+  const ensureCameraPermission = async () => {
+    if (!CameraKit?.checkDeviceCameraAuthorizationStatus || !CameraKit?.requestDeviceCameraAuthorization) {
+      setCameraPermissionGranted(false);
+      return false;
+    }
+
+    try {
+      const granted = await CameraKit.checkDeviceCameraAuthorizationStatus();
+      if (granted) {
+        setCameraPermissionGranted(true);
+        return true;
+      }
+
+      const requested = await CameraKit.requestDeviceCameraAuthorization();
+      setCameraPermissionGranted(Boolean(requested));
+      return Boolean(requested);
+    } catch (error) {
+      setCameraPermissionGranted(false);
+      return false;
     }
   };
 
@@ -2396,6 +3706,21 @@ export default function App() {
 
           {sheetStep === 'type' ? (
             <>
+              <Pressable
+                style={styles.sheetOption}
+                onPress={async () => {
+                  setSheetStep('closed');
+                  const granted = await ensureCameraPermission();
+                  if (!granted || !Camera) {
+                    showToast('Camera permission is needed to take a photo.', 'error');
+                    return;
+                  }
+                  setChatCameraVisible(true);
+                }}
+              >
+                <Text style={styles.sheetOptionTitle}>Camera</Text>
+                <Text style={styles.sheetOptionBody}>Capture a photo in this chat</Text>
+              </Pressable>
               <Pressable style={styles.sheetOption} onPress={() => { setAttachmentType('image'); setSheetStep('source'); }}>
                 <Text style={styles.sheetOptionTitle}>Image</Text>
                 <Text style={styles.sheetOptionBody}>Open gallery or file manager</Text>
@@ -2478,7 +3803,14 @@ export default function App() {
           styles.messageBubble,
           message.mine ? styles.messageMine : styles.messageTheirs,
           emojiOnly ? styles.emojiBubble : null,
+          message.deletedForEveryone ? styles.messageDeletedBubble : null,
         ]}
+        onLongPress={() => {
+          if (!message.deletedForEveryone) {
+            setMessageActionTarget(message);
+          }
+        }}
+        delayLongPress={280}
         onPress={() => {
           if (message.kind === 'image') {
             openImageViewer(message);
@@ -2495,6 +3827,11 @@ export default function App() {
           }
         }}
       >
+        {message.replyPreview ? (
+          <View style={styles.replyQuoteCard}>
+            <Text numberOfLines={2} style={styles.replyQuoteText}>{message.replyPreview}</Text>
+          </View>
+        ) : null}
         {message.kind === 'image' ? (
           <>
             {message.imageUri ? (
@@ -2545,7 +3882,7 @@ export default function App() {
 
         <View style={styles.messageMetaRow}>
           <Text style={styles.messageTime}>{message.time}</Text>
-          {message.mine ? (
+          {message.mine && appSettings.readReceiptsEnabled ? (
             <Text
               style={[
                 styles.receiptBadge,
@@ -2598,17 +3935,33 @@ export default function App() {
         </Pressable>
         <View style={styles.detailHeaderText}>
           <Text style={styles.detailTitle}>{activeChat.name}</Text>
-          <Text style={styles.detailSubtitle}>{activeChat.presence}</Text>
+          <Text style={styles.detailSubtitle}>{getPresenceLabel(activeChat)}</Text>
         </View>
         <View style={styles.detailHeaderActions}>
           <Pressable
             style={styles.iconCircle}
             onPress={() => {
-              setActiveView('Tools');
-              setChatScreen('list');
+              Alert.alert(activeChat.name, 'Chat actions', [
+                {
+                  text: mutedChatIds.includes(activeChat.id) ? 'Unmute' : 'Mute',
+                  onPress: () => toggleMuteChat(activeChat.id),
+                },
+                {
+                  text: archivedChatIds.includes(activeChat.id) ? 'Unarchive' : 'Archive',
+                  onPress: () => {
+                    toggleArchiveChat(activeChat.id);
+                    setChatScreen('list');
+                  },
+                },
+                {
+                  text: favoriteChatIds.includes(activeChat.id) ? 'Unpin' : 'Pin',
+                  onPress: () => toggleFavoriteChat(activeChat.id),
+                },
+                { text: 'Cancel', style: 'cancel' },
+              ]);
             }}
           >
-            <Text style={styles.iconText}>🏬</Text>
+            <Text style={styles.iconText}>⋮</Text>
           </Pressable>
           <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
             <Text style={styles.iconText}>☎</Text>
@@ -2639,13 +3992,39 @@ export default function App() {
         </View>
       ) : null}
 
+      {replyTarget ? (
+        <View style={styles.replyComposerBar}>
+          <View style={styles.replyComposerCopy}>
+            <Text style={styles.replyComposerLabel}>Replying</Text>
+            <Text numberOfLines={1} style={styles.replyComposerText}>{replyTarget.text}</Text>
+          </View>
+          <Pressable onPress={() => setReplyTarget(null)}>
+            <Text style={styles.replyComposerClose}>✕</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
       <View style={styles.composer}>
         <TextInput
           value={messageDraft}
-          onChangeText={setMessageDraft}
+          onChangeText={(value) => {
+            setMessageDraft(value);
+            emitTyping(true);
+            if (typingTimeoutRef.current) {
+              clearTimeout(typingTimeoutRef.current);
+            }
+            typingTimeoutRef.current = setTimeout(() => emitTyping(false), 1200);
+          }}
           placeholder="Message"
           placeholderTextColor="#7d8b92"
-          multiline
+          multiline={!appSettings.enterIsSend}
+          blurOnSubmit={appSettings.enterIsSend}
+          returnKeyType={appSettings.enterIsSend ? 'send' : 'default'}
+          onSubmitEditing={() => {
+            if (appSettings.enterIsSend) {
+              sendMessage();
+            }
+          }}
           textAlignVertical="top"
           style={styles.composerInput}
         />
@@ -2667,6 +4046,23 @@ export default function App() {
           setSelectedChatId(chat.id);
           setChatScreen('detail');
         }}
+        onLongPress={() => {
+          Alert.alert(chat.name, 'Chat actions', [
+            {
+              text: favoriteChatIds.includes(chat.id) ? 'Unpin' : 'Pin',
+              onPress: () => toggleFavoriteChat(chat.id),
+            },
+            {
+              text: mutedChatIds.includes(chat.id) ? 'Unmute' : 'Mute notifications',
+              onPress: () => toggleMuteChat(chat.id),
+            },
+            {
+              text: archivedChatIds.includes(chat.id) ? 'Unarchive' : 'Archive',
+              onPress: () => toggleArchiveChat(chat.id),
+            },
+            { text: 'Cancel', style: 'cancel' },
+          ]);
+        }}
       >
         <View style={[styles.chatHomeAvatar, { backgroundColor: avatarPalette[index % avatarPalette.length] }]}>
           <Text style={styles.chatHomeAvatarText}>{chat.name.slice(0, 1).toUpperCase()}</Text>
@@ -2675,7 +4071,11 @@ export default function App() {
         <View style={styles.chatHomeCopy}>
           <View style={styles.chatHomeTopRow}>
             <View style={styles.chatHomeNameRow}>
+              {favoriteChatIds.includes(chat.id) ? (
+                <Text style={styles.chatHomeFavoriteStar}>★</Text>
+              ) : null}
               <Text numberOfLines={1} style={styles.chatHomeName}>{chat.name}</Text>
+              {mutedChatIds.includes(chat.id) ? <Text style={styles.chatHomeMuteIcon}>🔕</Text> : null}
               {/(store|shop|business|biz|kitchen|board)/i.test(chat.name) ? (
                 <Text style={styles.chatHomeBadge}>BIZ</Text>
               ) : null}
@@ -2683,7 +4083,9 @@ export default function App() {
             <Text style={styles.chatHomeTime}>{chat.time}</Text>
           </View>
           <View style={styles.chatHomeBottomRow}>
-            <Text numberOfLines={1} style={styles.chatHomePreview}>{chat.preview}</Text>
+            <Text numberOfLines={1} style={styles.chatHomePreview}>
+              {peerTypingByChat[chat.id] ? 'typing…' : chat.preview}
+            </Text>
             {chat.unread > 0 ? (
               <View style={styles.chatHomeUnread}>
                 <Text style={styles.chatHomeUnreadText}>{chat.unread}</Text>
@@ -2705,8 +4107,14 @@ export default function App() {
             Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
           </Text>
           <View style={styles.lightHeaderActions}>
-            <Pressable style={styles.lightHeaderAction}>
-              <Text style={styles.lightHeaderActionText}>⌕</Text>
+            <Pressable
+              style={styles.lightHeaderAction}
+              onPress={() => {
+                void syncPhoneContacts(currentUserId);
+                setNewChatVisible(true);
+              }}
+            >
+              <Text style={styles.lightHeaderActionText}>+</Text>
             </Pressable>
             <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
               <Text style={styles.lightHeaderActionText}>⌁</Text>
@@ -2728,21 +4136,61 @@ export default function App() {
           ))}
         </View>
 
-        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
-          <Text style={styles.lightSectionLabel}>RECENT</Text>
-          {recentChats.length ? recentChats.map((chat, index) => renderChatRow(chat, index)) : (
-            <View style={styles.emptyChatCard}>
-              <Text style={styles.cardTitle}>No chats yet</Text>
-              <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
-              <Pressable style={styles.sendButtonWide} onPress={() => setNewChatVisible(true)}>
-                <Text style={styles.sendButtonText}>New conversation</Text>
-              </Pressable>
-            </View>
-          )}
+        <TextInput
+          value={chatSearchQuery}
+          onChangeText={setChatSearchQuery}
+          placeholder="Search chats"
+          placeholderTextColor="#9aa3b2"
+          style={styles.chatSearchInput}
+        />
 
-          {earlierChats.length ? <Text style={styles.lightSectionLabel}>EARLIER TODAY</Text> : null}
-          {earlierChats.map((chat, index) => renderChatRow(chat, index + recentChats.length))}
-        </ScrollView>
+        {archivedChatIds.length ? (
+          <Pressable style={styles.archiveRow} onPress={() => setShowArchivedChats((current) => !current)}>
+            <Text style={styles.archiveIcon}>▦</Text>
+            <Text style={styles.archiveText}>
+              {showArchivedChats ? 'Back to chats' : `Archived (${archivedChatIds.length})`}
+            </Text>
+          </Pressable>
+        ) : null}
+
+        <View style={styles.chatListShell}>
+          <ScrollView
+            style={styles.lightScroll}
+            contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset + 72 }]}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.lightSectionLabel}>{showArchivedChats ? 'ARCHIVED' : 'RECENT'}</Text>
+            {recentChats.length ? recentChats.map((chat, index) => renderChatRow(chat, index)) : (
+              <View style={styles.emptyChatCard}>
+                <Text style={styles.cardTitle}>No chats yet</Text>
+                <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
+                <Pressable
+                  style={styles.sendButtonWide}
+                  onPress={() => {
+                    void syncPhoneContacts(currentUserId);
+                    setNewChatVisible(true);
+                  }}
+                >
+                  <Text style={styles.sendButtonText}>New conversation</Text>
+                </Pressable>
+              </View>
+            )}
+
+            {earlierChats.length ? <Text style={styles.lightSectionLabel}>EARLIER TODAY</Text> : null}
+            {earlierChats.map((chat, index) => renderChatRow(chat, index + recentChats.length))}
+          </ScrollView>
+
+          <Pressable
+            style={[styles.chatFab, { bottom: lightContentBottomInset + 12 }]}
+            onPress={() => {
+              void syncPhoneContacts(currentUserId);
+              setNewChatQuery('');
+              setNewChatVisible(true);
+            }}
+          >
+            <Text style={styles.chatFabText}>+</Text>
+          </Pressable>
+        </View>
       </View>
     );
   };
@@ -2771,19 +4219,30 @@ export default function App() {
         </Pressable>
       </View>
 
-      <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.lightScroll}
+        contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}
+        showsVerticalScrollIndicator={false}
+      >
         <View style={styles.payHeroCard}>
           <Text style={styles.payHeroLabel}>Wallet balance</Text>
           <Text style={styles.payHeroAmount}>GHC 1,240.50</Text>
           <Text style={styles.payHeroMeta}>MTN MoMo •••• 8821 · Synced now</Text>
           <View style={styles.payHeroActions}>
             {[
-              { label: 'Send', icon: '↗' },
-              { label: 'Request', icon: '+' },
-              { label: 'Top up', icon: '▭' },
-              { label: 'History', icon: '◔' },
+              { label: 'Send', icon: '↗', action: 'send' },
+              { label: 'Request', icon: '+', action: 'request' },
+              { label: 'Top up', icon: '▭', action: 'topup' },
+              { label: 'History', icon: '◔', action: 'history' },
             ].map((action) => (
-              <Pressable key={action.label} style={styles.payHeroAction}>
+              <Pressable
+                key={action.label}
+                style={styles.payHeroAction}
+                onPress={() => {
+                  setPayForm({ amount: '', phone: '', note: '' });
+                  setPaySheet(action.action);
+                }}
+              >
                 <View style={styles.payHeroActionIcon}>
                   <Text style={styles.payHeroActionIconText}>{action.icon}</Text>
                 </View>
@@ -2796,14 +4255,27 @@ export default function App() {
         <Text style={styles.lightSectionTitle}>Quick send</Text>
         <View style={styles.quickSendRow}>
           {payQuickContacts.slice(0, 4).map((contact, index) => (
-            <Pressable key={contact.id} style={styles.quickSendItem}>
+            <Pressable
+              key={contact.id}
+              style={styles.quickSendItem}
+              onPress={() => {
+                setPayForm({ amount: '', phone: contact.phone || '', note: '' });
+                setPaySheet('send');
+              }}
+            >
               <View style={[styles.quickSendAvatar, { backgroundColor: ['#dff3ec', '#f8eedb', '#dbe7f4', '#f0dff0'][index % 4] }]}>
                 <Text style={styles.quickSendAvatarText}>{contact.name.slice(0, 1).toUpperCase()}</Text>
               </View>
               <Text numberOfLines={1} style={styles.quickSendName}>{contact.name.split(' ')[0]}</Text>
             </Pressable>
           ))}
-          <Pressable style={styles.quickSendItem}>
+          <Pressable
+            style={styles.quickSendItem}
+            onPress={() => {
+              setPayForm({ amount: '', phone: '', note: '' });
+              setPaySheet('send');
+            }}
+          >
             <View style={[styles.quickSendAvatar, styles.quickSendAvatarAdd]}>
               <Text style={styles.quickSendAvatarAddText}>+</Text>
             </View>
@@ -2813,8 +4285,8 @@ export default function App() {
 
         <Text style={styles.lightSectionTitle}>Recent transactions</Text>
         <View style={styles.payTransactionList}>
-          {payTransactions.map((transaction, index) => (
-            <View key={transaction.id} style={[styles.payTransactionRow, index === payTransactions.length - 1 ? styles.payTransactionRowLast : null]}>
+          {[...payHistoryItems, ...payTransactions].map((transaction, index, list) => (
+            <View key={transaction.id} style={[styles.payTransactionRow, index === list.length - 1 ? styles.payTransactionRowLast : null]}>
               <View style={[styles.payTransactionAvatar, { backgroundColor: ['#dff3ec', '#dbe7f4', '#e9efe1'][index % 3] }]}>
                 <Text style={styles.payTransactionAvatarText}>{transaction.title.slice(0, 1).toUpperCase()}</Text>
               </View>
@@ -2848,7 +4320,11 @@ export default function App() {
           </Pressable>
         </View>
 
-        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+        <ScrollView
+          style={styles.lightScroll}
+          contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}
+          showsVerticalScrollIndicator={false}
+        >
           <Pressable style={styles.statusComposerCard} onPress={() => setStatusComposerVisible(true)}>
             <View style={styles.statusComposerRing}>
               <Text style={styles.statusComposerPlus}>+</Text>
@@ -2924,7 +4400,11 @@ export default function App() {
           </Pressable>
         </View>
 
-        <ScrollView style={styles.lightScroll} contentContainerStyle={styles.lightScrollContent} showsVerticalScrollIndicator={false}>
+        <ScrollView
+          style={styles.lightScroll}
+          contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}
+          showsVerticalScrollIndicator={false}
+        >
           <View style={styles.businessAlertCard}>
             <Text style={styles.businessAlertText}>Low stock alert: Ankara dress (2 left)</Text>
           </View>
@@ -2949,22 +4429,28 @@ export default function App() {
           </View>
 
           <View style={styles.businessGrid}>
-            <Pressable style={styles.businessGridCard} onPress={() => setActiveView('Settings')}>
+            <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('catalog')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▤</Text></View>
               <Text style={styles.businessGridTitle}>My catalog</Text>
               <Text style={styles.businessGridMeta}>{catalogCount} products live</Text>
             </Pressable>
-            <Pressable style={styles.businessGridCard} onPress={() => setNewChatVisible(true)}>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void syncPhoneContacts(currentUserId);
+                setBusinessPanel('customers');
+              }}
+            >
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◌</Text></View>
               <Text style={styles.businessGridTitle}>Customers</Text>
               <Text style={styles.businessGridMeta}>{customerCount} total</Text>
             </Pressable>
-            <Pressable style={styles.businessGridCard} onPress={() => setActiveView('Pay')}>
+            <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('receipts')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>□</Text></View>
               <Text style={styles.businessGridTitle}>Receipts</Text>
               <Text style={styles.businessGridMeta}>Auto-generated</Text>
             </Pressable>
-            <Pressable style={styles.businessGridCard} onPress={() => setStatusComposerVisible(true)}>
+            <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('broadcast')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◍</Text></View>
               <Text style={styles.businessGridTitle}>Broadcast</Text>
               <Text style={styles.businessGridMeta}>Send to all customers</Text>
@@ -2975,46 +4461,405 @@ export default function App() {
     );
   };
 
+  const renderSettingsToggle = (label, value, onValueChange, helper) => (
+    <View style={styles.settingsToggleRow}>
+      <View style={styles.settingsToggleCopy}>
+        <Text style={styles.settingsToggleLabel}>{label}</Text>
+        {helper ? <Text style={styles.settingsToggleHelper}>{helper}</Text> : null}
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onValueChange}
+        trackColor={{ false: '#3a4650', true: '#2f8f7b' }}
+        thumbColor={value ? '#dff7f1' : '#d0d7dc'}
+      />
+    </View>
+  );
+
+  const renderPrivacyChoice = (label, key) => (
+    <View style={styles.settingsChoiceBlock}>
+      <Text style={styles.settingsToggleLabel}>{label}</Text>
+      <View style={styles.settingsChoiceRow}>
+        {['everyone', 'contacts', 'nobody'].map((option) => (
+          <Pressable
+            key={`${key}-${option}`}
+            style={[
+              styles.settingsChoiceChip,
+              appSettings[key] === option ? styles.settingsChoiceChipActive : null,
+            ]}
+            onPress={() => updateAppSetting(key, option, { syncProfile: true })}
+          >
+            <Text
+              style={[
+                styles.settingsChoiceChipText,
+                appSettings[key] === option ? styles.settingsChoiceChipTextActive : null,
+              ]}
+            >
+              {option === 'everyone' ? 'Everyone' : option === 'contacts' ? 'My contacts' : 'Nobody'}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+
+  const renderSettingsPanelBody = () => {
+    if (settingsPanel === 'favorites') {
+      return (
+        <ScrollView style={styles.settingsPanelScroll}>
+          <Text style={styles.cardBody}>Favorite chats stay pinned at the top of Chats, like WhatsApp.</Text>
+          {chatItems.length ? (
+            chatItems.map((chat) => {
+              const isFavorite = favoriteChatIds.includes(chat.id);
+              return (
+                <Pressable key={chat.id} style={styles.settingsListRow} onPress={() => toggleFavoriteChat(chat.id)}>
+                  <View style={styles.settingsListCopy}>
+                    <Text style={styles.settingsListTitle}>{chat.name}</Text>
+                    <Text style={styles.settingsListSubtitle}>{chat.preview || 'No messages yet'}</Text>
+                  </View>
+                  <Text style={styles.settingsListChevron}>{isFavorite ? '★' : '☆'}</Text>
+                </Pressable>
+              );
+            })
+          ) : (
+            <Text style={styles.cardBody}>No chats yet. Start a conversation first.</Text>
+          )}
+        </ScrollView>
+      );
+    }
+
+    if (settingsPanel === 'business') {
+      return (
+        <View style={styles.settingsPanelBody}>
+          <Text style={styles.cardBody}>Jump into business tools without leaving Settings.</Text>
+          {[
+            { label: 'Open Business mode', action: () => { setSettingsPanel(''); setActiveView('Business'); } },
+            { label: 'My catalog', action: () => { setSettingsPanel(''); setActiveView('Business'); setBusinessPanel('catalog'); } },
+            { label: 'Broadcast list', action: () => { setSettingsPanel(''); setActiveView('Business'); setBusinessPanel('broadcast'); } },
+            { label: 'Customers', action: () => { setSettingsPanel(''); setActiveView('Business'); setBusinessPanel('customers'); } },
+          ].map((item) => (
+            <Pressable key={item.label} style={styles.settingsListRow} onPress={item.action}>
+              <Text style={styles.settingsListTitle}>{item.label}</Text>
+              <Text style={styles.settingsListChevron}>›</Text>
+            </Pressable>
+          ))}
+        </View>
+      );
+    }
+
+    if (settingsPanel === 'history') {
+      return (
+        <View style={styles.settingsPanelBody}>
+          <Text style={styles.cardBody}>
+            {Object.values(messagesByChat).reduce((count, list) => count + (list?.length ?? 0), 0)} messages stored on this device.
+          </Text>
+          <Pressable
+            style={styles.settingsListRow}
+            onPress={() => {
+              showToast(`Export ready: ${chatItems.length} chats on this device.`, 'success', 2800);
+            }}
+          >
+            <View style={styles.settingsListCopy}>
+              <Text style={styles.settingsListTitle}>Export chat</Text>
+              <Text style={styles.settingsListSubtitle}>Prepare a local summary of your conversations</Text>
+            </View>
+            <Text style={styles.settingsListChevron}>›</Text>
+          </Pressable>
+          <Pressable style={styles.settingsListRow} onPress={clearChatHistory}>
+            <View style={styles.settingsListCopy}>
+              <Text style={[styles.settingsListTitle, styles.settingsDangerText]}>Clear all chats</Text>
+              <Text style={styles.settingsListSubtitle}>Deletes local history on this phone</Text>
+            </View>
+            <Text style={styles.settingsListChevron}>›</Text>
+          </Pressable>
+        </View>
+      );
+    }
+
+    if (settingsPanel === 'account') {
+      return (
+        <ScrollView style={styles.settingsPanelScroll}>
+          <Text style={styles.settingsSectionCaption}>Profile</Text>
+          <TextInput
+            value={profile.name}
+            onChangeText={(value) => setProfile((current) => ({ ...current, name: value }))}
+            placeholder="Name"
+            placeholderTextColor="#7d8b92"
+            style={styles.input}
+          />
+          <TextInput
+            value={profile.about}
+            onChangeText={(value) => setProfile((current) => ({ ...current, about: value }))}
+            placeholder="About"
+            placeholderTextColor="#7d8b92"
+            style={styles.input}
+          />
+          <TextInput
+            value={profile.phone}
+            editable={false}
+            placeholder="Phone number"
+            placeholderTextColor="#7d8b92"
+            style={[styles.input, styles.inputReadonly]}
+          />
+          <Text style={styles.settingsSectionCaption}>Security</Text>
+          {renderSettingsToggle(
+            'App lock',
+            appSettings.appLockEnabled,
+            (value) => updateAppSetting('appLockEnabled', value, { syncProfile: true }),
+            'Require PIN when opening ZynkUp',
+          )}
+          <TextInput
+            value={accountPinDraft}
+            onChangeText={setAccountPinDraft}
+            placeholder="Set 4–6 digit PIN"
+            placeholderTextColor="#7d8b92"
+            keyboardType="number-pad"
+            maxLength={4}
+            secureTextEntry
+            style={styles.input}
+          />
+          <Pressable
+            style={styles.sendButtonWide}
+            onPress={() => {
+              if (appSettings.appLockEnabled && !/^\d{4,6}$/.test(accountPinDraft.trim()) && !appLockPin) {
+                showToast('Enter a 4–6 digit PIN to enable app lock.', 'error');
+                return;
+              }
+              void saveProfileToServer(
+                {},
+                {},
+                { pin: accountPinDraft.trim().length === 4 ? accountPinDraft.trim() : undefined },
+              );
+              setAccountPinDraft('');
+            }}
+          >
+            <Text style={styles.sendButtonText}>Save account</Text>
+          </Pressable>
+          <Pressable
+            style={styles.settingsListRow}
+            onPress={() => {
+              Alert.alert(
+                'Delete account?',
+                'Account deletion will be available once server purge is enabled. Contact support for now.',
+                [{ text: 'OK' }],
+              );
+            }}
+          >
+            <Text style={[styles.settingsListTitle, styles.settingsDangerText]}>Delete my account</Text>
+            <Text style={styles.settingsListChevron}>›</Text>
+          </Pressable>
+        </ScrollView>
+      );
+    }
+
+    if (settingsPanel === 'privacy') {
+      return (
+        <ScrollView style={styles.settingsPanelScroll}>
+          {renderPrivacyChoice('Last seen & online', 'lastSeenPrivacy')}
+          {renderPrivacyChoice('Profile photo', 'profilePhotoPrivacy')}
+          {renderPrivacyChoice('About', 'aboutPrivacy')}
+          <View style={styles.settingsChoiceBlock}>
+            <Text style={styles.settingsToggleLabel}>Status</Text>
+            <View style={styles.settingsChoiceRow}>
+              {['contacts', 'close-friends', 'nobody'].map((option) => (
+                <Pressable
+                  key={`status-${option}`}
+                  style={[
+                    styles.settingsChoiceChip,
+                    appSettings.statusPrivacy === option ? styles.settingsChoiceChipActive : null,
+                  ]}
+                  onPress={() => updateAppSetting('statusPrivacy', option, { syncProfile: true })}
+                >
+                  <Text
+                    style={[
+                      styles.settingsChoiceChipText,
+                      appSettings.statusPrivacy === option ? styles.settingsChoiceChipTextActive : null,
+                    ]}
+                  >
+                    {option === 'contacts' ? 'My contacts' : option === 'close-friends' ? 'Close friends' : 'Nobody'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+          {renderSettingsToggle(
+            'Read receipts',
+            appSettings.readReceiptsEnabled,
+            (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
+            'If off, you won\'t send or see blue ticks in real time',
+          )}
+        </ScrollView>
+      );
+    }
+
+    if (settingsPanel === 'chats') {
+      return (
+        <View style={styles.settingsPanelBody}>
+          {renderSettingsToggle(
+            'Enter is send',
+            appSettings.enterIsSend,
+            (value) => updateAppSetting('enterIsSend', value),
+            'Enter key sends your message instead of a new line',
+          )}
+          {renderSettingsToggle(
+            'Media auto-download',
+            appSettings.mediaAutoDownload,
+            (value) => updateAppSetting('mediaAutoDownload', value),
+            'Automatically fetch photos and videos in chats',
+          )}
+          {renderSettingsToggle(
+            'Save to camera roll',
+            appSettings.saveToCameraRoll,
+            (value) => updateAppSetting('saveToCameraRoll', value),
+            'Keep received media on this device',
+          )}
+        </View>
+      );
+    }
+
+    if (settingsPanel === 'notifications') {
+      return (
+        <View style={styles.settingsPanelBody}>
+          {renderSettingsToggle(
+            'Message notifications',
+            appSettings.messageNotifications,
+            (value) => updateAppSetting('messageNotifications', value),
+            'Show alerts for new messages',
+          )}
+          {renderSettingsToggle(
+            'Show preview',
+            appSettings.showNotificationPreview,
+            (value) => updateAppSetting('showNotificationPreview', value),
+            'Include message text in notifications',
+          )}
+          {renderSettingsToggle(
+            'Conversation tones',
+            appSettings.conversationTones,
+            (value) => updateAppSetting('conversationTones', value),
+            'Play a sound when chats update',
+          )}
+        </View>
+      );
+    }
+
+    if (settingsPanel === 'storage') {
+      const messageCount = Object.values(messagesByChat).reduce((count, list) => count + (list?.length ?? 0), 0);
+      return (
+        <View style={styles.settingsPanelBody}>
+          <Text style={styles.cardBody}>
+            {messageCount} messages · {catalogItems.length} catalog items · {favoriteChatIds.length} favorites
+          </Text>
+          {renderSettingsToggle(
+            'Low data mode',
+            appSettings.lowDataMode,
+            (value) => updateAppSetting('lowDataMode', value),
+            'Reduce media auto-download on cellular',
+          )}
+          <Pressable style={styles.settingsListRow} onPress={clearLocalMediaCache}>
+            <View style={styles.settingsListCopy}>
+              <Text style={styles.settingsListTitle}>Clear cache</Text>
+              <Text style={styles.settingsListSubtitle}>Remove temporary media selections</Text>
+            </View>
+            <Text style={styles.settingsListChevron}>›</Text>
+          </Pressable>
+        </View>
+      );
+    }
+
+    if (settingsPanel === 'help') {
+      return (
+        <ScrollView style={styles.settingsPanelScroll}>
+          <Text style={styles.cardBody}>Need help? Send feedback and we will improve ZynkUp with you.</Text>
+          {[
+            'How do I link a desktop device?',
+            'How do payments work?',
+            'How do I create a catalog?',
+          ].map((faq) => (
+            <Pressable
+              key={faq}
+              style={styles.settingsListRow}
+              onPress={() => showToast(faq, 'info', 2800)}
+            >
+              <Text style={styles.settingsListTitle}>{faq}</Text>
+              <Text style={styles.settingsListChevron}>›</Text>
+            </Pressable>
+          ))}
+          <TextInput
+            value={feedbackDraft}
+            onChangeText={setFeedbackDraft}
+            placeholder="Tell us what to improve..."
+            placeholderTextColor="#7d8b92"
+            multiline
+            style={styles.textArea}
+          />
+          <Pressable
+            style={styles.sendButtonWide}
+            onPress={() => {
+              if (!feedbackDraft.trim()) {
+                showToast('Write feedback first.', 'error');
+                return;
+              }
+              setFeedbackDraft('');
+              showToast('Thanks — feedback sent to the ZynkUp team.', 'success', 3200);
+              setSettingsPanel('');
+            }}
+          >
+            <Text style={styles.sendButtonText}>Send feedback</Text>
+          </Pressable>
+        </ScrollView>
+      );
+    }
+
+    return null;
+  };
+
   const renderSettings = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
       <Text style={styles.secondaryTitle}>Settings</Text>
-      <View style={styles.profileHero}>
-        <Image source={{ uri: profile.photoUri }} style={styles.profileImage} />
-        <Text style={styles.editPhotoText}>Edit photo</Text>
-      </View>
-
-      <TextInput
-        value={profile.about}
-        onChangeText={(value) => setProfile((current) => ({ ...current, about: value }))}
-        placeholder="About"
-        placeholderTextColor="#7d8b92"
-        style={styles.input}
-      />
-      <TextInput
-        value={profile.name}
-        onChangeText={(value) => setProfile((current) => ({ ...current, name: value }))}
-        placeholder="Name"
-        placeholderTextColor="#7d8b92"
-        style={styles.input}
-      />
-      <TextInput
-        value={profile.phone}
-        onChangeText={(value) => setProfile((current) => ({ ...current, phone: value }))}
-        placeholder="Phone number"
-        placeholderTextColor="#7d8b92"
-        style={styles.input}
-      />
+      <Pressable style={styles.profileHero} onPress={() => setSettingsPanel('account')}>
+        {profile.photoUri ? (
+          <Image source={{ uri: profile.photoUri }} style={styles.profileImage} />
+        ) : (
+          <View style={[styles.profileImage, styles.profileImageFallback]}>
+            <Text style={styles.profileImageFallbackText}>
+              {(profile.name || 'ZU').slice(0, 2).toUpperCase()}
+            </Text>
+          </View>
+        )}
+        <Pressable onPress={() => void pickProfilePhoto()}>
+          <Text style={styles.editPhotoText}>Edit photo</Text>
+        </Pressable>
+        <Text style={styles.settingsProfileName}>{profile.name || 'Your name'}</Text>
+        <Text style={styles.settingsProfileMeta}>{profile.about || 'Hey there! I am using ZynkUp.'}</Text>
+        <Text style={styles.settingsProfileMeta}>{profile.phone || 'Add your phone number'}</Text>
+      </Pressable>
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Settings menu</Text>
-        {settingsSections.map((section) => (
-          <Text key={section} style={styles.settingsLine}>{section}</Text>
+        {SETTINGS_MENU.map((section) => (
+          <Pressable
+            key={section.id}
+            style={styles.settingsMenuRow}
+            onPress={() => setSettingsPanel(section.id)}
+          >
+            <View style={styles.settingsMenuIconWrap}>
+              <Text style={styles.settingsMenuIcon}>{section.icon}</Text>
+            </View>
+            <View style={styles.settingsMenuCopy}>
+              <Text style={styles.settingsMenuTitle}>{section.title}</Text>
+              <Text style={styles.settingsMenuSubtitle}>{section.subtitle}</Text>
+            </View>
+            <Text style={styles.settingsListChevron}>›</Text>
+          </Pressable>
         ))}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Linked devices</Text>
         <Pressable
           style={styles.sendButtonWide}
           onPress={async () => {
-            const permission = await requestCameraPermission();
-            if (!permission.granted) {
+            const granted = await ensureCameraPermission();
+            if (!granted) {
               setDeviceLinkMessage('Camera permission is needed to scan a desktop QR code.');
               return;
             }
@@ -3026,10 +4871,6 @@ export default function App() {
           <Text style={styles.sendButtonText}>{deviceLinking ? 'Linking...' : 'Link devices'}</Text>
         </Pressable>
         {deviceLinkMessage ? <Text style={styles.cardMeta}>{deviceLinkMessage}</Text> : null}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Linked devices</Text>
         {linkedDevices.length ? linkedDevices.map((device) => (
           <View key={device.deviceId} style={styles.deviceRow}>
             <View style={styles.deviceRowCopy}>
@@ -3043,46 +4884,26 @@ export default function App() {
         )) : <Text style={styles.cardBody}>No extra linked devices yet.</Text>}
       </View>
 
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Add catalog item</Text>
-        <Pressable style={styles.ghostButton} onPress={() => pickMultipleImages('catalog')}>
-          <Text style={styles.ghostButtonText}>
-            {catalogImageUris.length ? `${catalogImageUris.length} catalog image(s) selected` : 'Add multiple catalog images'}
-          </Text>
-        </Pressable>
-        <TextInput
-          value={catalogForm.title}
-          onChangeText={(value) => setCatalogForm((current) => ({ ...current, title: value }))}
-          placeholder="Product title"
-          placeholderTextColor="#7d8b92"
-          style={styles.input}
-        />
-        <TextInput
-          value={catalogForm.price}
-          onChangeText={(value) => setCatalogForm((current) => ({ ...current, price: value }))}
-          placeholder="Price"
-          placeholderTextColor="#7d8b92"
-          style={styles.input}
-        />
-        <TextInput
-          value={catalogForm.category}
-          onChangeText={(value) => setCatalogForm((current) => ({ ...current, category: value }))}
-          placeholder="Category"
-          placeholderTextColor="#7d8b92"
-          style={styles.input}
-        />
-        <TextInput
-          value={catalogForm.description}
-          onChangeText={(value) => setCatalogForm((current) => ({ ...current, description: value }))}
-          placeholder="Description"
-          placeholderTextColor="#7d8b92"
-          multiline
-          style={styles.textArea}
-        />
-        <Pressable style={styles.sendButtonWide} onPress={addCatalogItem}>
-          <Text style={styles.sendButtonText}>Add to catalog</Text>
-        </Pressable>
-      </View>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(settingsPanel)}
+        onRequestClose={() => setSettingsPanel('')}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>
+                {SETTINGS_MENU.find((item) => item.id === settingsPanel)?.title || 'Settings'}
+              </Text>
+              <Pressable onPress={() => setSettingsPanel('')}>
+                <Text style={styles.storyClose}>Close</Text>
+              </Pressable>
+            </View>
+            {renderSettingsPanelBody()}
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 
@@ -3191,9 +5012,29 @@ export default function App() {
             <Pressable
               style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
               disabled={isAuthBusy}
-              onPress={() => void startPhoneAuth()}
+              onPress={() => void continueWithPhone()}
             >
-              <Text style={styles.authDarkButtonText}>{authPendingAction === 'send-code' ? 'Sending...' : 'Send code'}</Text>
+              <Text style={styles.authDarkButtonText}>
+                {authPendingAction === 'lookup' || authPendingAction === 'send-code' ? 'Please wait...' : 'Continue'}
+              </Text>
+            </Pressable>
+            {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
+          </View>
+        );
+      }
+
+      if (authMode === 'pin') {
+        return (
+          <View style={styles.authStepFooter}>
+            <Pressable
+              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
+              disabled={isAuthBusy}
+              onPress={() => void loginWithPin()}
+            >
+              <Text style={styles.authDarkButtonText}>{authPendingAction === 'pin-login' ? 'Signing in...' : 'Sign in'}</Text>
+            </Pressable>
+            <Pressable disabled={isAuthBusy} onPress={() => void startForgotPinAuth()} style={{ marginTop: 12 }}>
+              <Text style={styles.authResendAccent}>Forgot PIN? Verify with OTP</Text>
             </Pressable>
             {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
           </View>
@@ -3209,6 +5050,21 @@ export default function App() {
               onPress={() => void verifyPhoneOtp()}
             >
               <Text style={styles.authDarkButtonText}>{authPendingAction === 'verify-otp' ? 'Verifying...' : 'Verify code'}</Text>
+            </Pressable>
+            {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
+          </View>
+        );
+      }
+
+      if (authMode === 'reset-pin') {
+        return (
+          <View style={styles.authStepFooter}>
+            <Pressable
+              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
+              disabled={isAuthBusy}
+              onPress={() => void resetPinAfterOtp()}
+            >
+              <Text style={styles.authDarkButtonText}>{authPendingAction === 'reset-pin' ? 'Saving...' : 'Save PIN & continue'}</Text>
             </Pressable>
             {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
           </View>
@@ -3259,8 +5115,8 @@ export default function App() {
             </View>
           </View>
         ) : null}
-        <View style={authContentStyle}>
-          {authMode === 'welcome' ? (
+        {authMode === 'welcome' ? (
+          <View style={authContentStyle}>
             <>
               <View style={styles.authWelcomeTopSpacer} />
               <Text style={styles.authBrandWordmark}>
@@ -3276,204 +5132,267 @@ export default function App() {
                 ))}
               </View>
             </>
-          ) : (
-            <>
-              <View style={styles.authStepHeader}>
-                <Pressable style={styles.authBackButton} onPress={goBackAuthStep}>
-                  <Text style={styles.authBackButtonText}>‹</Text>
-                </Pressable>
-                <View style={styles.authProgressTrack}>
-                  <View style={[styles.authProgressFill, { width: authProgressWidth }]} />
-                </View>
-                <Text style={styles.authProgressLabel}>{authStepNumber} of 4</Text>
-              </View>
-
-              {authMode === 'phone' ? (
+            {authFooter}
+          </View>
+        ) : (
+          <>
+            <ScrollView
+              style={styles.authFlowScroll}
+              contentContainerStyle={[styles.authFlowScrollContent, { paddingBottom: authBottomInset + 110 }]}
+              showsVerticalScrollIndicator={false}
+              bounces={false}
+            >
+              <View style={authContentStyle}>
                 <>
-                  <Text style={styles.authStepEmoji}>📱</Text>
-                  <Text style={styles.authStepTitle}>What's your</Text>
-                  <Text style={styles.authStepAccent}>phone number?</Text>
-                  <Text style={styles.authStepBody}>We'll send you a quick verification code.</Text>
-                  <Text style={styles.authStepBody}>Your number stays private.</Text>
-                  <View style={styles.authPhoneRow}>
-                    <Pressable style={styles.authCountryChip} onPress={() => setCountryPickerVisible(true)}>
-                      <Text style={styles.authCountryChipText}>
-                        {selectedAuthCountry ? `${selectedAuthCountry.code} ${selectedAuthCountry.dialCode}` : 'GH +233'}
-                      </Text>
+                  <View style={styles.authStepHeader}>
+                    <Pressable style={styles.authBackButton} onPress={goBackAuthStep}>
+                      <Text style={styles.authBackButtonText}>‹</Text>
                     </Pressable>
-                    <TextInput
-                      value={authForm.phone}
-                      onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
-                      placeholder="024 812 3456"
-                      placeholderTextColor="#8a8f9d"
-                      keyboardType="phone-pad"
-                      style={styles.authPhoneInput}
-                    />
-                  </View>
-                  <Text style={styles.authStepHint}>Your number is encrypted and never shared with anyone.</Text>
-                </>
-              ) : null}
-
-              {authMode === 'otp' ? (
-                <>
-                  <Text style={styles.authStepEmoji}>🔐</Text>
-                  <Text style={styles.authStepTitle}>Enter the</Text>
-                  <Text style={styles.authStepAccent}>6-digit code</Text>
-                  <Text style={styles.authStepBody}>Sent to {authForm.verifiedPhone || normalizeAuthPhone(authForm.countryCode || '+233', authForm.phone || '')}</Text>
-                  <Text style={styles.authStepBody}>Check your SMS.</Text>
-                  <View style={styles.authOtpRow}>
-                    {authOtpDigits.map((digit, index) => (
-                      <View
-                        key={`otp-${index}`}
-                        style={[styles.authOtpBox, digit ? styles.authOtpBoxFilled : null]}
-                      >
-                        <Text style={[styles.authOtpBoxText, digit ? styles.authOtpBoxTextFilled : null]}>{digit}</Text>
-                      </View>
-                    ))}
-                  </View>
-                  <Text style={styles.authResendText}>Didn't get it? <Text style={styles.authResendAccent}>Resend in 0:45</Text></Text>
-                  <View style={styles.authKeypadGrid}>
-                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map((key) => (
-                      <Pressable
-                        key={`key-${key}`}
-                        style={[styles.authKeypadKey, key === '' ? styles.authKeypadKeyBlank : null]}
-                        onPress={() => {
-                          if (key === '') {
-                            return;
-                          }
-                          if (key === '⌫') {
-                            removeOtpDigit();
-                            return;
-                          }
-                          appendOtpDigit(String(key));
-                        }}
-                      >
-                        <Text style={styles.authKeypadKeyText}>{key}</Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                </>
-              ) : null}
-
-              {authMode === 'profile' ? (
-                <>
-                  <Pressable style={styles.authProfilePhotoWrap} onPress={() => void pickAuthProfilePhoto()}>
-                    {authForm.photoUri ? (
-                      <Image source={{ uri: authForm.photoUri }} style={styles.authProfilePhotoImage} />
-                    ) : (
-                      <View style={styles.authProfilePhotoPlaceholder}>
-                        <Text style={styles.authProfilePhotoEmoji}>😊</Text>
-                        <View style={styles.authProfilePhotoAdd}>
-                          <Text style={styles.authProfilePhotoAddText}>+</Text>
-                        </View>
-                      </View>
-                    )}
-                  </Pressable>
-                  <Text style={styles.authPhotoHelper}>Add a photo or video</Text>
-                  <Text style={styles.authFieldLabel}>YOUR NAME</Text>
-                  <TextInput
-                    value={authForm.name}
-                    onChangeText={(value) =>
-                      setAuthForm((current) => ({
-                        ...current,
-                        name: value,
-                        username: current.username ? current.username : deriveAuthUsername(value),
-                      }))
-                    }
-                    placeholder="Kweku Mensah"
-                    placeholderTextColor="#8a8f9d"
-                    style={styles.authProfileInput}
-                  />
-                  <Text style={styles.authFieldLabel}>YOUR ZYNK ID</Text>
-                  <View style={styles.authUsernameRow}>
-                    <View style={styles.authUsernamePrefix}>
-                      <Text style={styles.authUsernamePrefixText}>@</Text>
+                    <View style={styles.authProgressTrack}>
+                      <View style={[styles.authProgressFill, { width: authProgressWidth }]} />
                     </View>
-                    <TextInput
-                      value={authForm.username}
-                      onChangeText={(value) =>
-                        setAuthForm((current) => ({
-                          ...current,
-                          username: value.replace(/[^a-z0-9.]/gi, '').toLowerCase(),
-                        }))
-                      }
-                      placeholder="kweku.mensah"
-                      placeholderTextColor="#8a8f9d"
-                      autoCapitalize="none"
-                      style={styles.authUsernameInput}
-                    />
+                    <Text style={styles.authProgressLabel}>{authStepNumber} of 4</Text>
                   </View>
-                  <Text style={styles.authUsernameHint}>@{authForm.username || 'your.zynk.id'} is available</Text>
-                  <Text style={styles.authFieldLabel}>LANGUAGE</Text>
-                  <TextInput
-                    value={authForm.language}
-                    onChangeText={(value) => setAuthForm((current) => ({ ...current, language: value }))}
-                    placeholderTextColor="#8a8f9d"
-                    style={styles.authProfileInput}
-                  />
-                  <Text style={styles.authFieldLabel}>CREATE PIN</Text>
-                  <TextInput
-                    value={authForm.pin}
-                    onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 4) }))}
-                    placeholder="4-digit PIN"
-                    placeholderTextColor="#8a8f9d"
-                    keyboardType="number-pad"
-                    secureTextEntry
-                    style={styles.authProfileInput}
-                  />
-                </>
-              ) : null}
+    
+                  {authMode === 'phone' ? (
+                    <>
+                      <Text style={styles.authStepEmoji}>📱</Text>
+                      <Text style={styles.authStepTitle}>What's your</Text>
+                      <Text style={styles.authStepAccent}>phone number?</Text>
+                      <Text style={styles.authStepBody}>Returning users sign in with their PIN.</Text>
+                      <Text style={styles.authStepBody}>New numbers verify once with OTP.</Text>
+                      <View style={styles.authPhoneRow}>
+                        <Pressable style={styles.authCountryChip} onPress={() => setCountryPickerVisible(true)}>
+                          <Text style={styles.authCountryChipText}>
+                            {selectedAuthCountry ? `${selectedAuthCountry.code} ${selectedAuthCountry.dialCode}` : 'GH +233'}
+                          </Text>
+                        </Pressable>
+                        <TextInput
+                          value={authForm.phone}
+                          onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
+                          placeholder="024 398 4046"
+                          placeholderTextColor="#8a8f9d"
+                          keyboardType="phone-pad"
+                          style={styles.authPhoneInput}
+                        />
+                      </View>
+                      <Text style={styles.authStepHint}>Your number is encrypted and never shared with anyone.</Text>
+                    </>
+                  ) : null}
 
-              {authMode === 'account' ? (
-                <>
-                  <Text style={styles.authStepTitle}>How will you use</Text>
-                  <Text style={styles.authStepAccent}>ZynkUp?</Text>
-                  <Text style={[styles.authStepBody, styles.authAccountCopy]}>
-                    Pick one to start - you can always switch later.
-                  </Text>
-                  {[
-                    {
-                      key: 'personal',
-                      title: 'Personal',
-                      body: "Chat with friends and family, send and receive money, see what's happening near you.",
-                    },
-                    {
-                      key: 'business',
-                      title: 'Business',
-                      body: 'Sell products, accept payments, manage customers, track your sales - all in one place.',
-                    },
-                  ].map((option) => {
-                    const selected = authForm.accountType === option.key;
-                    return (
-                      <Pressable
-                        key={option.key}
-                        style={[styles.authAccountCard, selected ? styles.authAccountCardSelected : null]}
-                        onPress={() => {
-                          submitSelectedAccountType(option.key);
-                        }}
-                      >
-                        <View style={styles.authAccountCardTop}>
-                          <Text style={styles.authAccountEmoji}>{option.key === 'business' ? '🛒' : '😊'}</Text>
-                          {selected ? (
-                            <View style={styles.authAccountCheck}>
-                              <Text style={styles.authAccountCheckText}>✓</Text>
-                            </View>
-                          ) : null}
-                        </View>
-                        <Text style={styles.authAccountTitle}>{option.title}</Text>
-                        <Text style={styles.authAccountBody}>{option.body}</Text>
+                  {authMode === 'pin' || authMode === 'reset-pin' ? (
+                    <>
+                      <Text style={styles.authStepEmoji}>🔑</Text>
+                      <Text style={styles.authStepTitle}>{authMode === 'reset-pin' ? 'Choose a' : 'Enter your'}</Text>
+                      <Text style={styles.authStepAccent}>{authMode === 'reset-pin' ? 'new PIN' : 'PIN'}</Text>
+                      <Text style={styles.authStepBody}>
+                        {authMode === 'reset-pin'
+                          ? 'Use 4–6 digits. You will use this PIN next time you sign in.'
+                          : `For ${authForm.verifiedPhone || normalizeAuthPhone(authForm.countryCode || '+233', authForm.phone || '')}`}
+                      </Text>
+                      <View style={styles.authOtpRow}>
+                        {authPinDigits.map((digit, index) => (
+                          <View
+                            key={`pin-${index}`}
+                            style={[styles.authOtpBox, digit ? styles.authOtpBoxFilled : null]}
+                          >
+                            <Text style={[styles.authOtpBoxText, digit ? styles.authOtpBoxTextFilled : null]}>
+                              {digit ? '•' : ''}
+                            </Text>
+                          </View>
+                        ))}
+                      </View>
+                      <View style={styles.authKeypadGrid}>
+                        {[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map((key) => (
+                          <Pressable
+                            key={`pin-key-${key === '' ? 'blank' : key}`}
+                            style={[styles.authKeypadKey, key === '' ? styles.authKeypadKeyBlank : null]}
+                            onPress={() => {
+                              if (key === '') {
+                                return;
+                              }
+                              if (key === '⌫') {
+                                removePinDigit();
+                                return;
+                              }
+                              appendPinDigit(String(key));
+                            }}
+                          >
+                            <Text style={styles.authKeypadKeyText}>{key}</Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    </>
+                  ) : null}
+    
+                  {authMode === 'otp' ? (
+                    <>
+                      <Text style={styles.authStepEmoji}>🔐</Text>
+                      <Text style={styles.authStepTitle}>Enter the</Text>
+                      <Text style={styles.authStepAccent}>6-digit code</Text>
+                      <Text style={styles.authStepBody}>Sent to {authForm.verifiedPhone || normalizeAuthPhone(authForm.countryCode || '+233', authForm.phone || '')}</Text>
+                      <Text style={styles.authStepBody}>
+                        {forgotPinFlowRef.current ? 'Verify to reset your PIN.' : 'Check your SMS.'}
+                      </Text>
+                      <View style={styles.authOtpRow}>
+                        {authOtpDigits.map((digit, index) => (
+                          <View
+                            key={`otp-${index}`}
+                            style={[styles.authOtpBox, digit ? styles.authOtpBoxFilled : null]}
+                          >
+                            <Text style={[styles.authOtpBoxText, digit ? styles.authOtpBoxTextFilled : null]}>{digit}</Text>
+                          </View>
+                        ))}
+                      </View>
+                      <Pressable onPress={() => void startPhoneAuth()}>
+                        <Text style={styles.authResendText}>
+                          Didn't get it? <Text style={styles.authResendAccent}>Resend code</Text>
+                        </Text>
                       </Pressable>
-                    );
-                  })}
-                  <Text style={styles.authAccountFootnote}>ZynkUp is free to use. Business features are always available.</Text>
+                      <View style={styles.authKeypadGrid}>
+                        {[1, 2, 3, 4, 5, 6, 7, 8, 9, '', 0, '⌫'].map((key) => (
+                          <Pressable
+                            key={`key-${key === '' ? 'blank' : key}`}
+                            style={[styles.authKeypadKey, key === '' ? styles.authKeypadKeyBlank : null]}
+                            onPress={() => {
+                              if (key === '') {
+                                return;
+                              }
+                              if (key === '⌫') {
+                                removeOtpDigit();
+                                return;
+                              }
+                              appendOtpDigit(String(key));
+                            }}
+                          >
+                            <Text style={styles.authKeypadKeyText}>{key}</Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    </>
+                  ) : null}
+    
+                  {authMode === 'profile' ? (
+                    <>
+                      <Pressable style={styles.authProfilePhotoWrap} onPress={() => void pickAuthProfilePhoto()}>
+                        {authForm.photoUri ? (
+                          <Image source={{ uri: authForm.photoUri }} style={styles.authProfilePhotoImage} />
+                        ) : (
+                          <View style={styles.authProfilePhotoPlaceholder}>
+                            <Text style={styles.authProfilePhotoEmoji}>😊</Text>
+                            <View style={styles.authProfilePhotoAdd}>
+                              <Text style={styles.authProfilePhotoAddText}>+</Text>
+                            </View>
+                          </View>
+                        )}
+                      </Pressable>
+                      <Text style={styles.authPhotoHelper}>Add a photo or video</Text>
+                      <Text style={styles.authFieldLabel}>YOUR NAME</Text>
+                      <TextInput
+                        value={authForm.name}
+                        onChangeText={(value) =>
+                          setAuthForm((current) => ({
+                            ...current,
+                            name: value,
+                            username: current.username ? current.username : deriveAuthUsername(value),
+                          }))
+                        }
+                        placeholder="Kweku Mensah"
+                        placeholderTextColor="#8a8f9d"
+                        style={styles.authProfileInput}
+                      />
+                      <Text style={styles.authFieldLabel}>YOUR ZYNK ID</Text>
+                      <View style={styles.authUsernameRow}>
+                        <View style={styles.authUsernamePrefix}>
+                          <Text style={styles.authUsernamePrefixText}>@</Text>
+                        </View>
+                        <TextInput
+                          value={authForm.username}
+                          onChangeText={(value) =>
+                            setAuthForm((current) => ({
+                              ...current,
+                              username: value.replace(/[^a-z0-9.]/gi, '').toLowerCase(),
+                            }))
+                          }
+                          placeholder="kweku.mensah"
+                          placeholderTextColor="#8a8f9d"
+                          autoCapitalize="none"
+                          style={styles.authUsernameInput}
+                        />
+                      </View>
+                      <Text style={styles.authUsernameHint}>@{authForm.username || 'your.zynk.id'} is available</Text>
+                      <Text style={styles.authFieldLabel}>LANGUAGE</Text>
+                      <TextInput
+                        value={authForm.language}
+                        onChangeText={(value) => setAuthForm((current) => ({ ...current, language: value }))}
+                        placeholderTextColor="#8a8f9d"
+                        style={styles.authProfileInput}
+                      />
+                      <Text style={styles.authFieldLabel}>CREATE PIN</Text>
+                      <TextInput
+                        value={authForm.pin}
+                        onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/[^\d]/g, '').slice(0, 6) }))}
+                        placeholder="4–6 digit PIN"
+                        placeholderTextColor="#8a8f9d"
+                        keyboardType="number-pad"
+                        secureTextEntry
+                        style={styles.authProfileInput}
+                      />
+                    </>
+                  ) : null}
+    
+                  {authMode === 'account' ? (
+                    <>
+                      <Text style={styles.authStepTitle}>How will you use</Text>
+                      <Text style={styles.authStepAccent}>ZynkUp?</Text>
+                      <Text style={[styles.authStepBody, styles.authAccountCopy]}>
+                        Pick one to start - you can always switch later.
+                      </Text>
+                      {[
+                        {
+                          key: 'personal',
+                          title: 'Personal',
+                          body: "Chat with friends and family, send and receive money, see what's happening near you.",
+                        },
+                        {
+                          key: 'business',
+                          title: 'Business',
+                          body: 'Sell products, accept payments, manage customers, track your sales - all in one place.',
+                        },
+                      ].map((option) => {
+                        const selected = authForm.accountType === option.key;
+                        return (
+                          <Pressable
+                            key={option.key}
+                            style={[styles.authAccountCard, selected ? styles.authAccountCardSelected : null]}
+                            onPress={() => {
+                              submitSelectedAccountType(option.key);
+                            }}
+                          >
+                            <View style={styles.authAccountCardTop}>
+                              <Text style={styles.authAccountEmoji}>{option.key === 'business' ? '🛒' : '😊'}</Text>
+                              {selected ? (
+                                <View style={styles.authAccountCheck}>
+                                  <Text style={styles.authAccountCheckText}>✓</Text>
+                                </View>
+                              ) : null}
+                            </View>
+                            <Text style={styles.authAccountTitle}>{option.title}</Text>
+                            <Text style={styles.authAccountBody}>{option.body}</Text>
+                          </Pressable>
+                        );
+                      })}
+                      <Text style={styles.authAccountFootnote}>ZynkUp is free to use. Business features are always available.</Text>
+                    </>
+                  ) : null}
                 </>
-              ) : null}
-
+              </View>
+            </ScrollView>
+            <View style={[styles.authFooterDock, { paddingBottom: authBottomInset }]}>
               {authFooter}
-            </>
-          )}
-          {authMode === 'welcome' ? authFooter : null}
-        </View>
+            </View>
+          </>
+        )}
       </View>
     );
 
@@ -3497,17 +5416,25 @@ export default function App() {
 
   if (!bootstrapReady) {
     return (
-      <View style={styles.screen}>
-        <StatusBar style="light" />
+      <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+        <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
+        <View style={styles.bootstrapLoader}>
+          <Text style={styles.authBrandWordmark}>
+            Zynk<Text style={styles.authBrandWordmarkAccent}>Up</Text>
+          </Text>
+          <ActivityIndicator color="#ffffff" size="small" style={styles.bootstrapLoaderSpinner} />
+          <Text style={styles.bootstrapLoaderTitle}>Starting your workspace...</Text>
+          <Text style={styles.bootstrapLoaderBody}>Checking session and connecting to the server.</Text>
+        </View>
         {renderToast()}
-      </View>
+      </SafeAreaView>
     );
   }
 
   if (!currentUserId) {
     return (
-      <View style={styles.screen}>
-        <StatusBar style="light" />
+      <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+        <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
         {renderAuthGate()}
         <Modal
           transparent
@@ -3545,23 +5472,23 @@ export default function App() {
           </Pressable>
         </Modal>
         {renderToast()}
-      </View>
+      </SafeAreaView>
     );
   }
 
   if (entryCelebrationVisible) {
     return (
-      <View style={styles.screen}>
-        <StatusBar style="light" />
+      <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+        <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
         {renderEntryCelebration()}
         {renderToast()}
-      </View>
+      </SafeAreaView>
     );
   }
 
   return (
-    <View style={styles.screen}>
-      <StatusBar style="light" />
+    <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+      <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
       {activeView === 'Chats' && chatScreen === 'detail' ? (
         renderChatDetail()
@@ -3574,39 +5501,27 @@ export default function App() {
           {activeView === 'Business' ? renderBusiness() : null}
           {activeView === 'Settings' ? renderSettings() : null}
 
-          <View style={styles.bottomNav}>
+          <View style={[styles.bottomNav, { paddingBottom: navBottomInset + 4 }]}>
             {tabs.map((tab) => (
               <Pressable
                 key={tab}
-                style={tab === 'Compose' ? styles.bottomNavComposeWrap : styles.bottomNavItem}
+                style={styles.bottomNavItem}
                 onPress={() => {
-                  if (tab === 'Compose') {
-                    setStatusComposerVisible(true);
-                    return;
-                  }
                   setActiveView(tab);
                   setChatScreen('list');
                 }}
               >
-                {tab === 'Compose' ? (
-                  <View style={styles.bottomNavComposeButton}>
-                    <Text style={styles.bottomNavComposeText}>+</Text>
-                  </View>
-                ) : (
-                  <>
-                    <View style={styles.bottomNavIconWrap}>
-                      <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
-                        {tab === 'Chats' ? '◫' : tab === 'Status' ? '◉' : tab === 'Pay' ? '▭' : '⌂'}
-                      </Text>
-                      {tabBadges[tab] ? (
-                        <View style={styles.bottomNavBadge}>
-                          <Text style={styles.bottomNavBadgeText}>{tabBadges[tab]}</Text>
-                        </View>
-                      ) : null}
+                <View style={styles.bottomNavIconWrap}>
+                  <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
+                    {tab === 'Chats' ? '◫' : tab === 'Calls' ? '☎' : tab === 'Status' ? '◉' : tab === 'Pay' ? '▭' : '⌂'}
+                  </Text>
+                  {tabBadges[tab] ? (
+                    <View style={styles.bottomNavBadge}>
+                      <Text style={styles.bottomNavBadgeText}>{tabBadges[tab]}</Text>
                     </View>
-                    <Text style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
-                  </>
-                )}
+                  ) : null}
+                </View>
+                <Text style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
               </Pressable>
             ))}
           </View>
@@ -3618,78 +5533,247 @@ export default function App() {
       {renderMediaViewer()}
       <Modal
         transparent
+        animationType="fade"
+        visible={Boolean(messageActionTarget)}
+        onRequestClose={() => setMessageActionTarget(null)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setMessageActionTarget(null)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Message</Text>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                setReplyTarget(messageActionTarget);
+                setMessageActionTarget(null);
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>Reply</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                void copyMessageText(messageActionTarget?.text);
+                setMessageActionTarget(null);
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>Copy</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => void forwardMessage(messageActionTarget)}
+            >
+              <Text style={styles.sheetOptionTitle}>Forward</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => void deleteMessage(messageActionTarget, 'me')}
+            >
+              <Text style={styles.sheetOptionTitle}>Delete for me</Text>
+            </Pressable>
+            {messageActionTarget?.mine ? (
+              <Pressable
+                style={styles.sheetOption}
+                onPress={() => void deleteMessage(messageActionTarget, 'everyone')}
+              >
+                <Text style={[styles.sheetOptionTitle, styles.settingsDangerText]}>Delete for everyone</Text>
+              </Pressable>
+            ) : null}
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal
+        animationType="slide"
+        visible={chatCameraVisible}
+        onRequestClose={() => setChatCameraVisible(false)}
+      >
+        <View style={styles.chatCameraScreen}>
+          {Camera ? (
+            <Camera
+              ref={chatCameraRef}
+              style={styles.chatCameraPreview}
+              cameraType={CameraKit?.CameraType?.Back ?? 'back'}
+              flashMode="auto"
+            />
+          ) : (
+            <View style={styles.chatCameraPreview}>
+              <Text style={styles.cardBody}>Camera unavailable in this build.</Text>
+            </View>
+          )}
+          <View style={[styles.chatCameraActions, { paddingBottom: modalBottomInset + 12 }]}>
+            <Pressable style={styles.ghostButton} onPress={() => setChatCameraVisible(false)}>
+              <Text style={styles.ghostButtonText}>Close</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sendButtonWide}
+              onPress={async () => {
+                try {
+                  const capture = await chatCameraRef.current?.capture?.();
+                  const uri = capture?.uri || capture?.path;
+                  if (!uri) {
+                    showToast('Could not capture photo.', 'error');
+                    return;
+                  }
+                  setChatCameraVisible(false);
+                  showToast('Uploading photo...', 'info', 0);
+                  const uploaded = await uploadUris([uri.startsWith('file://') ? uri : `file://${uri}`], {
+                    names: [`chat-cam-${Date.now()}.jpg`],
+                    fallbackType: 'image/jpeg',
+                  });
+                  const mediaUrl = uploaded[0] || uri;
+                  const clientRef = `mobile-cam-${Date.now()}`;
+                  const message = {
+                    id: `m${Date.now()}`,
+                    clientRef,
+                    mine: true,
+                    kind: 'image',
+                    text: 'Photo',
+                    time: 'Now',
+                    imageUri: mediaUrl,
+                    receiptState: 'sent',
+                    replyToMessageId: replyTarget?.id,
+                    replyPreview: replyTarget?.text?.slice(0, 140),
+                  };
+                  appendMessage(message);
+                  fetch(`${API_BASE_URL}/api/messages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      chatId: selectedChatId,
+                      senderId: currentUserId,
+                      clientRef,
+                      kind: 'image',
+                      text: 'Photo',
+                      mediaUrls: [mediaUrl],
+                      replyToMessageId: replyTarget?.id,
+                      replyPreview: replyTarget?.text?.slice(0, 140),
+                    }),
+                  }).catch(() => undefined);
+                  setReplyTarget(null);
+                  showToast('Photo sent', 'success');
+                } catch {
+                  showToast('Camera capture failed.', 'error');
+                }
+              }}
+            >
+              <Text style={styles.sendButtonText}>Capture</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        transparent
         animationType="slide"
         visible={statusComposerVisible}
         onRequestClose={() => setStatusComposerVisible(false)}
       >
         <View style={styles.statusComposerOverlay}>
-          <View style={styles.statusComposerSheet}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
             <View style={styles.statusComposerHeader}>
-              <Text style={styles.statusComposerTitle}>Create text status</Text>
+              <Text style={styles.statusComposerTitle}>Create status</Text>
               <Pressable onPress={() => setStatusComposerVisible(false)}>
                 <Text style={styles.storyClose}>Close</Text>
               </Pressable>
             </View>
-            <View style={[styles.statusComposerPreview, { backgroundColor: statusBackgroundColor }]}>
-              <Text
-                style={[
-                  styles.statusComposerPreviewText,
-                  {
-                    fontSize: statusFontSize,
-                    fontFamily: statusFontFamily === 'System' ? undefined : statusFontFamily,
-                  },
-                ]}
-              >
-                {statusDraft || 'Type your status'}
-              </Text>
+            <View style={styles.statusModeRow}>
+              {[
+                { id: 'text', label: 'Text' },
+                { id: 'photo', label: 'Photo' },
+                { id: 'video', label: 'Video' },
+              ].map((mode) => (
+                <Pressable
+                  key={mode.id}
+                  style={[styles.statusModeChip, statusComposerMode === mode.id ? styles.statusModeChipActive : null]}
+                  onPress={() => {
+                    setStatusComposerMode(mode.id);
+                    if (mode.id === 'text') {
+                      setStatusAssetUris([]);
+                    }
+                  }}
+                >
+                  <Text style={[styles.statusModeChipText, statusComposerMode === mode.id ? styles.statusModeChipTextActive : null]}>
+                    {mode.label}
+                  </Text>
+                </Pressable>
+              ))}
             </View>
+            {statusComposerMode === 'text' ? (
+              <View style={[styles.statusComposerPreview, { backgroundColor: statusBackgroundColor }]}>
+                <Text
+                  style={[
+                    styles.statusComposerPreviewText,
+                    {
+                      fontSize: statusFontSize,
+                      fontFamily: statusFontFamily === 'System' ? undefined : statusFontFamily,
+                    },
+                  ]}
+                >
+                  {statusDraft || 'Type your status'}
+                </Text>
+              </View>
+            ) : (
+              <Pressable
+                style={styles.statusMediaPicker}
+                onPress={() => void pickMultipleImages('status', statusComposerMode)}
+              >
+                <Text style={styles.statusMediaPickerTitle}>
+                  {statusAssetUris.length
+                    ? `${statusAssetUris.length} ${statusComposerMode}${statusAssetUris.length > 1 ? 's' : ''} selected`
+                    : `Tap to choose ${statusComposerMode}`}
+                </Text>
+                <Text style={styles.statusMediaPickerMeta}>WhatsApp-style media status with optional caption</Text>
+              </Pressable>
+            )}
             <TextInput
               value={statusDraft}
               onChangeText={setStatusDraft}
-              placeholder="Share an update"
+              placeholder={statusComposerMode === 'text' ? 'Share an update' : 'Add a caption (optional)'}
               placeholderTextColor="#7d8b92"
               multiline
               style={styles.textArea}
             />
-            <Text style={styles.statusOptionLabel}>Background</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusOptionRow}>
-              {statusBackgroundOptions.map((color) => (
-                <Pressable
-                  key={color}
-                  onPress={() => setStatusBackgroundColor(color)}
-                  style={[
-                    styles.statusColorChip,
-                    { backgroundColor: color },
-                    statusBackgroundColor === color ? styles.statusColorChipActive : null,
-                  ]}
-                />
-              ))}
-            </ScrollView>
-            <Text style={styles.statusOptionLabel}>Font</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusOptionRow}>
-              {statusFontOptions.map((font) => (
-                <Pressable
-                  key={font}
-                  onPress={() => setStatusFontFamily(font)}
-                  style={[styles.statusFontChip, statusFontFamily === font ? styles.statusFontChipActive : null]}
-                >
-                  <Text style={[styles.statusFontChipText, { fontFamily: font === 'System' ? undefined : font }]}>{font}</Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-            <Text style={styles.statusOptionLabel}>Size</Text>
-            <View style={styles.statusSizeRow}>
-              {[22, 30, 38].map((size) => (
-                <Pressable
-                  key={size}
-                  onPress={() => setStatusFontSize(size)}
-                  style={[styles.statusSizeChip, statusFontSize === size ? styles.statusFontChipActive : null]}
-                >
-                  <Text style={styles.statusFontChipText}>{size}</Text>
-                </Pressable>
-              ))}
-            </View>
-            <Pressable style={styles.sendButtonWide} onPress={postStatus}>
+            {statusComposerMode === 'text' ? (
+              <>
+                <Text style={styles.statusOptionLabel}>Background</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusOptionRow}>
+                  {statusBackgroundOptions.map((color) => (
+                    <Pressable
+                      key={color}
+                      onPress={() => setStatusBackgroundColor(color)}
+                      style={[
+                        styles.statusColorChip,
+                        { backgroundColor: color },
+                        statusBackgroundColor === color ? styles.statusColorChipActive : null,
+                      ]}
+                    />
+                  ))}
+                </ScrollView>
+                <Text style={styles.statusOptionLabel}>Font</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusOptionRow}>
+                  {statusFontOptions.map((font) => (
+                    <Pressable
+                      key={font}
+                      onPress={() => setStatusFontFamily(font)}
+                      style={[styles.statusFontChip, statusFontFamily === font ? styles.statusFontChipActive : null]}
+                    >
+                      <Text style={[styles.statusFontChipText, { fontFamily: font === 'System' ? undefined : font }]}>{font}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+                <Text style={styles.statusOptionLabel}>Size</Text>
+                <View style={styles.statusSizeRow}>
+                  {[22, 30, 38].map((size) => (
+                    <Pressable
+                      key={size}
+                      onPress={() => setStatusFontSize(size)}
+                      style={[styles.statusSizeChip, statusFontSize === size ? styles.statusFontChipActive : null]}
+                    >
+                      <Text style={styles.statusFontChipText}>{size}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </>
+            ) : null}
+            <Pressable style={styles.sendButtonWide} onPress={() => void postStatus()}>
               <Text style={styles.sendButtonText}>Post status</Text>
             </Pressable>
           </View>
@@ -3748,12 +5832,12 @@ export default function App() {
               >
                 {activeStatusItem?.assets?.[0]?.kind === 'video' && activeStatusItem?.assets?.[0]?.url ? (
                   <Video
-                    isLooping={false}
-                    shouldPlay={!statusPlaybackPaused}
-                    resizeMode={ResizeMode.CONTAIN}
+                    controls={false}
+                    paused={statusPlaybackPaused}
+                    repeat={false}
+                    resizeMode="contain"
                     source={{ uri: activeStatusItem.assets[0].url }}
                     style={styles.storyMedia}
-                    useNativeControls={false}
                   />
                 ) : activeStatusItem?.assets?.[0]?.url ? (
                   <Image resizeMode="contain" source={{ uri: activeStatusItem.assets[0].url }} style={styles.storyMedia} />
@@ -3978,21 +6062,315 @@ export default function App() {
       </Modal>
       <Modal
         transparent
+        animationType="slide"
+        visible={Boolean(businessPanel)}
+        onRequestClose={() => setBusinessPanel('')}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>
+                {businessPanel === 'catalog'
+                  ? 'My catalog'
+                  : businessPanel === 'customers'
+                    ? 'Customers'
+                    : businessPanel === 'receipts'
+                      ? 'Receipts'
+                      : 'Broadcast'}
+              </Text>
+              <Pressable onPress={() => setBusinessPanel('')}>
+                <Text style={styles.storyClose}>Close</Text>
+              </Pressable>
+            </View>
+
+            {businessPanel === 'catalog' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <TextInput
+                  value={catalogSearch}
+                  onChangeText={setCatalogSearch}
+                  placeholder="Search products"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <Pressable style={styles.ghostButton} onPress={() => pickMultipleImages('catalog')}>
+                  <Text style={styles.ghostButtonText}>
+                    {catalogImageUris.length ? `${catalogImageUris.length} image(s) selected` : 'Add product images'}
+                  </Text>
+                </Pressable>
+                <TextInput
+                  value={catalogForm.title}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, title: value }))}
+                  placeholder="Product title"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={catalogForm.price}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, price: value }))}
+                  placeholder="Price (GHS)"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="decimal-pad"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={catalogForm.stockQuantity}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, stockQuantity: value.replace(/[^\d]/g, '') }))}
+                  placeholder="Stock quantity"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="number-pad"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={catalogForm.description}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, description: value }))}
+                  placeholder="Description"
+                  placeholderTextColor="#7d8b92"
+                  multiline
+                  style={styles.textArea}
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void addCatalogItem()}>
+                  <Text style={styles.sendButtonText}>Publish product</Text>
+                </Pressable>
+                <Text style={styles.lightSectionLabel}>LIVE PRODUCTS</Text>
+                {filteredCatalogItems.map((item) => (
+                  <View key={item.id} style={styles.catalogManageRow}>
+                    {item.imageUri ? (
+                      <Image source={{ uri: item.imageUri }} style={styles.catalogManageImage} />
+                    ) : (
+                      <View style={[styles.catalogManageImage, styles.catalogManageImageFallback]}>
+                        <Text style={styles.cardMeta}>No img</Text>
+                      </View>
+                    )}
+                    <View style={styles.catalogManageCopy}>
+                      <Text style={styles.sheetOptionTitle}>{item.title}</Text>
+                      <Text style={styles.sheetOptionBody}>{item.price} · Stock {item.stockQuantity ?? 0}</Text>
+                      <View style={styles.stockControls}>
+                        <Pressable
+                          style={styles.stockButton}
+                          onPress={() => void adjustCatalogStock(item.id, (item.stockQuantity ?? 0) - 1)}
+                        >
+                          <Text style={styles.stockButtonText}>-</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.stockButton}
+                          onPress={() => void adjustCatalogStock(item.id, (item.stockQuantity ?? 0) + 1)}
+                        >
+                          <Text style={styles.stockButtonText}>+</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'customers' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                {(contactItems.length
+                  ? contactItems
+                  : Object.values(usersById)
+                      .filter((user) => user.id !== currentUserId)
+                      .map((user) => ({
+                        id: user.id,
+                        name: user.name,
+                        phone: user.phone,
+                        linkedUserId: user.id,
+                        registered: true,
+                        presence: user.presence,
+                      }))
+                ).map((customer) => (
+                  <Pressable
+                    key={customer.id}
+                    style={styles.sheetOption}
+                    onPress={() => {
+                      if (customer.linkedUserId) {
+                        setBusinessPanel('');
+                        void createDirectChat(customer.linkedUserId);
+                      }
+                    }}
+                  >
+                    <Text style={styles.sheetOptionTitle}>{customer.name}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {customer.phone}
+                      {customer.registered ? ' · On ZynkUp' : ' · Invite pending'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'receipts' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                {[...payHistoryItems, ...payTransactions].map((receipt) => (
+                  <View key={receipt.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{receipt.title}</Text>
+                    <Text style={styles.sheetOptionBody}>{receipt.time} · {receipt.amount}</Text>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'broadcast' ? (
+              <View>
+                <Text style={styles.cardBody}>
+                  Message every registered customer in one send — like WhatsApp Business broadcast lists.
+                </Text>
+                <TextInput
+                  value={broadcastDraft}
+                  onChangeText={setBroadcastDraft}
+                  placeholder="Hi customers — new arrivals just dropped..."
+                  placeholderTextColor="#7d8b92"
+                  multiline
+                  style={styles.textArea}
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void sendBroadcast()}>
+                  <Text style={styles.sendButtonText}>Send broadcast</Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(paySheet)}
+        onRequestClose={() => setPaySheet('')}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>
+                {paySheet === 'send'
+                  ? 'Send money'
+                  : paySheet === 'request'
+                    ? 'Request money'
+                    : paySheet === 'topup'
+                      ? 'Top up wallet'
+                      : 'Payment history'}
+              </Text>
+              <Pressable onPress={() => setPaySheet('')}>
+                <Text style={styles.storyClose}>Close</Text>
+              </Pressable>
+            </View>
+            {paySheet === 'history' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                {[...payHistoryItems, ...payTransactions].map((item) => (
+                  <View key={item.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{item.title}</Text>
+                    <Text style={styles.sheetOptionBody}>{item.time} · {item.amount}</Text>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : (
+              <View>
+                {(paySheet === 'send' || paySheet === 'request') ? (
+                  <TextInput
+                    value={payForm.phone}
+                    onChangeText={(value) => setPayForm((current) => ({ ...current, phone: value }))}
+                    placeholder="Phone number"
+                    placeholderTextColor="#7d8b92"
+                    keyboardType="phone-pad"
+                    style={styles.input}
+                  />
+                ) : null}
+                <TextInput
+                  value={payForm.amount}
+                  onChangeText={(value) => setPayForm((current) => ({ ...current, amount: value }))}
+                  placeholder="Amount (GHS)"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="decimal-pad"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={payForm.note}
+                  onChangeText={(value) => setPayForm((current) => ({ ...current, note: value }))}
+                  placeholder="Note (optional)"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <Text style={styles.cardMeta}>
+                  Provider keys can be added later. The flow is wired to `/api/payments/intent`.
+                </Text>
+                <Pressable style={styles.sendButtonWide} onPress={() => void submitPayAction()}>
+                  <Text style={styles.sendButtonText}>
+                    {paySheet === 'send' ? 'Send' : paySheet === 'request' ? 'Request' : 'Top up'}
+                  </Text>
+                </Pressable>
+              </View>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        transparent
         animationType="fade"
         visible={newChatVisible}
         onRequestClose={() => setNewChatVisible(false)}
       >
         <Pressable style={styles.dialogOverlay} onPress={() => setNewChatVisible(false)}>
-          <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>New conversation</Text>
-            <View style={styles.authAccountList}>
-              {Object.values(usersById).filter((user) => user.id !== currentUserId).map((user) => (
-                <Pressable key={user.id} style={styles.sheetOption} onPress={() => void createDirectChat(user.id)}>
-                  <Text style={styles.sheetOptionTitle}>{user.name}</Text>
-                  <Text style={styles.sheetOptionBody}>{user.phone}</Text>
-                </Pressable>
-              ))}
-            </View>
+          <Pressable style={[styles.dialog, styles.newChatDialog]} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>New chat</Text>
+            <Text style={styles.cardBody}>Contacts on ZynkUp from your phone book</Text>
+            <TextInput
+              value={newChatQuery}
+              onChangeText={setNewChatQuery}
+              placeholder="Search name or phone"
+              placeholderTextColor="#7d8b92"
+              style={styles.input}
+            />
+            <ScrollView style={styles.newChatList}>
+              {(() => {
+                const query = newChatQuery.trim().toLowerCase();
+                const registeredContacts = contactItems.filter((contact) => contact.registered && contact.linkedUserId);
+                const fallbackUsers = Object.values(usersById).filter((user) => user.id !== currentUserId);
+                const rows = (registeredContacts.length ? registeredContacts : fallbackUsers.map((user) => ({
+                  id: user.id,
+                  name: user.name,
+                  phone: user.phone,
+                  linkedUserId: user.id,
+                  registered: true,
+                  presence: user.presence,
+                }))).filter((entry) => {
+                  if (!query) return true;
+                  return (
+                    entry.name?.toLowerCase().includes(query)
+                    || String(entry.phone || '').toLowerCase().includes(query)
+                  );
+                });
+
+                if (!rows.length) {
+                  return (
+                    <View style={styles.emptyChatCard}>
+                      <Text style={styles.cardBody}>
+                        No registered contacts yet. Sync your phone book after signing in, or invite friends to ZynkUp.
+                      </Text>
+                      <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
+                        <Text style={styles.sendButtonText}>Sync phone book</Text>
+                      </Pressable>
+                    </View>
+                  );
+                }
+
+                return rows.map((entry) => (
+                  <Pressable
+                    key={entry.id}
+                    style={styles.sheetOption}
+                    onPress={() => {
+                      setNewChatVisible(false);
+                      void createDirectChat(entry.linkedUserId);
+                    }}
+                  >
+                    <Text style={styles.sheetOptionTitle}>{entry.name}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {entry.phone} · {entry.presence === 'online' ? 'Online' : 'On ZynkUp'}
+                    </Text>
+                  </Pressable>
+                ));
+              })()}
+            </ScrollView>
           </Pressable>
         </Pressable>
       </Modal>
@@ -4069,6 +6447,43 @@ export default function App() {
       </Modal>
       <Modal
         transparent
+        animationType="fade"
+        visible={appSettings.appLockEnabled && !appUnlocked && Boolean(appLockPin)}
+        onRequestClose={() => undefined}
+      >
+        <View style={styles.dialogOverlay}>
+          <View style={styles.dialog}>
+            <Text style={styles.dialogTitle}>App locked</Text>
+            <Text style={styles.cardBody}>Enter your PIN to open ZynkUp.</Text>
+            <TextInput
+              value={unlockPinDraft}
+              onChangeText={setUnlockPinDraft}
+              placeholder="••••"
+              placeholderTextColor="#7d8b92"
+              keyboardType="number-pad"
+              maxLength={4}
+              secureTextEntry
+              style={styles.input}
+            />
+            <Pressable
+              style={styles.sendButtonWide}
+              onPress={() => {
+                if (unlockPinDraft.trim() === appLockPin) {
+                  setAppUnlocked(true);
+                  setUnlockPinDraft('');
+                  showToast('Welcome back', 'success', 1400);
+                  return;
+                }
+                showToast('Incorrect PIN', 'error');
+              }}
+            >
+              <Text style={styles.sendButtonText}>Unlock</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        transparent
         animationType="slide"
         visible={countryPickerVisible}
         onRequestClose={() => setCountryPickerVisible(false)}
@@ -4116,15 +6531,22 @@ export default function App() {
                 ? 'Finishing secure desktop link...'
                 : 'Scan the desktop QR code from the web login screen.'}
             </Text>
-            {cameraPermission?.granted ? (
-              <CameraView
-                barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
-                onBarcodeScanned={deviceLinking ? undefined : ({ data }) => {
+            {cameraPermissionGranted && Camera ? (
+              <Camera
+                allowedBarcodeTypes={['qr']}
+                cameraType="back"
+                onError={() => {
+                  setDeviceLinkMessage('Camera could not start on this device.');
+                }}
+                onReadCode={deviceLinking ? undefined : ({ nativeEvent }) => {
                   if (!deviceScannerVisible) {
                     return;
                   }
-                  void confirmLinkedDesktop(data);
+                  void confirmLinkedDesktop(nativeEvent.codeStringValue);
                 }}
+                resizeMode="cover"
+                scanBarcode
+                scanThrottleDelay={1500}
                 style={styles.scannerView}
               />
             ) : (
@@ -4134,7 +6556,15 @@ export default function App() {
         </Pressable>
       </Modal>
       {renderToast()}
-    </View>
+    </SafeAreaView>
+  );
+}
+
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
   );
 }
 
@@ -4947,6 +7377,119 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '800',
   },
+  chatListShell: {
+    flex: 1,
+  },
+  chatFab: {
+    position: 'absolute',
+    right: 18,
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#128C7E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#0b3b34',
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  chatFabText: {
+    color: '#ffffff',
+    fontSize: 30,
+    fontWeight: '600',
+    marginTop: -2,
+  },
+  newChatDialog: {
+    maxHeight: '78%',
+  },
+  newChatList: {
+    maxHeight: 360,
+  },
+  statusModeRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  statusModeChip: {
+    flex: 1,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#d7e0e4',
+    paddingVertical: 10,
+    alignItems: 'center',
+    backgroundColor: '#f7fafb',
+  },
+  statusModeChipActive: {
+    backgroundColor: '#128C7E',
+    borderColor: '#128C7E',
+  },
+  statusModeChipText: {
+    color: '#44545b',
+    fontWeight: '600',
+  },
+  statusModeChipTextActive: {
+    color: '#ffffff',
+  },
+  statusMediaPicker: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#d7e0e4',
+    backgroundColor: '#f4f8f7',
+    padding: 18,
+    marginBottom: 12,
+  },
+  statusMediaPickerTitle: {
+    color: '#10233e',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  statusMediaPickerMeta: {
+    color: '#6b7a82',
+    marginTop: 4,
+  },
+  businessPanelScroll: {
+    maxHeight: 520,
+  },
+  catalogManageRow: {
+    flexDirection: 'row',
+    gap: 12,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#e4ebef',
+  },
+  catalogManageImage: {
+    width: 64,
+    height: 64,
+    borderRadius: 12,
+    backgroundColor: '#eef3f5',
+  },
+  catalogManageImageFallback: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  catalogManageCopy: {
+    flex: 1,
+  },
+  stockControls: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  stockButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#dff3ec',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stockButtonText: {
+    color: '#0b6b5b',
+    fontSize: 18,
+    fontWeight: '700',
+  },
   businessGridMeta: {
     color: '#8a8f9d',
     fontSize: 14,
@@ -5748,8 +8291,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#f4f5f7',
     justifyContent: 'flex-start',
     paddingHorizontal: 20,
-    paddingTop: 54,
-    paddingBottom: 18,
+    paddingTop: 34,
+    paddingBottom: 12,
+  },
+  authFlowScroll: {
+    flex: 1,
+  },
+  authFlowScrollContent: {
+    paddingBottom: 4,
   },
   authWelcomeCard: {
     width: '100%',
@@ -5761,11 +8310,10 @@ const styles = StyleSheet.create({
   },
   authFlowCard: {
     width: '100%',
-    flex: 1,
     backgroundColor: 'transparent',
     paddingHorizontal: 0,
-    paddingTop: 4,
-    paddingBottom: 20,
+    paddingTop: 0,
+    paddingBottom: 8,
   },
   authWelcomeBackdrop: {
     position: 'absolute',
@@ -5824,6 +8372,30 @@ const styles = StyleSheet.create({
   },
   authBrandWordmarkAccent: {
     color: '#60a5fa',
+  },
+  bootstrapLoader: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  bootstrapLoaderSpinner: {
+    marginTop: 24,
+  },
+  bootstrapLoaderTitle: {
+    color: '#f8fbff',
+    fontSize: 20,
+    fontWeight: '800',
+    textAlign: 'center',
+    marginTop: 18,
+  },
+  bootstrapLoaderBody: {
+    color: '#9fb2c9',
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+    marginTop: 10,
+    maxWidth: 260,
   },
   authWelcomeTagline: {
     color: '#f8fbff',
@@ -5903,7 +8475,7 @@ const styles = StyleSheet.create({
   authStepHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 18,
+    marginBottom: 12,
   },
   authBackButton: {
     width: 40,
@@ -5939,28 +8511,28 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   authStepEmoji: {
-    fontSize: 46,
-    marginBottom: 12,
+    fontSize: 40,
+    marginBottom: 8,
   },
   authStepTitle: {
     color: '#111827',
-    fontSize: 31,
+    fontSize: 26,
     fontWeight: '800',
-    lineHeight: 36,
+    lineHeight: 30,
     fontFamily: DISPLAY_FONT_FAMILY,
   },
   authStepAccent: {
     color: '#111827',
-    fontSize: 31,
+    fontSize: 26,
     fontWeight: '800',
-    lineHeight: 36,
-    marginBottom: 10,
+    lineHeight: 30,
+    marginBottom: 8,
     fontFamily: DISPLAY_FONT_FAMILY,
   },
   authStepBody: {
     color: '#6b7280',
-    fontSize: 15,
-    lineHeight: 22,
+    fontSize: 14,
+    lineHeight: 20,
   },
   authPhoneRow: {
     flexDirection: 'row',
@@ -6001,13 +8573,13 @@ const styles = StyleSheet.create({
   authOtpRow: {
     flexDirection: 'row',
     gap: 10,
-    marginTop: 28,
-    marginBottom: 18,
+    marginTop: 16,
+    marginBottom: 14,
   },
   authOtpBox: {
     flex: 1,
-    minHeight: 58,
-    borderRadius: 18,
+    minHeight: 52,
+    borderRadius: 16,
     backgroundColor: '#f3f4f6',
     alignItems: 'center',
     justifyContent: 'center',
@@ -6017,7 +8589,7 @@ const styles = StyleSheet.create({
   },
   authOtpBoxText: {
     color: '#111827',
-    fontSize: 24,
+    fontSize: 21,
     fontWeight: '800',
   },
   authOtpBoxTextFilled: {
@@ -6026,7 +8598,7 @@ const styles = StyleSheet.create({
   authResendText: {
     color: '#9ca3af',
     fontSize: 13,
-    marginBottom: 18,
+    marginBottom: 14,
   },
   authResendAccent: {
     color: '#111827',
@@ -6035,14 +8607,14 @@ const styles = StyleSheet.create({
   authKeypadGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 12,
+    gap: 10,
     justifyContent: 'space-between',
   },
   authKeypadKey: {
     width: '30%',
     aspectRatio: 1,
-    maxHeight: 72,
-    borderRadius: 22,
+    maxHeight: 64,
+    borderRadius: 18,
     backgroundColor: '#f8fafc',
     alignItems: 'center',
     justifyContent: 'center',
@@ -6052,8 +8624,12 @@ const styles = StyleSheet.create({
   },
   authKeypadKeyText: {
     color: '#111827',
-    fontSize: 24,
+    fontSize: 21,
     fontWeight: '700',
+  },
+  authFooterDock: {
+    backgroundColor: '#f4f5f7',
+    paddingTop: 10,
   },
   authProfilePhotoWrap: {
     width: 118,
@@ -6788,5 +9364,244 @@ const styles = StyleSheet.create({
   },
   authAccountList: {
     gap: 10,
+  },
+  settingsProfileName: {
+    color: '#f6f7f8',
+    fontSize: 22,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  settingsProfileMeta: {
+    color: '#9ab0b8',
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  profileImageFallback: {
+    backgroundColor: '#1d4ed8',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileImageFallbackText: {
+    color: '#edf4ff',
+    fontSize: 42,
+    fontWeight: '800',
+  },
+  settingsMenuRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#223149',
+  },
+  settingsMenuIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#172228',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  settingsMenuIcon: {
+    color: '#60a5fa',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  settingsMenuCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  settingsMenuTitle: {
+    color: '#f6f7f8',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  settingsMenuSubtitle: {
+    color: '#8ea1aa',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  settingsPanelScroll: {
+    maxHeight: 460,
+  },
+  settingsPanelBody: {
+    gap: 12,
+  },
+  settingsSectionCaption: {
+    color: '#8ea1aa',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  settingsToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 16,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#223149',
+  },
+  settingsToggleCopy: {
+    flex: 1,
+    gap: 4,
+  },
+  settingsToggleLabel: {
+    color: '#f6f7f8',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  settingsToggleHelper: {
+    color: '#8ea1aa',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  settingsChoiceBlock: {
+    gap: 10,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#223149',
+  },
+  settingsChoiceRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  settingsChoiceChip: {
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#172228',
+  },
+  settingsChoiceChipActive: {
+    backgroundColor: '#1d4ed8',
+  },
+  settingsChoiceChipText: {
+    color: '#c6d2d7',
+    fontSize: 13,
+    fontWeight: '700',
+    textTransform: 'capitalize',
+  },
+  settingsChoiceChipTextActive: {
+    color: '#edf4ff',
+  },
+  settingsListRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#223149',
+  },
+  settingsListCopy: {
+    flex: 1,
+    gap: 3,
+  },
+  settingsListTitle: {
+    color: '#f6f7f8',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  settingsListSubtitle: {
+    color: '#8ea1aa',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  settingsListChevron: {
+    color: '#7d8b92',
+    fontSize: 22,
+    fontWeight: '300',
+  },
+  settingsDangerText: {
+    color: '#f87171',
+  },
+  inputReadonly: {
+    opacity: 0.7,
+  },
+  chatHomeFavoriteStar: {
+    color: '#f59e0b',
+    fontSize: 13,
+    fontWeight: '800',
+    marginRight: 2,
+  },
+  chatHomeMuteIcon: {
+    fontSize: 12,
+  },
+  chatSearchInput: {
+    marginHorizontal: 16,
+    marginBottom: 8,
+    borderRadius: 14,
+    backgroundColor: '#eef1f6',
+    color: '#111827',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 15,
+  },
+  replyQuoteCard: {
+    borderLeftWidth: 3,
+    borderLeftColor: '#60a5fa',
+    backgroundColor: 'rgba(15,24,36,0.35)',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    marginBottom: 6,
+  },
+  replyQuoteText: {
+    color: '#dbe5ea',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  replyComposerBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginHorizontal: 12,
+    marginBottom: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#172228',
+  },
+  replyComposerCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  replyComposerLabel: {
+    color: '#60a5fa',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  replyComposerText: {
+    color: '#c6d2d7',
+    fontSize: 13,
+  },
+  replyComposerClose: {
+    color: '#9ab0b8',
+    fontSize: 16,
+    fontWeight: '700',
+    padding: 4,
+  },
+  messageDeletedBubble: {
+    opacity: 0.72,
+  },
+  chatCameraScreen: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  chatCameraPreview: {
+    flex: 1,
+    backgroundColor: '#0b1220',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatCameraActions: {
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    backgroundColor: '#0f1620',
   },
 });

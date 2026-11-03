@@ -1,8 +1,13 @@
-const { getDefaultConfig } = require('expo/metro-config');
+const path = require('path');
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
-const config = getDefaultConfig(__dirname);
+const rootNodeModules = path.resolve(__dirname, '../node_modules');
+const localNodeModules = path.resolve(__dirname, 'node_modules');
 
-// Watchman crashes in this environment, so fall back to Node file watching.
-config.resolver.useWatchman = false;
-
-module.exports = config;
+module.exports = mergeConfig(getDefaultConfig(__dirname), {
+  watchFolders: [path.resolve(__dirname, '..')],
+  resolver: {
+    nodeModulesPaths: [localNodeModules, rootNodeModules],
+    useWatchman: false,
+  },
+});
