@@ -472,7 +472,8 @@ const phoneLookupSchema = z.object({
 
 const resetPinSchema = z.object({
   deviceId: z.string().min(8).nullish(),
-  challengeId: z.string().min(6),
+  challengeId: z.string().min(6).optional(),
+  idToken: z.string().min(32).optional(),
   pin: pinCodeSchema,
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
@@ -514,6 +515,7 @@ const phoneSessionSchema = z.object({
   deviceId: optionalDeviceId,
   idToken: z.string().min(32),
   phone: z.string().min(6).max(30),
+  forcePinReset: z.boolean().optional(),
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -848,6 +850,84 @@ const hasFirebaseAdminCredentials = () =>
     || (FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY && FIREBASE_PROJECT_ID),
   );
 
+let firebasePublicCerts: { fetchedAt: number; certs: Record<string, string> } | null = null;
+
+const readFirebasePublicCerts = async () => {
+  if (firebasePublicCerts && Date.now() - firebasePublicCerts.fetchedAt < 60 * 60 * 1000) {
+    return firebasePublicCerts.certs;
+  }
+
+  const response = await fetch(
+    'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
+  );
+  if (!response.ok) {
+    throw new Error('Unable to load Firebase signing keys.');
+  }
+  const certs = (await response.json()) as Record<string, string>;
+  firebasePublicCerts = { fetchedAt: Date.now(), certs };
+  return certs;
+};
+
+const verifyFirebaseIdTokenWithPublicKeys = async (idToken: string, expectedPhone?: string) => {
+  const parts = idToken.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Invalid Firebase token.');
+  }
+
+  const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as { alg?: string; kid?: string };
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as {
+    aud?: string;
+    iss?: string;
+    exp?: number;
+    phone_number?: string;
+    sub?: string;
+    user_id?: string;
+  };
+
+  if (header.alg !== 'RS256' || !header.kid) {
+    throw new Error('Unsupported Firebase token.');
+  }
+
+  let certs = await readFirebasePublicCerts();
+  let certificate = certs[header.kid];
+  if (!certificate) {
+    firebasePublicCerts = null;
+    certs = await readFirebasePublicCerts();
+    certificate = certs[header.kid];
+  }
+  if (!certificate) {
+    throw new Error('Firebase signing key was not found.');
+  }
+
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${parts[0]}.${parts[1]}`);
+  verifier.end();
+  if (!verifier.verify(certificate, Buffer.from(parts[2], 'base64url'))) {
+    throw new Error('Firebase token signature is invalid.');
+  }
+
+  const projectId = FIREBASE_PROJECT_ID || payload.aud || '';
+  if (!projectId || payload.aud !== projectId || payload.iss !== `https://securetoken.google.com/${projectId}`) {
+    throw new Error('Firebase token is for a different project.');
+  }
+  if (!payload.exp || payload.exp * 1000 < Date.now()) {
+    throw new Error('Firebase token expired.');
+  }
+
+  const verifiedPhone = payload.phone_number?.trim() ?? '';
+  if (!verifiedPhone) {
+    throw new Error('Firebase token does not include a verified phone number.');
+  }
+  if (expectedPhone && sanitizePhone(verifiedPhone) !== sanitizePhone(expectedPhone)) {
+    throw new Error('Firebase token phone number does not match the submitted number.');
+  }
+
+  return {
+    uid: payload.sub || payload.user_id || 'firebase-user',
+    phoneNumber: verifiedPhone,
+  };
+};
+
 const verifyFirebasePhoneWithRestApi = async (idToken: string, expectedPhone?: string) => {
   if (!FIREBASE_WEB_API_KEY) {
     throw new Error('Firebase token verification is not configured yet.');
@@ -952,11 +1032,17 @@ const verifyFirebasePhoneIdentity = async (idToken: string, expectedPhone?: stri
         phoneNumber: verifiedPhone,
       };
     } catch (error) {
-      if (!FIREBASE_WEB_API_KEY) {
-        throw error;
-      }
-      console.warn('Firebase Admin token verification failed, falling back to REST lookup.');
+      console.warn('Firebase Admin token verification failed, checking the token signature directly.', error);
     }
+  }
+
+  try {
+    return await verifyFirebaseIdTokenWithPublicKeys(idToken, expectedPhone);
+  } catch (error) {
+    if (!FIREBASE_WEB_API_KEY) {
+      throw error;
+    }
+    console.warn('Public-key token check failed, falling back to Firebase REST lookup.', error);
   }
 
   return verifyFirebasePhoneWithRestApi(idToken, expectedPhone);
@@ -2427,12 +2513,27 @@ app.post('/api/auth/pin/reset', async (req, res) => {
     });
   }
 
-  const challenge = await readOtpChallenge(parseResult.data.challengeId);
-  if (!challenge?.verifiedAt) {
-    return res.status(401).json({ error: 'Phone number has not been verified yet' });
+  let verifiedPhone = '';
+  if (parseResult.data.idToken) {
+    try {
+      const identity = await verifyFirebasePhoneIdentity(parseResult.data.idToken);
+      verifiedPhone = identity.phoneNumber;
+    } catch (error) {
+      return res.status(401).json({
+        error: error instanceof Error ? error.message : 'Phone number has not been verified yet',
+      });
+    }
+  } else if (parseResult.data.challengeId) {
+    const challenge = await readOtpChallenge(parseResult.data.challengeId);
+    if (!challenge?.verifiedAt) {
+      return res.status(401).json({ error: 'Phone number has not been verified yet' });
+    }
+    verifiedPhone = challenge.normalizedPhone;
+  } else {
+    return res.status(400).json({ error: 'Phone number has not been verified yet' });
   }
 
-  const user = await readUserByPhone(challenge.normalizedPhone);
+  const user = await readUserByPhone(verifiedPhone);
   if (!user) {
     return res.status(404).json({ error: 'No account found for that phone number' });
   }
@@ -2490,6 +2591,26 @@ app.post('/api/auth/phone/session', async (req, res) => {
     });
   }
 
+  if (parseResult.data.forcePinReset) {
+    return res.json({
+      verified: true,
+      registrationRequired: false,
+      pinResetRequired: true,
+      phone: verifiedIdentity.phoneNumber,
+    });
+  }
+
+  const existingProfile = await readProfile(existingUser.id);
+  if (existingProfile?.pinHash) {
+    return res.json({
+      verified: true,
+      registrationRequired: false,
+      pinLoginRequired: true,
+      phone: verifiedIdentity.phoneNumber,
+      name: existingUser.name,
+    });
+  }
+
   if (!(await canOpenAnotherSession(existingUser.id, parseResult.data.deviceId))) {
     return res.status(409).json({
       error: 'Device limit reached. Log out from one of your linked devices and try again.',
@@ -2508,6 +2629,7 @@ app.post('/api/auth/phone/session', async (req, res) => {
   return res.json({
     verified: true,
     registrationRequired: false,
+    pinSetupRequired: true,
     session,
     bootstrap: await buildBootstrapPayload(session),
   });
