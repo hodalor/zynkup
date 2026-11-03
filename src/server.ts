@@ -1,5 +1,6 @@
 import 'dotenv/config';
-import admin from 'firebase-admin';
+import { App, cert, getApp, getApps, initializeApp, type ServiceAccount } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
 import { v2 as cloudinary } from 'cloudinary';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -26,6 +27,7 @@ type User = {
   phone: string;
   about: string;
   isBusiness: boolean;
+  lastSeenAt?: string;
 };
 
 type Message = {
@@ -41,6 +43,10 @@ type Message = {
   durationSeconds?: number;
   deliveredAt?: string;
   readAt?: string;
+  replyToMessageId?: string;
+  replyPreview?: string;
+  deletedForEveryone?: boolean;
+  deletedFor?: string[];
 };
 
 type Chat = {
@@ -49,6 +55,7 @@ type Chat = {
   kind: 'direct' | 'group';
   participants: string[];
   unreadCount: number;
+  unreadByUser?: Record<string, number>;
   lastMessagePreview: string;
   updatedAt: string;
 };
@@ -297,7 +304,7 @@ const seedSessions: DeviceSession[] = [];
 let mongoClientPromise: Promise<MongoClient | null> | null = null;
 let mongoConnectionState: 'not-configured' | 'connected' | 'failed' = 'not-configured';
 const mongoUri = process.env.MONGODB_ATLAS_URI ?? process.env.MONGO_URI;
-let firebaseAdminApp: admin.app.App | null = null;
+let firebaseAdminApp: App | null = null;
 
 const sendMessageSchema = z.object({
   chatId: z.string().min(1),
@@ -307,6 +314,17 @@ const sendMessageSchema = z.object({
   text: z.string().min(1).max(4000),
   mediaUrls: z.array(z.string().url()).default([]),
   durationSeconds: z.number().int().nonnegative().optional(),
+  replyToMessageId: z.string().min(1).optional(),
+  replyPreview: z.string().max(280).optional(),
+});
+
+const clearChatUnreadSchema = z.object({
+  userId: z.string().min(1),
+});
+
+const deleteMessageSchema = z.object({
+  userId: z.string().min(1),
+  scope: z.enum(['me', 'everyone']).default('me'),
 });
 
 const updateProfileSchema = z.object({
@@ -324,7 +342,7 @@ const updateProfileSchema = z.object({
   statusPrivacy: z.enum(['contacts', 'close-friends', 'nobody']).optional(),
   readReceiptsEnabled: z.boolean().optional(),
   appLockEnabled: z.boolean().optional(),
-  pin: z.string().length(4).optional(),
+  pin: z.string().regex(/^\d{4,6}$/).optional(),
 });
 
 const statusAssetSchema = z.object({
@@ -415,9 +433,27 @@ const createChatSchema = z.object({
   peerUserId: z.string().min(1),
 });
 
+const pinCodeSchema = z.string().regex(/^\d{4,6}$/);
+
 const authLoginSchema = z.object({
-  deviceId: z.string().min(8).optional(),
+  deviceId: z.string().min(8).nullish(),
+  countryCode: z.string().min(1).max(8).optional(),
   phone: z.string().min(7).max(30),
+  phoneNumber: z.string().min(4).max(20).optional(),
+  pin: pinCodeSchema,
+  platform: z.string().min(2).max(40).default('unknown'),
+  label: z.string().min(2).max(80).default('Primary device'),
+});
+
+const phoneLookupSchema = z.object({
+  countryCode: z.string().min(1).max(8),
+  phoneNumber: z.string().min(4).max(20),
+});
+
+const resetPinSchema = z.object({
+  deviceId: z.string().min(8).nullish(),
+  challengeId: z.string().min(6),
+  pin: pinCodeSchema,
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -449,6 +485,7 @@ const verifyOtpSchema = z.object({
   deviceId: optionalDeviceId,
   challengeId: z.string().min(6),
   code: z.string().min(4).max(8),
+  forcePinReset: z.boolean().optional(),
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -467,7 +504,7 @@ const completeRegistrationSchema = z.object({
   name: z.string().min(2).max(80),
   countryCode: z.string().min(1).max(8),
   phoneNumber: z.string().min(4).max(20),
-  pin: z.string().length(4).optional(),
+  pin: pinCodeSchema,
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -478,7 +515,7 @@ const phoneRegisterSchema = z.object({
   name: z.string().min(2).max(80),
   countryCode: z.string().min(1).max(8),
   phone: z.string().min(6).max(30),
-  pin: z.string().length(4).optional(),
+  pin: pinCodeSchema,
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -508,7 +545,7 @@ const confirmLinkRequestSchema = z.object({
 const verifyLinkedDevicePinSchema = z.object({
   requestId: z.string().min(6),
   token: z.string().min(12),
-  pin: z.string().length(4),
+  pin: pinCodeSchema,
 });
 
 const ensureSessionSchema = z.object({
@@ -570,10 +607,11 @@ const getMongoClient = async () => {
 
   if (!mongoClientPromise) {
     mongoClientPromise = MongoClient.connect(mongoUri, {
-      serverSelectionTimeoutMS: 5000,
+      serverSelectionTimeoutMS: 20000,
     })
       .then((client) => {
         mongoConnectionState = 'connected';
+        console.log('Connected to MongoDB');
         return client;
       })
       .catch((error: unknown) => {
@@ -844,21 +882,21 @@ const getFirebaseAdminApp = () => {
 
   try {
     if (FIREBASE_SERVICE_ACCOUNT_JSON.trim()) {
-      const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON) as admin.ServiceAccount;
-      firebaseAdminApp = admin.apps.length
-        ? admin.app()
-        : admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
+      const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON) as ServiceAccount;
+      firebaseAdminApp = getApps().length
+        ? getApp()
+        : initializeApp({
+            credential: cert(serviceAccount),
             projectId: FIREBASE_PROJECT_ID || serviceAccount.projectId,
           });
       return firebaseAdminApp;
     }
 
     if (FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY && FIREBASE_PROJECT_ID) {
-      firebaseAdminApp = admin.apps.length
-        ? admin.app()
-        : admin.initializeApp({
-            credential: admin.credential.cert({
+      firebaseAdminApp = getApps().length
+        ? getApp()
+        : initializeApp({
+            credential: cert({
               projectId: FIREBASE_PROJECT_ID,
               clientEmail: FIREBASE_CLIENT_EMAIL,
               privateKey: FIREBASE_PRIVATE_KEY,
@@ -878,7 +916,7 @@ const verifyFirebasePhoneIdentity = async (idToken: string, expectedPhone?: stri
   const adminApp = getFirebaseAdminApp();
   if (adminApp) {
     try {
-      const decodedToken = await admin.auth(adminApp).verifyIdToken(idToken, true);
+      const decodedToken = await getAuth(adminApp).verifyIdToken(idToken, true);
       const verifiedPhone = decodedToken.phone_number?.trim();
       if (!verifiedPhone) {
         throw new Error('Firebase token does not include a verified phone number.');
@@ -1301,8 +1339,9 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
   const visibleChats = chats
     .filter((chat) => chat.participants.includes(currentUserId))
     .map((chat) => {
+      const unreadForUser = chat.unreadByUser?.[currentUserId] ?? 0;
       if (chat.kind !== 'direct') {
-        return chat;
+        return { ...chat, unreadCount: unreadForUser };
       }
 
       const peerId = chat.participants.find((participantId) => participantId !== currentUserId);
@@ -1310,10 +1349,16 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       return {
         ...chat,
         title: peerUser?.name ?? chat.title,
+        unreadCount: unreadForUser,
       };
     });
   const visibleChatIds = new Set(visibleChats.map((chat) => chat.id));
-  const visibleMessages = messages.filter((message) => visibleChatIds.has(message.chatId));
+  const visibleMessages = messages.filter(
+    (message) =>
+      visibleChatIds.has(message.chatId) &&
+      !message.deletedForEveryone &&
+      !(message.deletedFor ?? []).includes(currentUserId),
+  );
   const visibleCalls = calls.filter((call) => call.participantIds.includes(currentUserId));
   const mergedContacts = contacts.map((contact) => {
     const linkedUser = users.find((user) => user.id === contact.linkedUserId);
@@ -1566,7 +1611,26 @@ const updateMessageReceipt = async (
   return collections.messages.findOne({ id: messageId }, { projection: { _id: 0 } });
 };
 
-const updateChatAfterMessage = async (chatId: string, preview: string, updatedAt: string) => {
+const bumpUnreadForRecipients = (
+  chat: Chat,
+  senderId: string,
+): Record<string, number> => {
+  const unreadByUser = { ...(chat.unreadByUser ?? {}) };
+  for (const participantId of chat.participants) {
+    if (participantId === senderId) {
+      continue;
+    }
+    unreadByUser[participantId] = (unreadByUser[participantId] ?? 0) + 1;
+  }
+  return unreadByUser;
+};
+
+const updateChatAfterMessage = async (
+  chatId: string,
+  preview: string,
+  updatedAt: string,
+  senderId?: string,
+) => {
   const db = await getDb();
   if (!db) {
     const fallbackChat = seedChats.find((item) => item.id === chatId);
@@ -1575,21 +1639,58 @@ const updateChatAfterMessage = async (chatId: string, preview: string, updatedAt
     }
     fallbackChat.lastMessagePreview = preview;
     fallbackChat.updatedAt = updatedAt;
+    if (senderId) {
+      fallbackChat.unreadByUser = bumpUnreadForRecipients(fallbackChat, senderId);
+      fallbackChat.unreadCount = Object.values(fallbackChat.unreadByUser).reduce((sum, n) => sum + n, 0);
+    }
     return fallbackChat;
   }
 
   await seedDatabaseIfNeeded();
   const collections = collectionsFor(db);
+  const current = await collections.chats.findOne({ id: chatId }, { projection: { _id: 0 } });
+  if (!current) {
+    return null;
+  }
+
+  const unreadByUser = senderId ? bumpUnreadForRecipients(current, senderId) : (current.unreadByUser ?? {});
+  const unreadCount = Object.values(unreadByUser).reduce((sum, n) => sum + n, 0);
   await collections.chats.updateOne(
     { id: chatId },
     {
       $set: {
         lastMessagePreview: preview,
         updatedAt,
+        unreadByUser,
+        unreadCount,
       },
     },
   );
 
+  return collections.chats.findOne({ id: chatId }, { projection: { _id: 0 } });
+};
+
+const clearChatUnread = async (chatId: string, userId: string) => {
+  const db = await getDb();
+  if (!db) {
+    const chat = seedChats.find((item) => item.id === chatId);
+    if (!chat) {
+      return null;
+    }
+    chat.unreadByUser = { ...(chat.unreadByUser ?? {}), [userId]: 0 };
+    chat.unreadCount = Object.values(chat.unreadByUser).reduce((sum, n) => sum + n, 0);
+    return chat;
+  }
+
+  await seedDatabaseIfNeeded();
+  const collections = collectionsFor(db);
+  const chat = await collections.chats.findOne({ id: chatId }, { projection: { _id: 0 } });
+  if (!chat) {
+    return null;
+  }
+  const unreadByUser = { ...(chat.unreadByUser ?? {}), [userId]: 0 };
+  const unreadCount = Object.values(unreadByUser).reduce((sum, n) => sum + n, 0);
+  await collections.chats.updateOne({ id: chatId }, { $set: { unreadByUser, unreadCount } });
   return collections.chats.findOne({ id: chatId }, { projection: { _id: 0 } });
 };
 
@@ -1865,6 +1966,7 @@ const updateProfile = async (userId: string, changes: Partial<Profile>) => {
 };
 
 const updatePresence = async (userId: string, presence: Presence) => {
+  const lastSeenAt = new Date().toISOString();
   const db = await getDb();
   if (!db) {
     const user = seedUsers.find((item) => item.id === userId);
@@ -1872,12 +1974,19 @@ const updatePresence = async (userId: string, presence: Presence) => {
       return null;
     }
     user.presence = presence;
+    if (presence === 'offline') {
+      user.lastSeenAt = lastSeenAt;
+    }
     return user;
   }
 
   await seedDatabaseIfNeeded();
   const collections = collectionsFor(db);
-  await collections.users.updateOne({ id: userId }, { $set: { presence } });
+  const changes: Partial<User> = { presence };
+  if (presence === 'offline') {
+    changes.lastSeenAt = lastSeenAt;
+  }
+  await collections.users.updateOne({ id: userId }, { $set: changes });
   return collections.users.findOne({ id: userId }, { projection: { _id: 0 } });
 };
 
@@ -2153,6 +2262,34 @@ app.post('/api/link/verify-pin', async (req, res) => {
   });
 });
 
+app.post('/api/auth/phone/lookup', async (req, res) => {
+  const parseResult = phoneLookupSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid phone lookup payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const phone = normalizePhone(parseResult.data.countryCode, parseResult.data.phoneNumber);
+  const user = await readUserByPhone(phone);
+  if (!user) {
+    return res.json({
+      registered: false,
+      hasPin: false,
+      phone,
+    });
+  }
+
+  const profile = await readProfile(user.id);
+  return res.json({
+    registered: true,
+    hasPin: Boolean(profile?.pinHash),
+    phone: user.phone,
+    name: user.name,
+  });
+});
+
 app.post('/api/auth/phone/start', async (req, res) => {
   const parseResult = startPhoneAuthSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -2203,6 +2340,31 @@ app.post('/api/auth/phone/verify', async (req, res) => {
 
   const existingUser = await readUserByPhone(verifiedChallenge.normalizedPhone);
   if (existingUser) {
+    if (parseResult.data.forcePinReset) {
+      return res.json({
+        verified: true,
+        registrationRequired: false,
+        pinResetRequired: true,
+        challengeId: verifiedChallenge.id,
+        phone: verifiedChallenge.normalizedPhone,
+        countryCode: verifiedChallenge.countryCode,
+      });
+    }
+
+    const existingProfile = await readProfile(existingUser.id);
+    if (existingProfile?.pinHash) {
+      // Registered users with a PIN must sign in with PIN (OTP only for forgot-PIN).
+      return res.json({
+        verified: true,
+        registrationRequired: false,
+        pinLoginRequired: true,
+        phone: verifiedChallenge.normalizedPhone,
+        countryCode: verifiedChallenge.countryCode,
+        name: existingUser.name,
+      });
+    }
+
+    // Account exists but has no PIN yet — open session and let client set one.
     if (!(await canOpenAnotherSession(existingUser.id, parseResult.data.deviceId))) {
       return res.status(409).json({
         error: 'Device limit reached. Log out from one of your linked devices and try again.',
@@ -2219,6 +2381,8 @@ app.post('/api/auth/phone/verify', async (req, res) => {
     return res.json({
       verified: true,
       registrationRequired: false,
+      pinSetupRequired: true,
+      challengeId: verifiedChallenge.id,
       session,
       bootstrap: await buildBootstrapPayload(session),
     });
@@ -2230,6 +2394,51 @@ app.post('/api/auth/phone/verify', async (req, res) => {
     challengeId: verifiedChallenge.id,
     phone: verifiedChallenge.phone,
     countryCode: verifiedChallenge.countryCode,
+  });
+});
+
+app.post('/api/auth/pin/reset', async (req, res) => {
+  const parseResult = resetPinSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid pin reset payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const challenge = await readOtpChallenge(parseResult.data.challengeId);
+  if (!challenge?.verifiedAt) {
+    return res.status(401).json({ error: 'Phone number has not been verified yet' });
+  }
+
+  const user = await readUserByPhone(challenge.normalizedPhone);
+  if (!user) {
+    return res.status(404).json({ error: 'No account found for that phone number' });
+  }
+
+  await updateProfile(user.id, {
+    pinHash: hashPin(parseResult.data.pin),
+    appLockEnabled: true,
+  });
+
+  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
+    return res.status(409).json({
+      error: 'Device limit reached. Log out from one of your linked devices and try again.',
+      code: 'DEVICE_LIMIT_REACHED',
+      limit: MAX_DEVICES_PER_USER,
+    });
+  }
+
+  const session = await ensureSession({
+    deviceId: parseResult.data.deviceId,
+    preferredUserId: user.id,
+    platform: parseResult.data.platform,
+    label: parseResult.data.label,
+  });
+
+  return res.json({
+    session,
+    bootstrap: await buildBootstrapPayload(session),
   });
 });
 
@@ -2392,9 +2601,23 @@ app.post('/api/auth/login', async (req, res) => {
     });
   }
 
-  const user = await readUserByPhone(parseResult.data.phone);
+  const phone = parseResult.data.countryCode && parseResult.data.phoneNumber
+    ? normalizePhone(parseResult.data.countryCode, parseResult.data.phoneNumber)
+    : sanitizePhone(parseResult.data.phone);
+  const user = await readUserByPhone(phone);
   if (!user) {
     return res.status(404).json({ error: 'No account found for that phone number' });
+  }
+
+  const profile = await readProfile(user.id);
+  if (!profile?.pinHash) {
+    return res.status(409).json({
+      error: 'This account has no PIN yet. Verify with OTP to set one.',
+      code: 'PIN_REQUIRED',
+    });
+  }
+  if (profile.pinHash !== hashPin(parseResult.data.pin)) {
+    return res.status(401).json({ error: 'Incorrect PIN' });
   }
 
   if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
@@ -2971,6 +3194,14 @@ app.post('/api/messages', async (req, res) => {
     return res.status(404).json({ error: 'Chat not found' });
   }
 
+  let replyPreview = payload.replyPreview?.trim() || undefined;
+  if (payload.replyToMessageId && !replyPreview) {
+    const parent = (await readMessages()).find((item) => item.id === payload.replyToMessageId);
+    if (parent && !parent.deletedForEveryone) {
+      replyPreview = parent.text.slice(0, 140);
+    }
+  }
+
   const message: Message = {
     id: `m${Date.now()}`,
     chatId: payload.chatId,
@@ -2982,17 +3213,108 @@ app.post('/api/messages', async (req, res) => {
     sentAt: new Date().toISOString(),
     state: 'sent',
     durationSeconds: payload.durationSeconds,
+    replyToMessageId: payload.replyToMessageId,
+    replyPreview,
   };
 
   await persistMessage(message);
-  const updatedChat = await updateChatAfterMessage(payload.chatId, payload.text, message.sentAt);
+  const updatedChat = await updateChatAfterMessage(
+    payload.chatId,
+    payload.text,
+    message.sentAt,
+    payload.senderId,
+  );
 
   io.emit('message:new', message);
   if (updatedChat) {
-    io.emit('chat:updated', updatedChat);
+    for (const participantId of chat.participants) {
+      io.emit('chat:updated', {
+        ...updatedChat,
+        unreadCount: updatedChat.unreadByUser?.[participantId] ?? 0,
+        viewerUserId: participantId,
+      });
+    }
   }
 
   return res.status(201).json({ message });
+});
+
+app.post('/api/chats/:chatId/read', async (req, res) => {
+  const parseResult = clearChatUnreadSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid read payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const chat = await clearChatUnread(req.params.chatId, parseResult.data.userId);
+  if (!chat) {
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+
+  io.emit('chat:updated', {
+    ...chat,
+    unreadCount: chat.unreadByUser?.[parseResult.data.userId] ?? 0,
+    viewerUserId: parseResult.data.userId,
+  });
+  return res.json({
+    chat: { ...chat, unreadCount: chat.unreadByUser?.[parseResult.data.userId] ?? 0 },
+  });
+});
+
+app.delete('/api/messages/:messageId', async (req, res) => {
+  const parseResult = deleteMessageSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid delete payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const messages = await readMessages();
+  const current = messages.find((item) => item.id === req.params.messageId);
+  if (!current) {
+    return res.status(404).json({ error: 'Message not found' });
+  }
+
+  if (parseResult.data.scope === 'everyone' && current.senderId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'Only the sender can delete for everyone' });
+  }
+
+  const db = await getDb();
+  let nextMessage: Message;
+  if (parseResult.data.scope === 'everyone') {
+    nextMessage = {
+      ...current,
+      text: 'This message was deleted',
+      mediaUrls: [],
+      deletedForEveryone: true,
+      kind: 'text',
+    };
+  } else {
+    nextMessage = {
+      ...current,
+      deletedFor: [...new Set([...(current.deletedFor ?? []), parseResult.data.userId])],
+    };
+  }
+
+  if (!db) {
+    const index = seedMessages.findIndex((item) => item.id === current.id);
+    if (index >= 0) {
+      seedMessages[index] = nextMessage;
+    }
+  } else {
+    await seedDatabaseIfNeeded();
+    await collectionsFor(db).messages.replaceOne({ id: current.id }, nextMessage);
+  }
+
+  io.emit('message:deleted', {
+    message: nextMessage,
+    scope: parseResult.data.scope,
+    userId: parseResult.data.userId,
+  });
+  return res.json({ message: nextMessage });
 });
 
 app.patch('/api/messages/:messageId/receipt', async (req, res) => {
@@ -3041,7 +3363,11 @@ io.on('connection', (socket) => {
       if (!user) {
         return;
       }
-      io.emit('presence:changed', { userId, presence });
+      io.emit('presence:changed', {
+        userId,
+        presence: user.presence,
+        lastSeenAt: user.lastSeenAt ?? null,
+      });
     })();
   });
 
@@ -3084,18 +3410,22 @@ const port = Number(process.env.PORT ?? 4000);
 const host = process.env.HOST ?? '0.0.0.0';
 
 const startServer = async () => {
-  await getMongoClient();
+  if (!mongoUri) {
+    console.error('FATAL: MONGODB_ATLAS_URI (or MONGO_URI) is required. Refusing to start with mock/in-memory data.');
+    process.exit(1);
+  }
+
+  const client = await getMongoClient();
+  if (!client || mongoConnectionState !== 'connected') {
+    console.error('FATAL: Could not connect to MongoDB. Fix network/URI and restart. Mock data is disabled.');
+    process.exit(1);
+  }
+
   await seedDatabaseIfNeeded();
 
   server.listen(port, host, () => {
     console.log(`Running on http://${host}:${port}`);
-    console.log(
-      mongoConnectionState === 'connected'
-        ? 'Connected to MongoDB'
-        : mongoUri
-          ? 'MongoDB configured but using in-memory fallback'
-          : 'MongoDB not configured, using in-memory fallback',
-    );
+    console.log('Connected to MongoDB (persistent mode — no mock data)');
     console.log(`Media storage: ${MEDIA_STORAGE_MODE}${MEDIA_STORAGE_MODE === 'gcs' ? ` (bucket=${GCS_BUCKET || 'unset'})` : ''}`);
     console.log(`Socket.IO running on port ${port}`);
   });

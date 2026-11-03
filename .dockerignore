@@ -8,3 +8,4 @@ uploads
 .gitignore
 README*
 **/.DS_Store
+cloudbuild.yaml

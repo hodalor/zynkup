@@ -1,0 +1,43 @@
+# Optional Cloud Build config when deploying the backend folder as the build context.
+substitutions:
+  _SERVICE: zynkup-api
+  _REGION: europe-west9
+  _IMAGE: europe-west9-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE}
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - --no-cache
+      - -t
+      - ${_IMAGE}:$COMMIT_SHA
+      - -t
+      - ${_IMAGE}:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - --all-tags
+      - ${_IMAGE}
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - ${_SERVICE}
+      - --platform=managed
+      - --image=${_IMAGE}:$COMMIT_SHA
+      - --region=${_REGION}
+
+images:
+  - ${_IMAGE}:$COMMIT_SHA
+  - ${_IMAGE}:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY
