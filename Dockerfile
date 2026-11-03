@@ -34,10 +34,12 @@ ENV NODE_ENV=production
 ENV PORT=8080
 ENV HOST=0.0.0.0
 
-RUN useradd --system --uid 10001 --create-home zynkup
-COPY --from=build /app/package.json ./
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+RUN useradd --system --uid 10001 --create-home zynkup \
+  && mkdir -p /app/uploads /tmp/zynkup-uploads \
+  && chown -R zynkup:zynkup /app /tmp/zynkup-uploads
+COPY --from=build --chown=zynkup:zynkup /app/package.json ./
+COPY --from=build --chown=zynkup:zynkup /app/node_modules ./node_modules
+COPY --from=build --chown=zynkup:zynkup /app/dist ./dist
 
 USER zynkup
 EXPOSE 8080

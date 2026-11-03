@@ -269,7 +269,27 @@ const settingsMenu = [
 
 const DEFAULT_USER_ID = '';
 const DEFAULT_DB_NAME = process.env.MONGODB_DB_NAME ?? 'zynkup';
-const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
+
+const resolveUploadsDir = () => {
+  const candidates = [
+    process.env.UPLOADS_DIR ? path.resolve(process.env.UPLOADS_DIR) : '',
+    path.resolve(process.cwd(), 'uploads'),
+    '/tmp/zynkup-uploads',
+  ].filter(Boolean);
+
+  for (const directory of candidates) {
+    try {
+      fs.mkdirSync(directory, { recursive: true });
+      return directory;
+    } catch (error) {
+      console.warn(`Uploads directory not writable (${directory}):`, error instanceof Error ? error.message : error);
+    }
+  }
+
+  throw new Error('No writable uploads directory. Set UPLOADS_DIR to a writable path.');
+};
+
+const UPLOADS_DIR = resolveUploadsDir();
 const STATIC_UPLOAD_PREFIX = '/uploads';
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID ?? '';
 const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY ?? '';
@@ -567,7 +587,6 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 app.use(morgan('dev'));
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 app.use(STATIC_UPLOAD_PREFIX, express.static(UPLOADS_DIR));
 
 const storage = multer.diskStorage({
