@@ -3,20 +3,35 @@ import QRCode from 'qrcode';
 import { io, Socket } from 'socket.io-client';
 import './App.css';
 
-type View = 'chats' | 'catalog' | 'settings' | 'updates';
+type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates';
 type ReceiptState = 'sent' | 'delivered' | 'read';
+type SettingsPanelId =
+  | 'favorites'
+  | 'business'
+  | 'history'
+  | 'account'
+  | 'privacy'
+  | 'chats'
+  | 'notifications'
+  | 'storage'
+  | 'help'
+  | '';
 
 type Message = {
   id: string;
   clientRef?: string;
   sender: 'me' | 'other';
-  kind: 'text' | 'image' | 'voice' | 'file';
+  kind: 'text' | 'image' | 'voice' | 'file' | 'video';
   text: string;
   time: string;
   imageUrl?: string;
   audioUrl?: string;
+  videoUrl?: string;
   durationLabel?: string;
   receiptState?: ReceiptState;
+  replyToMessageId?: string;
+  replyPreview?: string;
+  deletedForEveryone?: boolean;
 };
 
 type Chat = {
@@ -26,6 +41,7 @@ type Chat = {
   time: string;
   unread: number;
   presence: string;
+  lastSeenAt?: string;
   peerUserId?: string;
 };
 
@@ -90,6 +106,8 @@ type AppUser = {
   name: string;
   avatar: string;
   phone: string;
+  presence?: string;
+  lastSeenAt?: string;
 };
 
 type LinkedDevice = {
@@ -121,27 +139,47 @@ type UpdateGroup = {
   }>;
 };
 
-const API_BASE_URL = 'http://localhost:4000';
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:4000';
 const DEVICE_STORAGE_KEY = 'zynkup-web-device-id';
+const SETTINGS_STORAGE_KEY = 'zynkup-web-app-settings';
+const FAVORITES_STORAGE_KEY = 'zynkup-web-favorite-chats';
+const MUTED_CHATS_STORAGE_KEY = 'zynkup-web-muted-chats';
+const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-web-archived-chats';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const STATUS_REACTIONS = ['❤️', '👍', '👎', '🔥', '😂'];
 
+const DEFAULT_APP_SETTINGS = {
+  enterIsSend: true,
+  mediaAutoDownload: true,
+  messageNotifications: true,
+  showNotificationPreview: true,
+  conversationTones: true,
+  saveToCameraRoll: false,
+  lowDataMode: false,
+  lastSeenPrivacy: 'everyone' as const,
+  profilePhotoPrivacy: 'everyone' as const,
+  aboutPrivacy: 'everyone' as const,
+  statusPrivacy: 'contacts' as const,
+  readReceiptsEnabled: true,
+  appLockEnabled: false,
+};
+
+const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
+  { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top' },
+  { id: 'business', title: 'Business tools', subtitle: 'Catalog and seller shortcuts' },
+  { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations' },
+  { id: 'account', title: 'Account', subtitle: 'Profile and security' },
+  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, status' },
+  { id: 'chats', title: 'Chats', subtitle: 'Enter is send and media' },
+  { id: 'notifications', title: 'Notifications', subtitle: 'Message alerts and previews' },
+  { id: 'storage', title: 'Storage and data', subtitle: 'Network usage and cache' },
+  { id: 'help', title: 'Help and feedback', subtitle: 'FAQ and support' },
+];
+
 const initialChats: Chat[] = [];
 
 const initialCatalogItems: CatalogItem[] = [];
-
-const settingsSections = [
-  'Favorites',
-  'Business tools',
-  'Chat history',
-  'Account',
-  'Privacy',
-  'Chats',
-  'Notifications',
-  'Storage and data',
-  'Help and feedback',
-];
 
 const categories = ['All', 'Fashion', 'Phones', 'Home', 'Electronics'];
 const emojiChoices = ['😀', '😂', '🤣', '😍', '🔥', '🙏', '🎉', '❤️'];
@@ -186,16 +224,48 @@ const getChatTitle = (chat: any, userId: string, userList: AppUser[]) => {
   return userList.find((user) => user.id === peerId)?.name ?? chat.title;
 };
 
-const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => ({
-  id: chat.id,
-  name: getChatTitle(chat, userId, userList),
-  preview: chat.lastMessagePreview,
-  time: formatClock(chat.updatedAt ?? new Date().toISOString()),
-  unread: chat.unreadCount ?? 0,
-  presence: 'online',
-  peerUserId: chat.kind === 'direct'
+const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => {
+  const peerUserId = chat.kind === 'direct'
     ? (chat.participants ?? []).find((participantId: string) => participantId !== userId)
+    : undefined;
+  const peer = peerUserId ? userList.find((user) => user.id === peerUserId) : undefined;
+  return {
+    id: chat.id,
+    name: getChatTitle(chat, userId, userList),
+    preview: chat.lastMessagePreview,
+    time: formatClock(chat.updatedAt ?? new Date().toISOString()),
+    unread: chat.unreadCount ?? 0,
+    presence: peer?.presence ?? 'offline',
+    lastSeenAt: peer?.lastSeenAt,
+    peerUserId,
+  };
+};
+
+const mapServerMessage = (message: any, userId: string): Message => ({
+  id: message.id,
+  clientRef: message.clientRef,
+  sender: message.senderId === userId ? 'me' : 'other',
+  kind: message.deletedForEveryone
+    ? 'text'
+    : message.kind === 'emoji'
+      ? 'text'
+      : message.kind,
+  text: message.text,
+  time: formatClock(message.sentAt),
+  imageUrl: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
+  audioUrl: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
+  videoUrl: message.deletedForEveryone
+    ? undefined
+    : message.kind === 'video'
+      ? message.mediaUrls?.[0]
+      : undefined,
+  durationLabel: message.durationSeconds
+    ? `0:${String(message.durationSeconds).padStart(2, '0')}`
     : undefined,
+  receiptState: message.state,
+  replyToMessageId: message.replyToMessageId,
+  replyPreview: message.replyPreview,
+  deletedForEveryone: Boolean(message.deletedForEveryone),
 });
 
 const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
@@ -276,6 +346,18 @@ function App() {
     phone: '+260765453163',
     photoUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
   });
+  const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
+  const [settingsPanel, setSettingsPanel] = useState<SettingsPanelId>('account');
+  const [favoriteChatIds, setFavoriteChatIds] = useState<string[]>([]);
+  const [mutedChatIds, setMutedChatIds] = useState<string[]>([]);
+  const [archivedChatIds, setArchivedChatIds] = useState<string[]>([]);
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+  const [showArchivedChats, setShowArchivedChats] = useState(false);
+  const [replyTarget, setReplyTarget] = useState<Message | null>(null);
+  const [messageActionTarget, setMessageActionTarget] = useState<Message | null>(null);
+  const [peerTypingByChat, setPeerTypingByChat] = useState<Record<string, boolean>>({});
+  const [toastMessage, setToastMessage] = useState('');
+  const [feedbackDraft, setFeedbackDraft] = useState('');
   const [catalogForm, setCatalogForm] = useState({
     title: '',
     price: '',
@@ -284,18 +366,23 @@ function App() {
   });
   const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({});
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const profilePhotoInputRef = useRef<HTMLInputElement | null>(null);
   const statusInputRef = useRef<HTMLInputElement | null>(null);
   const catalogInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
+  const typingTimeoutRef = useRef<number | null>(null);
+  const toastTimeoutRef = useRef<number | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const callMediaStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const applyBootstrapRef = useRef<(payload: any) => void>(() => undefined);
+  const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
+  const mutedChatIdsRef = useRef<string[]>([]);
   const updatesFeedRef = useRef<UpdateGroup[]>([]);
   const statusGroupIndexRef = useRef<number | null>(null);
   const statusItemIndexRef = useRef(0);
@@ -314,6 +401,22 @@ function App() {
     statusReactorsVisible ||
     Boolean(statusCommentDraft.trim()) ||
     Boolean(editingStatusCommentId);
+  const visibleChatItems = useMemo(() => {
+    const query = chatSearchQuery.trim().toLowerCase();
+    const scoped = chatItems.filter((chat) => {
+      const archived = archivedChatIds.includes(chat.id);
+      if (showArchivedChats ? !archived : archived) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      return chat.name.toLowerCase().includes(query) || (chat.preview || '').toLowerCase().includes(query);
+    });
+    const favorites = scoped.filter((chat) => favoriteChatIds.includes(chat.id));
+    const rest = scoped.filter((chat) => !favoriteChatIds.includes(chat.id));
+    return [...favorites, ...rest];
+  }, [archivedChatIds, chatItems, chatSearchQuery, favoriteChatIds, showArchivedChats]);
   const filteredCatalogItems = useMemo(() => {
     return catalogItems.filter((item) => {
       const matchesCategory = catalogCategory === 'All' || item.category === catalogCategory;
@@ -439,18 +542,7 @@ function App() {
           item.id === incomingMessage.id ||
           (incomingMessage.clientRef && item.clientRef === incomingMessage.clientRef),
       );
-      const mapped = {
-        id: incomingMessage.id,
-        clientRef: incomingMessage.clientRef,
-        sender: incomingMessage.senderId === currentUserId ? 'me' : 'other',
-        kind: incomingMessage.kind === 'emoji' ? 'text' : incomingMessage.kind,
-        text: incomingMessage.text,
-        time: formatClock(incomingMessage.sentAt),
-        imageUrl: incomingMessage.mediaUrls?.[0],
-        audioUrl: incomingMessage.mediaUrls?.[0],
-        durationLabel: incomingMessage.durationSeconds ? `0:${String(incomingMessage.durationSeconds).padStart(2, '0')}` : undefined,
-        receiptState: incomingMessage.state,
-      } satisfies Message;
+      const mapped = mapServerMessage(incomingMessage, currentUserId);
 
       if (existingIndex >= 0) {
         const next = [...existing];
@@ -514,6 +606,219 @@ function App() {
     }).catch(() => undefined);
   };
 
+  const showToast = (message: string, duration = 2200) => {
+    setToastMessage(message);
+    if (toastTimeoutRef.current) {
+      window.clearTimeout(toastTimeoutRef.current);
+    }
+    toastTimeoutRef.current = window.setTimeout(() => setToastMessage(''), duration);
+  };
+
+  const persistAppSettings = async (nextSettings: typeof DEFAULT_APP_SETTINGS) => {
+    appSettingsRef.current = nextSettings;
+    setAppSettings(nextSettings);
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings));
+  };
+
+  const persistFavorites = (next: string[]) => {
+    setFavoriteChatIds(next);
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const persistMuted = (next: string[]) => {
+    mutedChatIdsRef.current = next;
+    setMutedChatIds(next);
+    localStorage.setItem(MUTED_CHATS_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const persistArchived = (next: string[]) => {
+    setArchivedChatIds(next);
+    localStorage.setItem(ARCHIVED_CHATS_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const saveProfileToServer = async (
+    overrides: Partial<typeof profile> = {},
+    settingsOverrides: Partial<typeof DEFAULT_APP_SETTINGS> = {},
+  ) => {
+    if (!currentUserId) {
+      showToast('Link your phone first to sync settings.');
+      return false;
+    }
+    const nextProfile = { ...profile, ...overrides };
+    const nextSettings = { ...appSettingsRef.current, ...settingsOverrides };
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/profile?userId=${encodeURIComponent(currentUserId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: nextProfile.name.trim() || undefined,
+          about: nextProfile.about.trim() || 'Hey there! I am using ZynkUp.',
+          phone: nextProfile.phone.trim() || undefined,
+          photoUri: nextProfile.photoUrl || '',
+          lastSeenPrivacy: nextSettings.lastSeenPrivacy,
+          profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
+          aboutPrivacy: nextSettings.aboutPrivacy,
+          statusPrivacy: nextSettings.statusPrivacy,
+          readReceiptsEnabled: nextSettings.readReceiptsEnabled,
+          appLockEnabled: nextSettings.appLockEnabled,
+        }),
+      });
+      if (!response.ok) {
+        showToast('Could not save settings.');
+        return false;
+      }
+      const payload = await response.json();
+      if (payload.profile) {
+        setProfile((current) => ({
+          ...current,
+          name: payload.profile.name ?? current.name,
+          about: payload.profile.about ?? current.about,
+          phone: payload.profile.phone ?? current.phone,
+          photoUrl: payload.profile.photoUri || current.photoUrl,
+        }));
+      }
+      showToast('Settings saved');
+      return true;
+    } catch {
+      showToast('Network error while saving settings.');
+      return false;
+    }
+  };
+
+  const updateAppSetting = <K extends keyof typeof DEFAULT_APP_SETTINGS>(
+    key: K,
+    value: (typeof DEFAULT_APP_SETTINGS)[K],
+    options: { syncProfile?: boolean } = {},
+  ) => {
+    const next = { ...appSettingsRef.current, [key]: value };
+    void persistAppSettings(next);
+    showToast('Setting updated', 1400);
+    if (options.syncProfile) {
+      void saveProfileToServer({}, { [key]: value } as Partial<typeof DEFAULT_APP_SETTINGS>);
+    }
+  };
+
+  const toggleFavoriteChat = (chatId: string) => {
+    const exists = favoriteChatIds.includes(chatId);
+    persistFavorites(exists ? favoriteChatIds.filter((id) => id !== chatId) : [chatId, ...favoriteChatIds]);
+    showToast(exists ? 'Removed from favorites' : 'Added to favorites');
+  };
+
+  const toggleMuteChat = (chatId: string) => {
+    const exists = mutedChatIds.includes(chatId);
+    persistMuted(exists ? mutedChatIds.filter((id) => id !== chatId) : [chatId, ...mutedChatIds]);
+    showToast(exists ? 'Chat unmuted' : 'Chat muted');
+  };
+
+  const toggleArchiveChat = (chatId: string) => {
+    const exists = archivedChatIds.includes(chatId);
+    persistArchived(exists ? archivedChatIds.filter((id) => id !== chatId) : [chatId, ...archivedChatIds]);
+    showToast(exists ? 'Chat unarchived' : 'Chat archived');
+  };
+
+  const clearChatUnread = (chatId: string) => {
+    if (!chatId || !currentUserId) {
+      return;
+    }
+    setChatItems((current) => current.map((chat) => (chat.id === chatId ? { ...chat, unread: 0 } : chat)));
+    fetch(`${API_BASE_URL}/api/chats/${encodeURIComponent(chatId)}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId }),
+    }).catch(() => undefined);
+  };
+
+  const emitTyping = (typing: boolean) => {
+    if (!socketRef.current || !selectedChatId || !currentUserId) {
+      return;
+    }
+    socketRef.current.emit('typing:update', {
+      chatId: selectedChatId,
+      userId: currentUserId,
+      typing,
+    });
+  };
+
+  const getPresenceLabel = (chat: Chat | null) => {
+    if (!chat) {
+      return 'offline';
+    }
+    if (peerTypingByChat[chat.id]) {
+      return 'typing…';
+    }
+    const peer = users.find((user) => user.id === chat.peerUserId);
+    if (peer?.presence === 'online' || peer?.presence === 'typing') {
+      return peer.presence === 'typing' ? 'typing…' : 'online';
+    }
+    if (peer?.lastSeenAt || chat.lastSeenAt) {
+      return `last seen ${formatClock(peer?.lastSeenAt || chat.lastSeenAt || '')}`;
+    }
+    return chat.presence || 'offline';
+  };
+
+  const clearChatHistory = () => {
+    if (!window.confirm('Clear all local chat history on this browser?')) {
+      return;
+    }
+    setMessagesByChat({});
+    setChatItems((current) => current.map((chat) => ({ ...chat, preview: 'No messages yet', unread: 0, time: '' })));
+    showToast('Chat history cleared');
+  };
+
+  const deleteMessage = async (message: Message, scope: 'me' | 'everyone' = 'me') => {
+    if (!message?.id || !currentUserId || !activeChat) {
+      return;
+    }
+    if (scope === 'me') {
+      setMessagesByChat((current) => ({
+        ...current,
+        [activeChat.id]: (current[activeChat.id] ?? []).filter((item) => item.id !== message.id),
+      }));
+    }
+    const response = await fetch(`${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, scope }),
+    }).catch(() => null);
+    if (!response?.ok && scope === 'everyone') {
+      showToast('Could not delete for everyone');
+      return;
+    }
+    showToast(scope === 'everyone' ? 'Deleted for everyone' : 'Deleted for you');
+    setMessageActionTarget(null);
+  };
+
+  const forwardMessage = async (message: Message) => {
+    const peers = chatItems.filter((chat) => chat.id !== activeChat?.id).slice(0, 8);
+    if (!peers.length) {
+      showToast('No other chat to forward into yet.');
+      return;
+    }
+    const choice = window.prompt(
+      `Forward to chat number:\n${peers.map((chat, index) => `${index + 1}. ${chat.name}`).join('\n')}`,
+      '1',
+    );
+    const index = Number(choice) - 1;
+    const target = peers[index];
+    if (!target) {
+      return;
+    }
+    fetch(`${API_BASE_URL}/api/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chatId: target.id,
+        senderId: currentUserId,
+        clientRef: `fwd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        kind: message.kind === 'image' || message.kind === 'voice' || message.kind === 'video' ? message.kind : 'text',
+        text: message.text || 'Forwarded message',
+        mediaUrls: [message.imageUrl || message.audioUrl || message.videoUrl].filter(Boolean),
+      }),
+    }).catch(() => undefined);
+    showToast(`Forwarded to ${target.name}`);
+    setMessageActionTarget(null);
+  };
+
   const applyBootstrap = useCallback((payload: any) => {
     setAuthRequired(Boolean(payload.authRequired));
     setCurrentUserId(payload.currentUserId ?? '');
@@ -524,11 +829,35 @@ function App() {
       name: payload.profile?.name ?? 'Temwa Lesa',
       about: payload.profile?.about ?? '',
       phone: payload.profile?.phone ?? '',
-      photoUrl: payload.profile?.avatar?.startsWith?.('http')
-        ? payload.profile.avatar
-        : 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
+      photoUrl:
+        payload.profile?.photoUri ||
+        (payload.profile?.avatar?.startsWith?.('http')
+          ? payload.profile.avatar
+          : 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80'),
     });
-    const nextChats = (payload.chats ?? []).map((chat: any) => mapChatFromServer(chat, payload.currentUserId ?? 'u1', nextUsers));
+    if (payload.profile) {
+      setAppSettings((current) => {
+        const next = {
+          ...current,
+          lastSeenPrivacy: payload.profile.lastSeenPrivacy ?? current.lastSeenPrivacy,
+          profilePhotoPrivacy: payload.profile.profilePhotoPrivacy ?? current.profilePhotoPrivacy,
+          aboutPrivacy: payload.profile.aboutPrivacy ?? current.aboutPrivacy,
+          statusPrivacy: payload.profile.statusPrivacy ?? current.statusPrivacy,
+          readReceiptsEnabled:
+            payload.profile.readReceiptsEnabled == null
+              ? current.readReceiptsEnabled
+              : Boolean(payload.profile.readReceiptsEnabled),
+          appLockEnabled:
+            payload.profile.appLockEnabled == null
+              ? current.appLockEnabled
+              : Boolean(payload.profile.appLockEnabled),
+        };
+        appSettingsRef.current = next;
+        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
+        return next;
+      });
+    }
+    const nextChats = (payload.chats ?? []).map((chat: any) => mapChatFromServer(chat, payload.currentUserId ?? '', nextUsers));
     setChatItems(nextChats);
     setSelectedChatId((current) =>
       nextChats.some((chat: Chat) => chat.id === current) ? current : nextChats[0]?.id ?? '',
@@ -537,18 +866,7 @@ function App() {
       Object.fromEntries(
         Object.entries(payload.messagesByChat ?? {}).map(([chatId, messageList]) => [
           chatId,
-          (messageList as any[]).map((message) => ({
-            id: message.id,
-            clientRef: message.clientRef,
-            sender: message.senderId === (payload.currentUserId ?? 'u1') ? 'me' : 'other',
-            kind: message.kind === 'emoji' ? 'text' : message.kind,
-            text: message.text,
-            time: formatClock(message.sentAt),
-            imageUrl: message.mediaUrls?.[0],
-            audioUrl: message.mediaUrls?.[0],
-            durationLabel: message.durationSeconds ? `0:${String(message.durationSeconds).padStart(2, '0')}` : undefined,
-            receiptState: message.state,
-          })),
+          (messageList as any[]).map((message) => mapServerMessage(message, payload.currentUserId ?? '')),
         ]),
       ),
     );
@@ -563,12 +881,12 @@ function App() {
         imageUrl: item.imageUrls?.[0] ?? '',
       })),
     );
-    const nextCalls = (payload.calls ?? []).map((call: any) => mapCallFromServer(call, payload.currentUserId ?? 'u1', nextUsers));
+    const nextCalls = (payload.calls ?? []).map((call: any) => mapCallFromServer(call, payload.currentUserId ?? '', nextUsers));
     setCalls(nextCalls);
     const liveCall = nextCalls.find((call: CallItem) => call.state === 'ongoing' || call.state === 'ringing') ?? null;
     setActiveCall(liveCall);
     setIncomingCall(
-      nextCalls.find((call: CallItem) => call.state === 'ringing' && call.initiatorId !== (payload.currentUserId ?? 'u1')) ?? null,
+      nextCalls.find((call: CallItem) => call.state === 'ringing' && call.initiatorId !== (payload.currentUserId ?? '')) ?? null,
     );
     setStatuses(payload.statuses ?? []);
     setUpdatesFeed(payload.updatesFeed ?? []);
@@ -863,13 +1181,74 @@ function App() {
       reconcileIncomingMessage(message.chatId, message);
 
       if (message.senderId !== currentUserId) {
+        const viewingChat = activeView === 'chats' && message.chatId === selectedChatId;
+        const settings = appSettingsRef.current;
         void syncReceiptState(
           message.id,
-          activeView === 'chats' && message.chatId === selectedChatId ? 'read' : 'delivered',
+          viewingChat && settings.readReceiptsEnabled ? 'read' : 'delivered',
         );
+        if (
+          settings.messageNotifications &&
+          !viewingChat &&
+          !mutedChatIdsRef.current.includes(message.chatId) &&
+          typeof Notification !== 'undefined'
+        ) {
+          const preview = settings.showNotificationPreview
+            ? message.text || 'New message'
+            : 'New message';
+          if (Notification.permission === 'granted') {
+            new Notification('ZynkUp', { body: preview });
+          } else {
+            showToast(preview);
+          }
+        } else if (settings.messageNotifications && !viewingChat && !mutedChatIdsRef.current.includes(message.chatId)) {
+          showToast(settings.showNotificationPreview ? message.text || 'New message' : 'New message');
+        }
       }
     });
+    socket.on('message:deleted', ({ message, scope, userId }) => {
+      if (!message?.chatId) {
+        return;
+      }
+      if (scope === 'me' && userId !== currentUserId) {
+        return;
+      }
+      if (scope === 'me') {
+        setMessagesByChat((current) => ({
+          ...current,
+          [message.chatId]: (current[message.chatId] ?? []).filter((item) => item.id !== message.id),
+        }));
+        return;
+      }
+      reconcileIncomingMessage(message.chatId, message);
+    });
+    socket.on('typing:update', ({ chatId, userId, typing }) => {
+      if (!chatId || userId === currentUserId) {
+        return;
+      }
+      setPeerTypingByChat((current) => ({ ...current, [chatId]: Boolean(typing) }));
+    });
+    socket.on('presence:changed', ({ userId, presence, lastSeenAt }) => {
+      if (!userId) {
+        return;
+      }
+      setUsers((current) =>
+        current.map((user) =>
+          user.id === userId ? { ...user, presence, lastSeenAt: lastSeenAt ?? user.lastSeenAt } : user,
+        ),
+      );
+      setChatItems((current) =>
+        current.map((chat) =>
+          chat.peerUserId === userId
+            ? { ...chat, presence, lastSeenAt: lastSeenAt ?? chat.lastSeenAt }
+            : chat,
+        ),
+      );
+    });
     socket.on('chat:updated', (chat) => {
+      if (chat.viewerUserId && chat.viewerUserId !== currentUserId) {
+        return;
+      }
       setChatItems((current) =>
         current.map((item) =>
           item.id === chat.id
@@ -1011,14 +1390,73 @@ function App() {
       upsertStatus(status);
     });
 
+    if (currentUserId) {
+      socket.emit('presence:update', { userId: currentUserId, presence: 'online' });
+    }
+
     return () => {
+      if (currentUserId) {
+        socket.emit('presence:update', { userId: currentUserId, presence: 'offline' });
+      }
       socket.disconnect();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, currentDeviceId, currentUserId, ensurePeerConnection, profile.name, reconcileIncomingMessage, selectedChatId, upsertCall, upsertStatus, users]);
 
   useEffect(() => {
-    if (activeView !== 'chats') {
+    try {
+      const storedSettings = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      const storedFavorites = localStorage.getItem(FAVORITES_STORAGE_KEY);
+      const storedMuted = localStorage.getItem(MUTED_CHATS_STORAGE_KEY);
+      const storedArchived = localStorage.getItem(ARCHIVED_CHATS_STORAGE_KEY);
+      if (storedSettings) {
+        const next = { ...DEFAULT_APP_SETTINGS, ...JSON.parse(storedSettings) };
+        appSettingsRef.current = next;
+        setAppSettings(next);
+      }
+      if (storedFavorites) {
+        const parsed = JSON.parse(storedFavorites);
+        if (Array.isArray(parsed)) {
+          setFavoriteChatIds(parsed);
+        }
+      }
+      if (storedMuted) {
+        const parsed = JSON.parse(storedMuted);
+        if (Array.isArray(parsed)) {
+          mutedChatIdsRef.current = parsed;
+          setMutedChatIds(parsed);
+        }
+      }
+      if (storedArchived) {
+        const parsed = JSON.parse(storedArchived);
+        if (Array.isArray(parsed)) {
+          setArchivedChatIds(parsed);
+        }
+      }
+    } catch {
+      // Keep defaults.
+    }
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      void Notification.requestPermission().catch(() => undefined);
+    }
+  }, []);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || activeView !== 'chats' || !selectedChatId) {
+      return undefined;
+    }
+    socket.emit('chat:join', selectedChatId);
+    clearChatUnread(selectedChatId);
+    return () => {
+      socket.emit('chat:leave', selectedChatId);
+      emitTyping(false);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, selectedChatId]);
+
+  useEffect(() => {
+    if (activeView !== 'chats' || !appSettings.readReceiptsEnabled) {
       return;
     }
 
@@ -1027,7 +1465,7 @@ function App() {
       .forEach((message) => {
         void syncReceiptState(message.id, 'read');
       });
-  }, [activeView, messagesByChat, selectedChatId]);
+  }, [activeView, appSettings.readReceiptsEnabled, messagesByChat, selectedChatId]);
 
   useEffect(() => {
     if (!activeStatusId) {
@@ -1233,20 +1671,23 @@ function App() {
       return;
     }
 
-    const optimistic = {
+    const optimistic: Message = {
       id: `local-${Date.now()}`,
       clientRef: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      sender: 'me' as const,
-      kind: 'text' as const,
+      sender: 'me',
+      kind: 'text',
       text: messageDraft.trim(),
       time: 'Now',
-      receiptState: 'sent' as const,
+      receiptState: 'sent',
+      replyToMessageId: replyTarget?.id,
+      replyPreview: replyTarget?.text?.slice(0, 140),
     };
 
     setMessagesByChat((current) => ({
       ...current,
       [activeChat.id]: [...(current[activeChat.id] ?? []), optimistic],
     }));
+    emitTyping(false);
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1257,9 +1698,12 @@ function App() {
         kind: 'text',
         text: messageDraft.trim(),
         mediaUrls: [],
+        replyToMessageId: replyTarget?.id,
+        replyPreview: replyTarget?.text?.slice(0, 140),
       }),
     }).catch(() => undefined);
     setMessageDraft('');
+    setReplyTarget(null);
   };
 
   const addCatalogItem = async () => {
@@ -1646,25 +2090,54 @@ function App() {
         </header>
 
         <div className="search-box desktop-search">
-          <input aria-label="Search chats" placeholder="Search" />
+          <input
+            aria-label="Search chats"
+            onChange={(event) => setChatSearchQuery(event.target.value)}
+            placeholder="Search"
+            value={chatSearchQuery}
+          />
         </div>
 
+        {archivedChatIds.length ? (
+          <button className="archive-toggle" onClick={() => setShowArchivedChats((current) => !current)} type="button">
+            {showArchivedChats ? 'Back to chats' : `Archived (${archivedChatIds.length})`}
+          </button>
+        ) : null}
+
         <div className="chat-list desktop-chat-list">
-          {chatItems.map((chat) => (
+          {visibleChatItems.map((chat) => (
             <button
               className={`chat-list-item desktop-chat-item ${chat.id === activeChat?.id ? 'active' : ''}`}
               key={chat.id}
               onClick={() => setSelectedChatId(chat.id)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                const action = window.prompt(
+                  `${chat.name}\n1 Pin/Unpin\n2 Mute/Unmute\n3 Archive/Unarchive`,
+                  '1',
+                );
+                if (action === '1') {
+                  toggleFavoriteChat(chat.id);
+                } else if (action === '2') {
+                  toggleMuteChat(chat.id);
+                } else if (action === '3') {
+                  toggleArchiveChat(chat.id);
+                }
+              }}
               type="button"
             >
               <div className="avatar desktop-avatar">{chat.name.slice(0, 2).toUpperCase()}</div>
               <div className="chat-copy">
                 <div className="chat-topline">
-                  <strong>{chat.name}</strong>
+                  <strong>
+                    {favoriteChatIds.includes(chat.id) ? '★ ' : ''}
+                    {chat.name}
+                    {mutedChatIds.includes(chat.id) ? ' 🔕' : ''}
+                  </strong>
                   <span>{chat.time}</span>
                 </div>
                 <div className="chat-bottomline">
-                  <span>{chat.preview}</span>
+                  <span>{peerTypingByChat[chat.id] ? 'typing…' : chat.preview}</span>
                   {chat.unread > 0 ? <em>{chat.unread}</em> : null}
                 </div>
               </div>
@@ -1681,10 +2154,25 @@ function App() {
             <div className="avatar desktop-avatar">{activeChat.name.slice(0, 2).toUpperCase()}</div>
             <div>
               <strong>{activeChat.name}</strong>
-              <small>{activeChat.presence}</small>
+              <small>{getPresenceLabel(activeChat)}</small>
             </div>
           </div>
           <div className="desktop-chat-actions">
+            <button
+              onClick={() => {
+                const action = window.prompt('1 Mute  2 Archive  3 Pin', '1');
+                if (action === '1') {
+                  toggleMuteChat(activeChat.id);
+                } else if (action === '2') {
+                  toggleArchiveChat(activeChat.id);
+                } else if (action === '3') {
+                  toggleFavoriteChat(activeChat.id);
+                }
+              }}
+              type="button"
+            >
+              ⋮
+            </button>
             <button onClick={() => setActiveView('catalog')} type="button">🏬</button>
             <button onClick={() => setCallSheetVisible(true)} type="button">☎</button>
           </div>
@@ -1692,7 +2180,17 @@ function App() {
 
         <section className="desktop-canvas">
           {messages.map((message) => (
-            <article className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'}`} key={message.id}>
+            <article
+              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''}`}
+              key={message.id}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                if (!message.deletedForEveryone) {
+                  setMessageActionTarget(message);
+                }
+              }}
+            >
+              {message.replyPreview ? <div className="reply-quote">{message.replyPreview}</div> : null}
               {message.kind === 'image' && message.imageUrl ? (
                 <button className="message-image-button" onClick={() => setMediaViewer(message.imageUrl ?? null)} type="button">
                   <img alt={message.text} className="message-image" src={message.imageUrl} />
@@ -1708,16 +2206,39 @@ function App() {
               {message.kind !== 'voice' ? <p>{message.text}</p> : null}
               <div className="message-meta">
                 <span>{message.time}</span>
-                {renderReceipt(message)}
+                {appSettings.readReceiptsEnabled ? renderReceipt(message) : null}
               </div>
             </article>
           ))}
         </section>
 
+        {replyTarget ? (
+          <div className="reply-composer-bar">
+            <div>
+              <strong>Replying</strong>
+              <span>{replyTarget.text}</span>
+            </div>
+            <button onClick={() => setReplyTarget(null)} type="button">✕</button>
+          </div>
+        ) : null}
+
         <footer className="composer desktop-composer">
           <textarea
             aria-label="Message composer"
-            onChange={(event) => setMessageDraft(event.target.value)}
+            onChange={(event) => {
+              setMessageDraft(event.target.value);
+              emitTyping(true);
+              if (typingTimeoutRef.current) {
+                window.clearTimeout(typingTimeoutRef.current);
+              }
+              typingTimeoutRef.current = window.setTimeout(() => emitTyping(false), 1200);
+            }}
+            onKeyDown={(event) => {
+              if (appSettings.enterIsSend && event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+              }
+            }}
             placeholder="Type a message"
             rows={1}
             className="desktop-message-input"
@@ -1752,6 +2273,40 @@ function App() {
         )}
       </main>
     </>
+  );
+
+  const renderCallsView = () => (
+    <main className="panel-shell">
+      <header className="panel-header">
+        <div>
+          <h2>Calls</h2>
+          <p>Recent audio and video calls synced from your account.</p>
+        </div>
+      </header>
+      <section className="calls-list">
+        {calls.length ? calls.map((call) => (
+          <article className="call-history-row" key={call.id}>
+            <div>
+              <strong>{call.peerName}</strong>
+              <small>{call.kind} · {call.state} · {formatClock(call.startedAt)}</small>
+            </div>
+            <button
+              onClick={() => {
+                const chat = chatItems.find((item) => item.peerUserId === call.peerUserId);
+                if (chat) {
+                  setSelectedChatId(chat.id);
+                  setActiveView('chats');
+                  setCallSheetVisible(true);
+                }
+              }}
+              type="button"
+            >
+              Call again
+            </button>
+          </article>
+        )) : <p>No calls yet. Start one from a chat header.</p>}
+      </section>
+    </main>
   );
 
   const renderCatalogView = () => (
@@ -1837,32 +2392,199 @@ function App() {
     </main>
   );
 
-  const renderSettingsView = () => (
-    <main className="settings-shell">
-      <aside className="settings-menu">
-        <h2>Settings</h2>
-        <input placeholder="Search" />
-        <div className="settings-user">
-          <img alt={profile.name} src={profile.photoUrl} />
-          <strong>{profile.name}</strong>
-        </div>
-        <div className="settings-links">
-          {settingsSections.map((section) => (
-            <button key={section} type="button">{section}</button>
-          ))}
-        </div>
-        <button className="settings-auth-button" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">
-          Refresh Linked Devices
-        </button>
-      </aside>
+  const renderSettingsToggle = (
+    label: string,
+    value: boolean,
+    onChange: (next: boolean) => void,
+    helper?: string,
+  ) => (
+    <label className="settings-toggle-row">
+      <span>
+        <strong>{label}</strong>
+        {helper ? <small>{helper}</small> : null}
+      </span>
+      <input checked={value} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+    </label>
+  );
 
-      <section className="settings-profile">
+  const renderPrivacyChoice = (
+    label: string,
+    key: 'lastSeenPrivacy' | 'profilePhotoPrivacy' | 'aboutPrivacy' | 'statusPrivacy',
+    options: Array<{ value: string; label: string }>,
+  ) => (
+    <div className="settings-choice-block">
+      <strong>{label}</strong>
+      <div className="settings-choice-row">
+        {options.map((option) => (
+          <button
+            className={appSettings[key] === option.value ? 'active' : ''}
+            key={`${key}-${option.value}`}
+            onClick={() => updateAppSetting(key, option.value as any, { syncProfile: true })}
+            type="button"
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderSettingsPanelBody = () => {
+    if (settingsPanel === 'favorites') {
+      return (
+        <>
+          <p>Favorite chats stay pinned at the top of Chats.</p>
+          {chatItems.map((chat) => (
+            <button className="settings-list-row" key={chat.id} onClick={() => toggleFavoriteChat(chat.id)} type="button">
+              <span>{chat.name}</span>
+              <strong>{favoriteChatIds.includes(chat.id) ? '★' : '☆'}</strong>
+            </button>
+          ))}
+        </>
+      );
+    }
+    if (settingsPanel === 'business') {
+      return (
+        <>
+          <button className="settings-list-row" onClick={() => setActiveView('catalog')} type="button">Open catalog</button>
+          <div className="business-panel">
+            <h3>Add Catalog Item</h3>
+            <button onClick={() => catalogInputRef.current?.click()} type="button">Upload Catalog Images</button>
+            <input onChange={(event) => setCatalogForm((current) => ({ ...current, title: event.target.value }))} placeholder="Product title" value={catalogForm.title} />
+            <input onChange={(event) => setCatalogForm((current) => ({ ...current, price: event.target.value }))} placeholder="Price" value={catalogForm.price} />
+            <input onChange={(event) => setCatalogForm((current) => ({ ...current, category: event.target.value }))} placeholder="Category" value={catalogForm.category} />
+            <textarea onChange={(event) => setCatalogForm((current) => ({ ...current, description: event.target.value }))} placeholder="Description" value={catalogForm.description} />
+            <button onClick={() => void addCatalogItem()} type="button">Add To Catalog</button>
+          </div>
+        </>
+      );
+    }
+    if (settingsPanel === 'history') {
+      return (
+        <>
+          <button className="settings-list-row" onClick={() => showToast(`Export ready: ${chatItems.length} chats`)} type="button">
+            Export chat
+          </button>
+          <button className="settings-list-row danger" onClick={clearChatHistory} type="button">
+            Clear all chats
+          </button>
+        </>
+      );
+    }
+    if (settingsPanel === 'privacy') {
+      return (
+        <>
+          {renderPrivacyChoice('Last seen & online', 'lastSeenPrivacy', [
+            { value: 'everyone', label: 'Everyone' },
+            { value: 'contacts', label: 'My contacts' },
+            { value: 'nobody', label: 'Nobody' },
+          ])}
+          {renderPrivacyChoice('Profile photo', 'profilePhotoPrivacy', [
+            { value: 'everyone', label: 'Everyone' },
+            { value: 'contacts', label: 'My contacts' },
+            { value: 'nobody', label: 'Nobody' },
+          ])}
+          {renderPrivacyChoice('About', 'aboutPrivacy', [
+            { value: 'everyone', label: 'Everyone' },
+            { value: 'contacts', label: 'My contacts' },
+            { value: 'nobody', label: 'Nobody' },
+          ])}
+          {renderPrivacyChoice('Status', 'statusPrivacy', [
+            { value: 'contacts', label: 'My contacts' },
+            { value: 'close-friends', label: 'Close friends' },
+            { value: 'nobody', label: 'Nobody' },
+          ])}
+          {renderSettingsToggle(
+            'Read receipts',
+            appSettings.readReceiptsEnabled,
+            (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
+            'If off, you won’t send or see read ticks',
+          )}
+        </>
+      );
+    }
+    if (settingsPanel === 'chats') {
+      return (
+        <>
+          {renderSettingsToggle('Enter is send', appSettings.enterIsSend, (value) => updateAppSetting('enterIsSend', value))}
+          {renderSettingsToggle('Media auto-download', appSettings.mediaAutoDownload, (value) => updateAppSetting('mediaAutoDownload', value))}
+          {renderSettingsToggle('Low data mode', appSettings.lowDataMode, (value) => updateAppSetting('lowDataMode', value))}
+        </>
+      );
+    }
+    if (settingsPanel === 'notifications') {
+      return (
+        <>
+          {renderSettingsToggle('Message notifications', appSettings.messageNotifications, (value) => updateAppSetting('messageNotifications', value))}
+          {renderSettingsToggle('Show preview', appSettings.showNotificationPreview, (value) => updateAppSetting('showNotificationPreview', value))}
+          {renderSettingsToggle('Conversation tones', appSettings.conversationTones, (value) => updateAppSetting('conversationTones', value))}
+        </>
+      );
+    }
+    if (settingsPanel === 'storage') {
+      return (
+        <>
+          <p>{Object.values(messagesByChat).flat().length} messages · {catalogItems.length} catalog items · {favoriteChatIds.length} favorites</p>
+          {renderSettingsToggle('Low data mode', appSettings.lowDataMode, (value) => updateAppSetting('lowDataMode', value))}
+          <button className="settings-list-row" onClick={() => { setCatalogAssetFiles([]); setStatusAssetFiles([]); showToast('Local media cache cleared'); }} type="button">
+            Clear cache
+          </button>
+        </>
+      );
+    }
+    if (settingsPanel === 'help') {
+      return (
+        <>
+          {['How to link devices', 'How payments work', 'Contact support'].map((faq) => (
+            <button className="settings-list-row" key={faq} onClick={() => showToast(faq)} type="button">{faq}</button>
+          ))}
+          <textarea onChange={(event) => setFeedbackDraft(event.target.value)} placeholder="Send feedback" value={feedbackDraft} />
+          <button
+            className="send-button"
+            onClick={() => {
+              if (!feedbackDraft.trim()) {
+                showToast('Write feedback first.');
+                return;
+              }
+              setFeedbackDraft('');
+              showToast('Thanks — feedback sent to the ZynkUp team.');
+            }}
+            type="button"
+          >
+            Send feedback
+          </button>
+        </>
+      );
+    }
+
+    return (
+      <>
         <h2>Profile</h2>
         <div className="profile-top">
           <img alt={profile.name} src={profile.photoUrl} />
-          <button type="button">Edit photo</button>
+          <button onClick={() => profilePhotoInputRef.current?.click()} type="button">Edit photo</button>
+          <input
+            accept="image/*"
+            className="hidden-input"
+            onChange={async (event) => {
+              const file = event.target.files?.[0];
+              if (!file) {
+                return;
+              }
+              showToast('Uploading photo…');
+              try {
+                const uploaded = await uploadFiles([file]);
+                const photoUrl = uploaded[0] || URL.createObjectURL(file);
+                setProfile((current) => ({ ...current, photoUrl }));
+                await saveProfileToServer({ photoUrl });
+              } catch {
+                showToast('Could not upload profile photo.');
+              }
+            }}
+            ref={profilePhotoInputRef}
+            type="file"
+          />
         </div>
-
         <label>
           <span>About</span>
           <input onChange={(event) => setProfile((current) => ({ ...current, about: event.target.value }))} value={profile.about} />
@@ -1873,11 +2595,15 @@ function App() {
         </label>
         <label>
           <span>Phone number</span>
-          <input onChange={(event) => setProfile((current) => ({ ...current, phone: event.target.value }))} value={profile.phone} />
+          <input readOnly value={profile.phone} />
         </label>
+        <button className="send-button" onClick={() => void saveProfileToServer()} type="button">Save account</button>
 
         <div className="business-panel">
           <h3>Linked Devices</h3>
+          <button className="settings-auth-button" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">
+            Refresh Linked Devices
+          </button>
           <div className="linked-device-list">
             {linkedDevices.length ? linkedDevices.map((device) => (
               <div className="linked-device-row" key={device.deviceId}>
@@ -1899,32 +2625,36 @@ function App() {
             )) : <p>No extra linked devices yet.</p>}
           </div>
         </div>
+      </>
+    );
+  };
 
-        <div className="business-panel">
-          <h3>Add Catalog Item</h3>
-          <button onClick={() => catalogInputRef.current?.click()} type="button">Upload Catalog Images</button>
-          <input
-            onChange={(event) => setCatalogForm((current) => ({ ...current, title: event.target.value }))}
-            placeholder="Product title"
-            value={catalogForm.title}
-          />
-          <input
-            onChange={(event) => setCatalogForm((current) => ({ ...current, price: event.target.value }))}
-            placeholder="Price"
-            value={catalogForm.price}
-          />
-          <input
-            onChange={(event) => setCatalogForm((current) => ({ ...current, category: event.target.value }))}
-            placeholder="Category"
-            value={catalogForm.category}
-          />
-          <textarea
-            onChange={(event) => setCatalogForm((current) => ({ ...current, description: event.target.value }))}
-            placeholder="Description"
-            value={catalogForm.description}
-          />
-          <button onClick={addCatalogItem} type="button">Add To Catalog</button>
+  const renderSettingsView = () => (
+    <main className="settings-shell">
+      <aside className="settings-menu">
+        <h2>Settings</h2>
+        <div className="settings-user">
+          <img alt={profile.name} src={profile.photoUrl} />
+          <strong>{profile.name}</strong>
         </div>
+        <div className="settings-links">
+          {SETTINGS_MENU.map((section) => (
+            <button
+              className={settingsPanel === section.id ? 'active' : ''}
+              key={section.id}
+              onClick={() => setSettingsPanel(section.id)}
+              type="button"
+            >
+              <strong>{section.title}</strong>
+              <small>{section.subtitle}</small>
+            </button>
+          ))}
+        </div>
+      </aside>
+
+      <section className="settings-profile">
+        <h2>{SETTINGS_MENU.find((item) => item.id === settingsPanel)?.title || 'Account'}</h2>
+        {renderSettingsPanelBody()}
       </section>
     </main>
   );
@@ -2054,20 +2784,60 @@ function App() {
         <div className="rail-icons">
           <button className={`rail-button rail-badged ${activeView === 'chats' ? 'active' : ''}`} onClick={() => setActiveView('chats')} type="button">
             💬
-            {chatItems.length ? <span>{chatItems.length}</span> : null}
+            {(() => {
+              const unreadTotal = chatItems.reduce((sum, chat) => sum + (chat.unread || 0), 0);
+              return unreadTotal > 0 ? <span>{unreadTotal}</span> : null;
+            })()}
           </button>
+          <button className={`rail-button ${activeView === 'calls' ? 'active' : ''}`} onClick={() => setActiveView('calls')} type="button">☎</button>
           <button className={`rail-button ${activeView === 'updates' ? 'active' : ''}`} onClick={() => setActiveView('updates')} type="button">◌</button>
           <button className={`rail-button ${activeView === 'catalog' ? 'active' : ''}`} onClick={() => setActiveView('catalog')} type="button">🏬</button>
           <button className={`rail-button ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')} type="button">⚙</button>
-          <button className="rail-button" type="button">☆</button>
         </div>
         <button className="rail-button rail-bottom" onClick={() => setActiveView('settings')} type="button">⚙</button>
       </aside>
 
       {activeView === 'chats' ? renderChatsView() : null}
+      {activeView === 'calls' ? renderCallsView() : null}
       {activeView === 'updates' ? renderUpdatesView() : null}
       {activeView === 'catalog' ? renderCatalogView() : null}
       {activeView === 'settings' ? renderSettingsView() : null}
+
+      {toastMessage ? <div className="web-toast">{toastMessage}</div> : null}
+
+      {messageActionTarget ? (
+        <div className="modal-overlay" onClick={() => setMessageActionTarget(null)}>
+          <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Message</h3>
+            <button
+              onClick={() => {
+                setReplyTarget(messageActionTarget);
+                setMessageActionTarget(null);
+              }}
+              type="button"
+            >
+              Reply
+            </button>
+            <button
+              onClick={() => {
+                void navigator.clipboard?.writeText(messageActionTarget.text || '').then(
+                  () => showToast('Copied'),
+                  () => showToast('Could not copy'),
+                );
+                setMessageActionTarget(null);
+              }}
+              type="button"
+            >
+              Copy
+            </button>
+            <button onClick={() => void forwardMessage(messageActionTarget)} type="button">Forward</button>
+            <button onClick={() => void deleteMessage(messageActionTarget, 'me')} type="button">Delete for me</button>
+            {messageActionTarget.sender === 'me' ? (
+              <button onClick={() => void deleteMessage(messageActionTarget, 'everyone')} type="button">Delete for everyone</button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       {callSheetVisible ? (
         <div className="call-type-dropdown" onClick={(event) => event.stopPropagation()}>
