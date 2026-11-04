@@ -46,6 +46,7 @@ type Message = {
   readAt?: string;
   replyToMessageId?: string;
   replyPreview?: string;
+  catalogItemId?: string;
   deletedForEveryone?: boolean;
   deletedFor?: string[];
 };
@@ -100,6 +101,7 @@ type StatusPost = {
   backgroundColor?: string;
   fontFamily?: string;
   fontSize?: number;
+  catalogItemId?: string;
   reactions: Array<{
     userId: string;
     emoji: string;
@@ -131,6 +133,7 @@ type CatalogItem = {
   description: string;
   imageUrls: string[];
   stockQuantity: number;
+  isPublic?: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -340,6 +343,7 @@ const sendMessageSchema = z.object({
   durationSeconds: z.number().int().nonnegative().optional(),
   replyToMessageId: z.string().min(1).optional(),
   replyPreview: z.string().max(280).optional(),
+  catalogItemId: z.string().min(1).max(80).optional(),
 });
 
 const clearChatUnreadSchema = z.object({
@@ -386,6 +390,7 @@ const createStatusSchema = z.object({
   backgroundColor: z.string().min(4).max(30).optional(),
   fontFamily: z.string().min(2).max(40).optional(),
   fontSize: z.number().int().min(16).max(64).optional(),
+  catalogItemId: z.string().min(1).max(80).optional(),
   audience: z.enum(['contacts', 'close-friends']).default('contacts'),
 }).refine((value) => value.text.trim().length > 0 || value.assets.length > 0, {
   message: 'A status needs text or at least one asset',
@@ -412,6 +417,7 @@ const createCatalogItemSchema = z.object({
   description: z.string().min(2).max(400),
   imageUrls: z.array(z.string().url()).min(1).max(10),
   stockQuantity: z.number().int().nonnegative().default(0),
+  isPublic: z.boolean().optional(),
 });
 
 const updateCatalogItemSchema = z.object({
@@ -422,6 +428,7 @@ const updateCatalogItemSchema = z.object({
   description: z.string().min(2).max(400).optional(),
   imageUrls: z.array(z.string().url()).min(1).max(10).optional(),
   stockQuantity: z.number().int().nonnegative().optional(),
+  isPublic: z.boolean().optional(),
 });
 
 const paymentIntentSchema = z.object({
@@ -3093,6 +3100,7 @@ app.post('/api/statuses', async (req, res) => {
     backgroundColor: parseResult.data.backgroundColor,
     fontFamily: parseResult.data.fontFamily,
     fontSize: parseResult.data.fontSize,
+    catalogItemId: parseResult.data.catalogItemId,
     reactions: [],
     comments: [],
     views: [],
@@ -3265,6 +3273,7 @@ app.post('/api/catalog', async (req, res) => {
     description: parseResult.data.description,
     imageUrls: parseResult.data.imageUrls,
     stockQuantity: parseResult.data.stockQuantity ?? 0,
+    isPublic: Boolean(parseResult.data.isPublic),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -3458,6 +3467,14 @@ app.post('/api/messages', async (req, res) => {
   }
 
   const payload = parseResult.data;
+  if (payload.clientRef) {
+    const existing = (await readMessages()).find(
+      (item) => item.chatId === payload.chatId && item.clientRef === payload.clientRef,
+    );
+    if (existing) {
+      return res.status(200).json({ message: existing });
+    }
+  }
   const chat = (await readChats()).find((item) => item.id === payload.chatId);
 
   if (!chat) {
@@ -3485,6 +3502,7 @@ app.post('/api/messages', async (req, res) => {
     durationSeconds: payload.durationSeconds,
     replyToMessageId: payload.replyToMessageId,
     replyPreview,
+    catalogItemId: payload.catalogItemId,
   };
 
   await persistMessage(message);
@@ -3641,8 +3659,21 @@ io.on('connection', (socket) => {
     })();
   });
 
+  socket.on('user:join', ({ userId }: { userId?: string }) => {
+    if (userId) {
+      socket.join(`user:${userId}`);
+    }
+  });
+
+  socket.on('call:ringing', ({ callId, userId }: { callId: string; userId: string }) => {
+    socket.to(callId).emit('call:peerRinging', { callId, userId });
+  });
+
   socket.on('call:join', ({ callId, userId }: { callId: string; userId: string }) => {
     socket.join(callId);
+    if (userId) {
+      socket.join(`user:${userId}`);
+    }
     socket.to(callId).emit('call:participantJoined', { callId, userId });
   });
 
@@ -3666,12 +3697,11 @@ io.on('connection', (socket) => {
       signalType: 'offer' | 'answer' | 'ice-candidate';
       payload: unknown;
     }) => {
+      const event = { callId, fromUserId, toUserId, signalType, payload };
       if (toUserId) {
-        socket.to(callId).emit('call:signal', { callId, fromUserId, toUserId, signalType, payload });
-        return;
+        io.to(`user:${toUserId}`).emit('call:signal', event);
       }
-
-      socket.to(callId).emit('call:signal', { callId, fromUserId, signalType, payload });
+      socket.to(callId).emit('call:signal', event);
     },
   );
 });
