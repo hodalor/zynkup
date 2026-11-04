@@ -147,6 +147,7 @@ type Profile = {
   pinHash?: string | null;
   businessName: string;
   businessDescription: string;
+  currency?: string;
   photoUri?: string;
   lastSeenPrivacy?: 'everyone' | 'contacts' | 'nobody';
   profilePhotoPrivacy?: 'everyone' | 'contacts' | 'nobody';
@@ -239,6 +240,7 @@ const emptyProfile: Profile = {
   pinHash: null,
   businessName: '',
   businessDescription: '',
+  currency: '',
   photoUri: '',
   lastSeenPrivacy: 'everyone',
   profilePhotoPrivacy: 'everyone',
@@ -302,13 +304,13 @@ const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY ?? '').replace(/\
 const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? '';
 const MAX_DEVICES_PER_USER = 5;
 const LINK_REQUEST_TTL_MS = 1000 * 60 * 5;
-const MEDIA_STORAGE_MODE: MediaStorageMode =
-  process.env.MEDIA_STORAGE_PROVIDER === 'gcs'
-    ? 'gcs'
-    : process.env.MEDIA_STORAGE_PROVIDER === 'cloudinary'
-      ? 'cloudinary'
-      : 'local';
 const GCS_BUCKET = process.env.GCS_BUCKET ?? process.env.GOOGLE_CLOUD_STORAGE_BUCKET ?? '';
+const MEDIA_STORAGE_MODE: MediaStorageMode =
+  process.env.MEDIA_STORAGE_PROVIDER === 'cloudinary'
+    ? 'cloudinary'
+    : process.env.MEDIA_STORAGE_PROVIDER === 'gcs' || GCS_BUCKET
+      ? 'gcs'
+      : 'local';
 const GCS_PUBLIC_BASE_URL = (process.env.GCS_PUBLIC_BASE_URL ?? '').replace(/\/$/, '');
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
@@ -355,7 +357,11 @@ const updateProfileSchema = z.object({
   phone: z.string().min(7).max(30).optional(),
   businessName: z.string().min(2).max(80).optional(),
   businessDescription: z.string().min(2).max(160).optional(),
-  photoUri: z.string().url().or(z.literal('')).optional(),
+  currency: z.string().min(3).max(5).optional(),
+  photoUri: z.string().max(2000).refine(
+    (value) => value === '' || /^https?:\/\//i.test(value),
+    'Profile photo must be an uploaded https URL',
+  ).optional(),
   lastSeenPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   profilePhotoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   aboutPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
@@ -679,6 +685,9 @@ const uploadFileToGcs = async (file: Express.Multer.File) => {
       cacheControl: 'public, max-age=31536000',
     },
   });
+  await bucket.file(objectName).makePublic().catch((error: unknown) => {
+    console.warn('GCS object was uploaded but is not public yet. Grant allUsers the Storage Object Viewer role on the bucket.', error);
+  });
   await fs.promises.rm(file.path, { force: true }).catch(() => undefined);
 
   const publicUrl = GCS_PUBLIC_BASE_URL
@@ -840,6 +849,39 @@ const normalizePhone = (countryCode: string, phoneNumber: string) => {
 };
 
 const sanitizePhone = (phoneNumber: string) => phoneNumber.replace(/[^\d+]/g, '');
+
+const CURRENCY_BY_CALLING_CODE: Array<[string, string]> = [
+  ['233', 'GHS'],
+  ['260', 'ZMW'],
+  ['234', 'NGN'],
+  ['254', 'KES'],
+  ['256', 'UGX'],
+  ['255', 'TZS'],
+  ['250', 'RWF'],
+  ['257', 'BIF'],
+  ['243', 'CDF'],
+  ['237', 'XAF'],
+  ['225', 'XOF'],
+  ['221', 'XOF'],
+  ['27', 'ZAR'],
+  ['20', 'EGP'],
+  ['212', 'MAD'],
+  ['44', 'GBP'],
+  ['91', 'INR'],
+  ['86', 'CNY'],
+  ['1', 'USD'],
+];
+
+const currencyForCallingCode = (value: string) => {
+  const digits = String(value || '').replace(/\D/g, '');
+  const match = CURRENCY_BY_CALLING_CODE
+    .slice()
+    .sort((left, right) => right[0].length - left[0].length)
+    .find(([code]) => digits.startsWith(code));
+  return match?.[1] ?? 'USD';
+};
+
+const phoneTail = (value: string) => String(value || '').replace(/\D/g, '').replace(/^0+/, '').slice(-9);
 
 const hashPin = (pin: string) =>
   crypto.createHash('sha256').update(`zynkup:${pin}`).digest('hex');
@@ -1229,16 +1271,17 @@ const canOpenAnotherSession = async (userId: string, deviceId?: string | null) =
 const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
   const nowIso = new Date().toISOString();
   const users = await readUsers();
-  const resolvedUserId = input.preferredUserId
-    ? (users.find((user) => user.id === input.preferredUserId)?.id ?? '')
-    : '';
+  // Omitting preferredUserId must keep the saved account. Sending it replaces the account.
+  const explicitUserId = input.preferredUserId
+    ? users.find((user) => user.id === input.preferredUserId)?.id
+    : undefined;
   const deviceId = input.deviceId ?? crypto.randomUUID();
 
   const db = await getDb();
   if (!db) {
     const existing = seedSessions.find((session) => session.deviceId === deviceId);
     if (existing) {
-      existing.userId = resolvedUserId;
+      existing.userId = explicitUserId === undefined ? existing.userId : explicitUserId;
       existing.platform = input.platform;
       existing.label = input.label;
       existing.lastSeenAt = nowIso;
@@ -1248,7 +1291,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
     const session: DeviceSession = {
       id: `session-${Date.now()}`,
       deviceId,
-      userId: resolvedUserId,
+      userId: explicitUserId ?? '',
       platform: input.platform,
       label: input.label,
       createdAt: nowIso,
@@ -1262,11 +1305,12 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
   const collections = collectionsFor(db);
   const existing = await collections.sessions.findOne({ deviceId }, { projection: { _id: 0 } });
   if (existing) {
+    const userId = explicitUserId === undefined ? existing.userId : explicitUserId;
     await collections.sessions.updateOne(
       { deviceId },
       {
         $set: {
-          userId: resolvedUserId,
+          userId,
           platform: input.platform,
           label: input.label,
           lastSeenAt: nowIso,
@@ -1275,7 +1319,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
     );
     return {
       ...existing,
-      userId: resolvedUserId,
+      userId,
       platform: input.platform,
       label: input.label,
       lastSeenAt: nowIso,
@@ -1285,7 +1329,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
   const session: DeviceSession = {
     id: `session-${Date.now()}`,
     deviceId,
-    userId: resolvedUserId,
+    userId: explicitUserId ?? '',
     platform: input.platform,
     label: input.label,
     createdAt: nowIso,
@@ -1433,8 +1477,16 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     };
   }
 
-  const [profile, users, chats, messages, contacts, calls, statuses, catalogItems] = await Promise.all([
-    readProfile(currentUserId),
+  let profile = await readProfile(currentUserId);
+  if (profile?.id && !profile.currency) {
+    const currency = currencyForCallingCode(profile.countryCode || profile.phone);
+    profile = { ...profile, currency };
+    await updateProfile(profile.id, { currency }).catch((error) => {
+      console.warn('Could not store the account currency', error);
+    });
+  }
+
+  const [users, chats, messages, contacts, calls, statuses, catalogItems] = await Promise.all([
     readUsers(),
     readChats(),
     readMessages(),
@@ -1548,6 +1600,7 @@ const createAuthIdentity = async (
     pinHash: pin ? hashPin(pin) : null,
     businessName: '',
     businessDescription: '',
+    currency: currencyForCallingCode(countryCode || normalizedPhone),
   };
 
   const db = await getDb();
@@ -1587,10 +1640,12 @@ const syncDeviceContacts = async (
 ) => {
   const users = await readUsers();
   const syncedContacts: Contact[] = contacts.map((contact, index) => {
-    const normalizedPhone = normalizePhone('', contact.phone).replace(/^\+/, '+');
-    const linkedUser = users.find(
-      (user) => user.phone.replace(/[^\d+]/g, '') === normalizedPhone.replace(/[^\d+]/g, ''),
-    );
+    const normalizedPhone = sanitizePhone(contact.phone);
+    const contactTail = phoneTail(contact.phone);
+    const linkedUser = users.find((user) => {
+      const userTail = phoneTail(user.phone);
+      return contactTail.length >= 8 && userTail === contactTail;
+    });
 
     return {
       id: `contact-${ownerUserId}-${index}-${Date.now()}`,
@@ -3128,12 +3183,18 @@ app.post('/api/catalog', async (req, res) => {
   }
 
   const timestamp = new Date().toISOString();
+  const sellerId = parseResult.data.sellerId ?? await resolveRequestUserId(req);
+  const sellerProfile = sellerId ? await readProfile(sellerId) : null;
+  const sellerCurrency = sellerProfile?.currency
+    || (sellerProfile?.phone || sellerProfile?.countryCode
+      ? currencyForCallingCode(sellerProfile.countryCode || sellerProfile.phone)
+      : '');
   const item: CatalogItem = {
     id: `p${Date.now()}`,
-    sellerId: parseResult.data.sellerId ?? await resolveRequestUserId(req),
+    sellerId,
     title: parseResult.data.title,
     price: parseResult.data.price,
-    currency: parseResult.data.currency,
+    currency: sellerCurrency || parseResult.data.currency,
     category: parseResult.data.category,
     description: parseResult.data.description,
     imageUrls: parseResult.data.imageUrls,
