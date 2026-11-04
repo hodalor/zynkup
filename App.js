@@ -28,6 +28,7 @@ import {
   Text,
   TextInput,
   View,
+  AppState,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { io } from 'socket.io-client';
@@ -129,6 +130,8 @@ const FAVORITES_STORAGE_KEY = 'zynkup-mobile-favorite-chats';
 const MUTED_CHATS_STORAGE_KEY = 'zynkup-mobile-muted-chats';
 const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-mobile-archived-chats';
 const APP_LOCK_PIN_KEY = 'zynkup-mobile-app-lock-pin';
+const ACCOUNT_STORAGE_KEY = 'zynkup-mobile-account';
+const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_APP_SETTINGS = {
   enterIsSend: true,
   mediaAutoDownload: true,
@@ -184,9 +187,54 @@ const COUNTRY_OPTIONS = Object.entries(countries)
       name: country.name,
       dialCode: `+${phoneCode}`,
       flag: country.emoji ?? code,
+      currency: country.currency?.[0] || 'USD',
     })),
   )
   .sort((left, right) => left.name.localeCompare(right.name));
+
+const countryForPhone = (phone) => {
+  const normalized = String(phone || '');
+  return [...COUNTRY_OPTIONS]
+    .sort((left, right) => right.dialCode.length - left.dialCode.length)
+    .find((country) => normalized.startsWith(country.dialCode)) ?? null;
+};
+
+const currencyForPhone = (phone, countryCode) =>
+  COUNTRY_OPTIONS.find((country) => country.dialCode === countryCode)?.currency
+  || countryForPhone(phone)?.currency
+  || 'USD';
+
+const splitStoredPhone = (phone) => {
+  const match = countryForPhone(phone);
+  if (!match) {
+    return { countryCode: '+233', phone: String(phone || '').replace(/^\+/, '') };
+  }
+  let national = String(phone).slice(match.dialCode.length);
+  if (national && !national.startsWith('0')) {
+    national = `0${national}`;
+  }
+  return { countryCode: match.dialCode, phone: national };
+};
+
+const readRememberedAccount = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(ACCOUNT_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeRememberedAccount = async (account) => {
+  const current = (await readRememberedAccount()) ?? {};
+  const next = {
+    ...current,
+    ...account,
+    lastActiveAt: account.lastActiveAt ?? current.lastActiveAt ?? Date.now(),
+  };
+  await AsyncStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(next));
+  return next;
+};
 
 const chats = [];
 const contacts = [];
@@ -339,6 +387,8 @@ function AppContent() {
     username: '',
     about: '',
     phone: '',
+    countryCode: '',
+    currency: '',
     photoUri: '',
   });
   const [settingsPanel, setSettingsPanel] = useState('');
@@ -485,8 +535,14 @@ function AppContent() {
     Boolean(statusCommentDraft.trim()) ||
     Boolean(editingStatusCommentId);
 
+  const accountCurrency = profile.currency || currencyForPhone(profile.phone, profile.countryCode);
+  const accountCountry = countryForPhone(profile.phone) || COUNTRY_OPTIONS.find((country) => country.dialCode === profile.countryCode);
+
   const filteredCatalogItems = useMemo(() => {
     return catalogItems.filter((item) => {
+      if (item.sellerId && currentUserId && item.sellerId !== currentUserId) {
+        return false;
+      }
       const matchesCategory = catalogCategory === 'All' || item.category === catalogCategory;
       const query = catalogSearch.trim().toLowerCase();
       const matchesSearch =
@@ -496,7 +552,7 @@ function AppContent() {
         item.seller.toLowerCase().includes(query);
       return matchesCategory && matchesSearch;
     });
-  }, [catalogCategory, catalogItems, catalogSearch]);
+  }, [catalogCategory, catalogItems, catalogSearch, currentUserId]);
 
   const filteredCountryOptions = useMemo(() => {
     const query = countrySearch.trim().toLowerCase();
@@ -556,20 +612,7 @@ function AppContent() {
     return unique.slice(0, 5);
   }, [chatItems, contactItems, usersById]);
 
-  const payTransactions = useMemo(() => {
-    const base = payQuickContacts.slice(0, 3);
-    const fallback = ['Afia', 'Maame Sika Store', 'Kwame'];
-    return [0, 1, 2].map((index) => {
-      const name = base[index]?.name ?? fallback[index];
-      if (index === 0) {
-        return { id: `${name}-sent`, title: `Sent to ${name}`, time: 'Today, 10:06 AM', amount: '-GHC 50', positive: false };
-      }
-      if (index === 1) {
-        return { id: `${name}-merchant`, title: name, time: 'Today, 9:50 AM', amount: '-GHC 45', positive: false };
-      }
-      return { id: `${name}-received`, title: `Received from ${name}`, time: 'Yesterday, 3:12 PM', amount: '+GHC 200', positive: true };
-    });
-  }, [payQuickContacts]);
+  const payTransactions = payHistoryItems;
 
   const selectedAuthCountry = useMemo(
     () => COUNTRY_OPTIONS.find((country) => country.dialCode === authForm.countryCode) ?? null,
@@ -861,7 +904,8 @@ function AppContent() {
           phone: nextProfile.phone.trim() || undefined,
           username: nextProfile.username?.trim() || undefined,
           avatar,
-          photoUri: nextProfile.photoUri || '',
+          photoUri: /^https?:\/\//i.test(nextProfile.photoUri || '') ? nextProfile.photoUri : '',
+          currency: nextProfile.currency || accountCurrency,
           lastSeenPrivacy: nextSettings.lastSeenPrivacy,
           profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
           aboutPrivacy: nextSettings.aboutPrivacy,
@@ -884,6 +928,8 @@ function AppContent() {
           username: payload.profile.username ?? current.username,
           about: payload.profile.about ?? current.about,
           phone: payload.profile.phone ?? current.phone,
+          countryCode: payload.profile.countryCode ?? current.countryCode,
+          currency: payload.profile.currency ?? current.currency,
           photoUri: payload.profile.photoUri ?? current.photoUri,
         }));
       }
@@ -928,17 +974,22 @@ function AppContent() {
       return;
     }
 
+    const localUri = result.assets[0].uri;
+    setProfile((current) => ({ ...current, photoUri: localUri }));
     showToast('Uploading profile photo...', 'info', 0);
     try {
-      const uploaded = await uploadUris([result.assets[0].uri], {
+      const uploaded = await uploadUris([localUri], {
         names: [`profile-${Date.now()}.jpg`],
         fallbackType: 'image/jpeg',
       });
-      const photoUri = uploaded[0] || result.assets[0].uri;
-      setProfile((current) => ({ ...current, photoUri }));
-      await saveProfileToServer({ photoUri });
+      if (!uploaded[0]) {
+        showToast('Preview is on this phone. Cloud Storage is not ready, so it will not show on other devices yet.', 'error', 4600);
+        return;
+      }
+      setProfile((current) => ({ ...current, photoUri: uploaded[0] }));
+      await saveProfileToServer({ photoUri: uploaded[0] });
     } catch {
-      showToast('Could not upload profile photo.', 'error');
+      showToast('Could not upload profile photo. The preview stays on this phone.', 'error', 4200);
     }
   };
 
@@ -1287,9 +1338,11 @@ function AppContent() {
     } catch (error) {
       const firebaseCode = error?.code ?? '';
       showToast(
-        firebaseCode
-          ? `SMS was not sent (${firebaseCode}). Check Firebase Phone auth billing and the test-number list.`
-          : error?.message || 'SMS was not sent. Check Firebase Phone auth.',
+        firebaseCode === 'auth/app-not-authorized'
+          ? 'Firebase refused this install (app-not-authorized). Add this APK’s SHA-1 and SHA-256 in Firebase, enable Play Integrity, and allow SMS for Ghana and Zambia. Phones that fail the check open the robot page and then get no SMS.'
+          : firebaseCode
+            ? `SMS was not sent (${firebaseCode}). Check Firebase Phone auth billing and the test-number list.`
+            : error?.message || 'SMS was not sent. Check Firebase Phone auth.',
         'error',
         5200,
       );
@@ -1362,52 +1415,80 @@ function AppContent() {
     });
   };
 
-  const syncPhoneContacts = async (userId) => {
+  const syncPhoneContacts = async (userId, options = {}) => {
+    if (!userId) {
+      showToast('Sign in first, then sync your phone book.', 'error');
+      return;
+    }
     if (!Contacts?.getAll) {
+      showToast('Contact sync needs the latest app install.', 'error', 4200);
       return;
     }
 
-    if (Platform.OS === 'android') {
-      const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
-      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+    try {
+      if (Platform.OS === 'android') {
+        const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          showToast('Allow contacts access so ZynkUp can find people you can chat with.', 'error', 4200);
+          return;
+        }
+      } else {
+        const permission = await Contacts.requestPermission();
+        if (permission !== 'authorized') {
+          showToast('Allow contacts access so ZynkUp can find people you can chat with.', 'error', 4200);
+          return;
+        }
+      }
+
+      const deviceContacts = await Contacts.getAll();
+      const payloadContacts = deviceContacts
+        .flatMap((contact) =>
+          (contact.phoneNumbers ?? []).map((entry) => ({
+            name: contact.displayName || 'Unknown',
+            phone: entry.number ?? '',
+          })),
+        )
+        .filter((contact) => contact.phone.trim().length >= 4);
+
+      if (!payloadContacts.length) {
+        setContactItems([]);
+        if (!options.quiet) {
+          showToast('No phone numbers were found in the phone book.', 'error', 3600);
+        }
         return;
       }
-    } else {
-      const permission = await Contacts.requestPermission();
-      if (permission !== 'authorized') {
+
+      if (!options.quiet) {
+        showToast('Syncing phone book...', 'info', 0);
+      }
+      const response = await fetch(`${API_BASE_URL}/api/contacts/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId,
+          contacts: payloadContacts,
+        }),
+      });
+      if (!response.ok) {
+        showToast('Contact sync failed. Check the connection and try again.', 'error', 3600);
         return;
       }
+
+      const payload = await response.json();
+      const matched = payload.contacts ?? [];
+      setContactItems(matched);
+      if (!options.quiet) {
+        showToast(
+          matched.length
+            ? `${matched.length} contact${matched.length === 1 ? '' : 's'} on ZynkUp. You can chat and call them.`
+            : `Checked ${payloadContacts.length} numbers. None of them are on ZynkUp yet.`,
+          matched.length ? 'success' : 'info',
+          4200,
+        );
+      }
+    } catch {
+      showToast('Contact sync could not read the phone book.', 'error', 3600);
     }
-
-    const deviceContacts = await Contacts.getAll();
-    const payloadContacts = deviceContacts
-      .flatMap((contact) =>
-        (contact.phoneNumbers ?? []).map((entry) => ({
-          name: contact.displayName || 'Unknown',
-          phone: entry.number ?? '',
-        })),
-      )
-      .filter((contact) => contact.phone.trim().length >= 4);
-
-    if (!payloadContacts.length) {
-      setContactItems([]);
-      return;
-    }
-
-    const response = await fetch(`${API_BASE_URL}/api/contacts/sync`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId,
-        contacts: payloadContacts,
-      }),
-    });
-    if (!response.ok) {
-      return;
-    }
-
-    const payload = await response.json();
-    setContactItems(payload.contacts ?? []);
   };
 
   const fetchLinkedDevices = async (userId) => {
@@ -1694,6 +1775,8 @@ function AppContent() {
       username: payload.profile?.username ?? current.username,
       about: payload.profile?.about ?? current.about,
       phone: payload.profile?.phone ?? current.phone,
+      countryCode: payload.profile?.countryCode ?? current.countryCode,
+      currency: payload.profile?.currency || currencyForPhone(payload.profile?.phone, payload.profile?.countryCode),
       photoUri: payload.profile?.photoUri || current.photoUri,
     }));
     if (payload.profile) {
@@ -1727,6 +1810,7 @@ function AppContent() {
         name: contact.name,
         phone: contact.phone,
         registered: contact.registered,
+        linkedUserId: contact.linkedUserId,
         presence: contact.presence,
       })),
     );
@@ -1756,6 +1840,7 @@ function AppContent() {
     setCatalogItems(
       (payload.catalogItems ?? []).map((item) => ({
         id: item.id,
+        sellerId: item.sellerId,
         title: item.title,
         price: `${item.currency ?? 'GHS'} ${item.price}`,
         category: item.category,
@@ -1766,8 +1851,18 @@ function AppContent() {
         imageUris: item.imageUrls ?? [],
       })),
     );
+    if (nextCurrentUserId) {
+      void writeRememberedAccount({
+        userId: nextCurrentUserId,
+        phone: payload.profile?.phone || '',
+        countryCode: payload.profile?.countryCode || '',
+        name: payload.profile?.name || '',
+        currency: payload.profile?.currency || currencyForPhone(payload.profile?.phone, payload.profile?.countryCode),
+        lastActiveAt: Date.now(),
+      });
+    }
     if (!payload.authRequired && nextCurrentUserId) {
-      void syncPhoneContacts(nextCurrentUserId);
+      void syncPhoneContacts(nextCurrentUserId, { quiet: true });
       void fetchLinkedDevices(nextCurrentUserId);
     }
   };
@@ -1918,12 +2013,34 @@ function AppContent() {
 
     const bootstrapSession = async () => {
       const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
+      const account = await readRememberedAccount();
+      const idleMs = account?.lastActiveAt ? Date.now() - Number(account.lastActiveAt) : 0;
+      if (account?.userId && account?.phone && idleMs > SESSION_IDLE_MS) {
+        const parts = splitStoredPhone(account.phone);
+        if (cancelled) {
+          return;
+        }
+        setAuthForm((current) => ({
+          ...current,
+          countryCode: account.countryCode || parts.countryCode,
+          phone: parts.phone,
+          verifiedPhone: account.phone,
+          name: account.name || current.name,
+          pin: '',
+        }));
+        setAuthMode('pin');
+        setAuthRequired(true);
+        setAuthVisible(true);
+        setBootstrapReady(true);
+        return;
+      }
       try {
         const response = await fetchWithTimeout(`${API_BASE_URL}/api/session/ensure`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             deviceId: storedDeviceId ?? undefined,
+            preferredUserId: idleMs <= SESSION_IDLE_MS ? account?.userId : undefined,
             platform: Platform.OS,
             label: `${Platform.OS} device`,
           }),
@@ -1963,8 +2080,15 @@ function AppContent() {
 
     void bootstrapSession();
 
+    const appStateSub = AppState.addEventListener('change', (state) => {
+      if ((state === 'background' || state === 'inactive') && currentUserIdRef.current) {
+        void writeRememberedAccount({ lastActiveAt: Date.now() });
+      }
+    });
+
     return () => {
       cancelled = true;
+      appStateSub.remove();
     };
   }, []);
 
@@ -2097,8 +2221,9 @@ function AppContent() {
         return [
           {
             id: item.id,
+            sellerId: item.sellerId,
             title: item.title,
-            price: `${item.currency ?? 'GHS'} ${item.price}`,
+            price: `${item.currency || accountCurrency} ${item.price}`,
             category: item.category,
             seller: usersByIdRef.current[item.sellerId]?.name || 'Seller',
             description: item.description,
@@ -2584,7 +2709,7 @@ function AppContent() {
           sellerId: currentUserId,
           title: catalogForm.title.trim(),
           price: Number.parseFloat(catalogForm.price) || 0,
-          currency: 'GHS',
+          currency: accountCurrency,
           category: catalogForm.category,
           description: catalogForm.description.trim() || 'New item from your business catalog.',
           stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
@@ -2665,7 +2790,7 @@ function AppContent() {
         body: JSON.stringify({
           action: paySheet === 'topup' ? 'topup' : paySheet,
           amount,
-          currency: 'GHS',
+          currency: accountCurrency,
           phone: payForm.phone.trim() || undefined,
           note: payForm.note.trim() || undefined,
           provider: 'mtn_momo',
@@ -2686,7 +2811,7 @@ function AppContent() {
               ? `Requested from ${payForm.phone.trim()}`
               : 'Wallet top up',
         time: 'Just now',
-        amount: `${paySheet === 'request' ? '+' : '-'}GHC ${amount.toFixed(2)}`,
+        amount: `${paySheet === 'request' ? '+' : '-'}${accountCurrency} ${amount.toFixed(2)}`,
         positive: paySheet === 'request' || paySheet === 'topup',
       };
       setPayHistoryItems((current) => [entry, ...current]);
@@ -4452,6 +4577,12 @@ function AppContent() {
   const renderCalls = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
       <Text style={styles.secondaryTitle}>Calls</Text>
+      {calls.length ? null : (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>No calls yet</Text>
+          <Text style={styles.cardBody}>Open a chat and start an audio or video call. Calls with your contacts show up here.</Text>
+        </View>
+      )}
       {calls.map((call) => (
         <View key={call.id} style={styles.card}>
           <Text style={styles.cardTitle}>{call.name}</Text>
@@ -4480,8 +4611,8 @@ function AppContent() {
       >
         <View style={styles.payHeroCard}>
           <Text style={styles.payHeroLabel}>Wallet balance</Text>
-          <Text style={styles.payHeroAmount}>GHC 1,240.50</Text>
-          <Text style={styles.payHeroMeta}>MTN MoMo •••• 8821 · Synced now</Text>
+          <Text style={styles.payHeroAmount}>{accountCurrency} 0.00</Text>
+          <Text style={styles.payHeroMeta}>No mobile-money wallet linked yet</Text>
           <View style={styles.payHeroActions}>
             {[
               { label: 'Send', icon: '↗', action: 'send' },
@@ -4539,7 +4670,10 @@ function AppContent() {
 
         <Text style={styles.lightSectionTitle}>Recent transactions</Text>
         <View style={styles.payTransactionList}>
-          {[...payHistoryItems, ...payTransactions].map((transaction, index, list) => (
+          {payHistoryItems.length ? null : (
+            <Text style={styles.cardBody}>No payments yet. Send, request, or top up to see them here.</Text>
+          )}
+          {payHistoryItems.map((transaction, index, list) => (
             <View key={transaction.id} style={[styles.payTransactionRow, index === list.length - 1 ? styles.payTransactionRowLast : null]}>
               <View style={[styles.payTransactionAvatar, { backgroundColor: ['#dff3ec', '#dbe7f4', '#e9efe1'][index % 3] }]}>
                 <Text style={styles.payTransactionAvatarText}>{transaction.title.slice(0, 1).toUpperCase()}</Text>
@@ -4637,11 +4771,12 @@ function AppContent() {
   };
 
   const renderBusiness = () => {
-    const businessName = profile.businessName || profile.name || authForm.name || 'Maame Sika Store';
-    const customerCount = Math.max(contactItems.length, visibleChatItems.length, 12);
-    const orderCount = Math.max(chatItems.length, 12);
-    const catalogCount = Math.max(filteredCatalogItems.length, 24);
-    const todaySales = 840 + (filteredCatalogItems.length * 5);
+    const businessName = profile.businessName || profile.name || 'Your business';
+    const registeredCustomers = contactItems.filter((contact) => contact.registered || contact.linkedUserId);
+    const customerCount = registeredCustomers.length;
+    const orderCount = payHistoryItems.length;
+    const catalogCount = filteredCatalogItems.length;
+    const lowStockItem = filteredCatalogItems.find((item) => Number(item.stockQuantity ?? 0) > 0 && Number(item.stockQuantity) <= 2);
 
     return (
       <View style={styles.lightScreen}>
@@ -4659,25 +4794,31 @@ function AppContent() {
           contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.businessAlertCard}>
-            <Text style={styles.businessAlertText}>Low stock alert: Ankara dress (2 left)</Text>
-          </View>
+          {lowStockItem ? (
+            <View style={styles.businessAlertCard}>
+              <Text style={styles.businessAlertText}>
+                Low stock: {lowStockItem.title} ({lowStockItem.stockQuantity} left)
+              </Text>
+            </View>
+          ) : null}
 
           <View style={styles.businessHeroCard}>
             <Text numberOfLines={1} style={styles.businessHeroTitle}>{businessName}</Text>
-            <Text style={styles.businessHeroMeta}>Verified business · Accra, Ghana</Text>
+            <Text style={styles.businessHeroMeta}>
+              {accountCountry?.name ? `${accountCurrency} · ${accountCountry.name}` : accountCurrency}
+            </Text>
             <View style={styles.businessStatsRow}>
               <View style={styles.businessStatCard}>
-                <Text style={styles.businessStatValue}>GHC {todaySales}</Text>
-                <Text style={styles.businessStatLabel}>Today's sales</Text>
+                <Text style={styles.businessStatValue}>{catalogCount}</Text>
+                <Text style={styles.businessStatLabel}>Products</Text>
               </View>
               <View style={styles.businessStatCard}>
                 <Text style={styles.businessStatValue}>{orderCount}</Text>
-                <Text style={styles.businessStatLabel}>Orders</Text>
+                <Text style={styles.businessStatLabel}>Payments</Text>
               </View>
               <View style={styles.businessStatCard}>
-                <Text style={styles.businessStatValue}>98%</Text>
-                <Text style={styles.businessStatLabel}>Response rate</Text>
+                <Text style={styles.businessStatValue}>{customerCount}</Text>
+                <Text style={styles.businessStatLabel}>Customers</Text>
               </View>
             </View>
           </View>
@@ -4697,7 +4838,7 @@ function AppContent() {
             >
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◌</Text></View>
               <Text style={styles.businessGridTitle}>Customers</Text>
-              <Text style={styles.businessGridMeta}>{customerCount} total</Text>
+              <Text style={styles.businessGridMeta}>{customerCount} on ZynkUp</Text>
             </Pressable>
             <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('receipts')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>□</Text></View>
@@ -5086,6 +5227,11 @@ function AppContent() {
         <Text style={styles.settingsProfileName}>{profile.name || 'Your name'}</Text>
         <Text style={styles.settingsProfileMeta}>{profile.about || 'Hey there! I am using ZynkUp.'}</Text>
         <Text style={styles.settingsProfileMeta}>{profile.phone || 'Add your phone number'}</Text>
+        <Text style={styles.settingsProfileMeta}>{accountCurrency}{accountCountry?.name ? ` · ${accountCountry.name}` : ''}</Text>
+      </Pressable>
+
+      <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
+        <Text style={styles.sendButtonText}>Sync contacts</Text>
       </Pressable>
 
       <View style={styles.card}>
@@ -5974,7 +6120,18 @@ function AppContent() {
                     ? `${statusAssetUris.length} ${statusComposerMode}${statusAssetUris.length > 1 ? 's' : ''} selected`
                     : `Tap to choose ${statusComposerMode}`}
                 </Text>
-                <Text style={styles.statusMediaPickerMeta}>WhatsApp-style media status with optional caption</Text>
+                <Text style={styles.statusMediaPickerMeta}>Photo, video, or product update</Text>
+                {statusAssetUris.length ? (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.mediaPreviewRow}>
+                    {statusAssetUris.map((uri) => (
+                      statusComposerMode === 'video' ? (
+                        <Video key={uri} source={{ uri }} style={styles.mediaPreviewThumb} paused resizeMode="cover" />
+                      ) : (
+                        <Image key={uri} source={{ uri }} style={styles.mediaPreviewThumb} />
+                      )
+                    ))}
+                  </ScrollView>
+                ) : null}
               </Pressable>
             )}
             <TextInput
@@ -6351,6 +6508,13 @@ function AppContent() {
                     {catalogImageUris.length ? `${catalogImageUris.length} image(s) selected` : 'Add product images'}
                   </Text>
                 </Pressable>
+                {catalogImageUris.length ? (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.mediaPreviewRow}>
+                    {catalogImageUris.map((uri) => (
+                      <Image key={uri} source={{ uri }} style={styles.mediaPreviewThumb} />
+                    ))}
+                  </ScrollView>
+                ) : null}
                 <TextInput
                   value={catalogForm.title}
                   onChangeText={(value) => setCatalogForm((current) => ({ ...current, title: value }))}
@@ -6361,7 +6525,7 @@ function AppContent() {
                 <TextInput
                   value={catalogForm.price}
                   onChangeText={(value) => setCatalogForm((current) => ({ ...current, price: value }))}
-                  placeholder="Price (GHS)"
+                  placeholder={`Price (${accountCurrency})`}
                   placeholderTextColor="#7d8b92"
                   keyboardType="decimal-pad"
                   style={styles.input}
@@ -6420,19 +6584,13 @@ function AppContent() {
 
             {businessPanel === 'customers' ? (
               <ScrollView style={styles.businessPanelScroll}>
-                {(contactItems.length
-                  ? contactItems
-                  : Object.values(usersById)
-                      .filter((user) => user.id !== currentUserId)
-                      .map((user) => ({
-                        id: user.id,
-                        name: user.name,
-                        phone: user.phone,
-                        linkedUserId: user.id,
-                        registered: true,
-                        presence: user.presence,
-                      }))
-                ).map((customer) => (
+                <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
+                  <Text style={styles.sendButtonText}>Sync contacts</Text>
+                </Pressable>
+                {contactItems.length ? null : (
+                  <Text style={styles.cardBody}>No customers yet. Sync your phone book to find people already on ZynkUp.</Text>
+                )}
+                {contactItems.map((customer) => (
                   <Pressable
                     key={customer.id}
                     style={styles.sheetOption}
@@ -6455,7 +6613,10 @@ function AppContent() {
 
             {businessPanel === 'receipts' ? (
               <ScrollView style={styles.businessPanelScroll}>
-                {[...payHistoryItems, ...payTransactions].map((receipt) => (
+                {payHistoryItems.length ? null : (
+                  <Text style={styles.cardBody}>No receipts yet. Payments you send or receive will show here.</Text>
+                )}
+                {payHistoryItems.map((receipt) => (
                   <View key={receipt.id} style={styles.sheetOption}>
                     <Text style={styles.sheetOptionTitle}>{receipt.title}</Text>
                     <Text style={styles.sheetOptionBody}>{receipt.time} · {receipt.amount}</Text>
@@ -6510,7 +6671,10 @@ function AppContent() {
             </View>
             {paySheet === 'history' ? (
               <ScrollView style={styles.businessPanelScroll}>
-                {[...payHistoryItems, ...payTransactions].map((item) => (
+                {payHistoryItems.length ? null : (
+                  <Text style={styles.cardBody}>No payments yet.</Text>
+                )}
+                {payHistoryItems.map((item) => (
                   <View key={item.id} style={styles.sheetOption}>
                     <Text style={styles.sheetOptionTitle}>{item.title}</Text>
                     <Text style={styles.sheetOptionBody}>{item.time} · {item.amount}</Text>
@@ -6532,7 +6696,7 @@ function AppContent() {
                 <TextInput
                   value={payForm.amount}
                   onChangeText={(value) => setPayForm((current) => ({ ...current, amount: value }))}
-                  placeholder="Amount (GHS)"
+                  placeholder={`Amount (${accountCurrency})`}
                   placeholderTextColor="#7d8b92"
                   keyboardType="decimal-pad"
                   style={styles.input}
@@ -6579,15 +6743,7 @@ function AppContent() {
               {(() => {
                 const query = newChatQuery.trim().toLowerCase();
                 const registeredContacts = contactItems.filter((contact) => contact.registered && contact.linkedUserId);
-                const fallbackUsers = Object.values(usersById).filter((user) => user.id !== currentUserId);
-                const rows = (registeredContacts.length ? registeredContacts : fallbackUsers.map((user) => ({
-                  id: user.id,
-                  name: user.name,
-                  phone: user.phone,
-                  linkedUserId: user.id,
-                  registered: true,
-                  presence: user.presence,
-                }))).filter((entry) => {
+                const rows = registeredContacts.filter((entry) => {
                   if (!query) return true;
                   return (
                     entry.name?.toLowerCase().includes(query)
@@ -7716,6 +7872,17 @@ const styles = StyleSheet.create({
   catalogManageImage: {
     width: 64,
     height: 64,
+    borderRadius: 12,
+    backgroundColor: '#eef3f5',
+  },
+  mediaPreviewRow: {
+    flexDirection: 'row',
+    gap: 8,
+    paddingVertical: 10,
+  },
+  mediaPreviewThumb: {
+    width: 84,
+    height: 84,
     borderRadius: 12,
     backgroundColor: '#eef3f5',
   },
