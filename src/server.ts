@@ -552,10 +552,10 @@ const syncContactsSchema = z.object({
   userId: z.string().min(1),
   contacts: z.array(
     z.object({
-      name: z.string().min(1).max(120),
-      phone: z.string().min(4).max(30),
+      name: z.string().max(120).optional(),
+      phone: z.string().max(40),
     }),
-  ).max(2000),
+  ).max(5000),
 });
 
 const createLinkRequestSchema = z.object({
@@ -593,7 +593,7 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(helmet());
-app.use(express.json());
+app.use(express.json({ limit: '8mb' }));
 app.use(morgan('dev'));
 app.use(STATIC_UPLOAD_PREFIX, express.static(UPLOADS_DIR));
 
@@ -1605,6 +1605,11 @@ const createAuthIdentity = async (
 
   const db = await getDb();
   if (!db) {
+    if (process.env.NODE_ENV === 'production') {
+      const error = new Error('Accounts cannot be saved because MongoDB is not connected on this server.');
+      (error as Error & { statusCode?: number }).statusCode = 503;
+      throw error;
+    }
     seedUsers.unshift(user);
     seedProfiles.unshift(profile);
     return { user, profile };
@@ -2714,12 +2719,24 @@ app.post('/api/auth/phone/complete', async (req, res) => {
     return res.status(409).json({ error: 'A user with that phone already exists' });
   }
 
-  const { user } = await createAuthIdentity(
-    parseResult.data.name,
-    parseResult.data.countryCode,
-    parseResult.data.phoneNumber,
-    parseResult.data.pin,
-  );
+  let user;
+  try {
+    ({ user } = await createAuthIdentity(
+      parseResult.data.name,
+      parseResult.data.countryCode,
+      parseResult.data.phoneNumber,
+      parseResult.data.pin,
+    ));
+  } catch (error) {
+    const statusCode = error instanceof Error ? (error as Error & { statusCode?: number }).statusCode : 0;
+    if (statusCode === 503) {
+      return res.status(503).json({
+        error: error instanceof Error ? error.message : 'MongoDB is not connected.',
+        code: 'DATABASE_UNAVAILABLE',
+      });
+    }
+    throw error;
+  }
   if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
     return res.status(409).json({
       error: 'Device limit reached. Log out from one of your linked devices and try again.',
@@ -2763,12 +2780,24 @@ app.post('/api/auth/phone/register', async (req, res) => {
     return res.status(409).json({ error: 'A user with that phone already exists' });
   }
 
-  const { user } = await createAuthIdentity(
-    parseResult.data.name,
-    parseResult.data.countryCode,
-    verifiedIdentity.phoneNumber,
-    parseResult.data.pin,
-  );
+  let user;
+  try {
+    ({ user } = await createAuthIdentity(
+      parseResult.data.name,
+      parseResult.data.countryCode,
+      verifiedIdentity.phoneNumber,
+      parseResult.data.pin,
+    ));
+  } catch (error) {
+    const statusCode = error instanceof Error ? (error as Error & { statusCode?: number }).statusCode : 0;
+    if (statusCode === 503) {
+      return res.status(503).json({
+        error: error instanceof Error ? error.message : 'MongoDB is not connected.',
+        code: 'DATABASE_UNAVAILABLE',
+      });
+    }
+    throw error;
+  }
   if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
     return res.status(409).json({
       error: 'Device limit reached. Log out from one of your linked devices and try again.',
@@ -2852,7 +2881,19 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(409).json({ error: 'A user with that phone already exists' });
   }
 
-  const { user } = await createAuthIdentity(parseResult.data.name, '', parseResult.data.phone);
+  let user;
+  try {
+    ({ user } = await createAuthIdentity(parseResult.data.name, '', parseResult.data.phone));
+  } catch (error) {
+    const statusCode = error instanceof Error ? (error as Error & { statusCode?: number }).statusCode : 0;
+    if (statusCode === 503) {
+      return res.status(503).json({
+        error: error instanceof Error ? error.message : 'MongoDB is not connected.',
+        code: 'DATABASE_UNAVAILABLE',
+      });
+    }
+    throw error;
+  }
   if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
     return res.status(409).json({
       error: 'Device limit reached. Log out from one of your linked devices and try again.',
@@ -2926,7 +2967,13 @@ app.post('/api/contacts/sync', async (req, res) => {
     });
   }
 
-  const syncedContacts = await syncDeviceContacts(parseResult.data.userId, parseResult.data.contacts);
+  const usableContacts = parseResult.data.contacts
+    .map((contact) => ({
+      name: (contact.name || 'Unknown').trim().slice(0, 80) || 'Unknown',
+      phone: contact.phone.replace(/[^\d+]/g, '').slice(0, 20),
+    }))
+    .filter((contact) => contact.phone.replace(/\D/g, '').length >= 8);
+  const syncedContacts = await syncDeviceContacts(parseResult.data.userId, usableContacts);
   return res.status(201).json({
     contacts: syncedContacts.filter((contact) => contact.registered),
   });
