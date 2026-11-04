@@ -1072,6 +1072,36 @@ function AppContent() {
     return null;
   };
 
+  const signOutKeepAccount = async () => {
+    const account = await readRememberedAccount();
+    const phone = account?.phone || profile.phone;
+    const parts = splitStoredPhone(phone);
+    if (phone) {
+      await writeRememberedAccount({
+        userId: account?.userId || currentUserId,
+        phone,
+        countryCode: account?.countryCode || profile.countryCode || parts.countryCode,
+        name: account?.name || profile.name || '',
+        currency: account?.currency || profile.currency || '',
+        lastActiveAt: Date.now() - SESSION_IDLE_MS - 1000,
+      });
+    }
+    setCurrentUserId('');
+    setAuthRequired(true);
+    setAuthVisible(true);
+    setAuthForm((current) => ({
+      ...current,
+      countryCode: parts.countryCode,
+      phone: parts.phone,
+      verifiedPhone: phone || '',
+      name: account?.name || profile.name || '',
+      pin: '',
+      otp: '',
+    }));
+    setAuthMode(phone ? 'pin' : 'phone');
+    showToast(phone ? 'Enter your PIN to open this account.' : 'Enter your phone number.', 'info', 2800);
+  };
+
   const resetAuthForm = () => {
     setAuthForm({
       countryCode: '+233',
@@ -1427,15 +1457,22 @@ function AppContent() {
 
     try {
       if (Platform.OS === 'android') {
-        const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
-        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-          showToast('Allow contacts access so ZynkUp can find people you can chat with.', 'error', 4200);
+        const permission = PermissionsAndroid.PERMISSIONS.READ_CONTACTS;
+        let granted = await PermissionsAndroid.check(permission);
+        if (!granted) {
+          const result = await PermissionsAndroid.request(permission);
+          granted = result === PermissionsAndroid.RESULTS.GRANTED;
+        }
+        if (!granted) {
+          showToast('Contacts are off. Allow ZynkUp to read contacts, then tap Sync again.', 'error', 4200);
+          await Linking.openSettings();
           return;
         }
       } else {
         const permission = await Contacts.requestPermission();
         if (permission !== 'authorized') {
-          showToast('Allow contacts access so ZynkUp can find people you can chat with.', 'error', 4200);
+          showToast('Contacts are off. Allow ZynkUp to read contacts, then tap Sync again.', 'error', 4200);
+          await Linking.openSettings();
           return;
         }
       }
@@ -1444,11 +1481,11 @@ function AppContent() {
       const payloadContacts = deviceContacts
         .flatMap((contact) =>
           (contact.phoneNumbers ?? []).map((entry) => ({
-            name: contact.displayName || 'Unknown',
-            phone: entry.number ?? '',
+            name: String(contact.displayName || 'Unknown').trim().slice(0, 80) || 'Unknown',
+            phone: String(entry.number || '').replace(/[^\d+]/g, '').slice(0, 20),
           })),
         )
-        .filter((contact) => contact.phone.trim().length >= 4);
+        .filter((contact) => contact.phone.replace(/\D/g, '').length >= 8);
 
       if (!payloadContacts.length) {
         setContactItems([]);
@@ -1470,7 +1507,8 @@ function AppContent() {
         }),
       });
       if (!response.ok) {
-        showToast('Contact sync failed. Check the connection and try again.', 'error', 3600);
+        const failure = await response.json().catch(() => ({}));
+        showToast(getBackendErrorMessage(failure, 'Contact sync failed. Check the connection and try again.'), 'error', 4200);
         return;
       }
 
@@ -5282,6 +5320,9 @@ function AppContent() {
             </Pressable>
           </View>
         )) : <Text style={styles.cardBody}>No extra linked devices yet.</Text>}
+        <Pressable style={styles.ghostButton} onPress={() => void signOutKeepAccount()}>
+          <Text style={styles.ghostButtonText}>Log out of this phone</Text>
+        </Pressable>
       </View>
 
       <Modal
@@ -5564,8 +5605,9 @@ function AppContent() {
                       <View style={styles.authPhoneRow}>
                         <Pressable style={styles.authCountryChip} onPress={() => setCountryPickerVisible(true)}>
                           <Text style={styles.authCountryChipText}>
-                            {selectedAuthCountry ? `${selectedAuthCountry.code} ${selectedAuthCountry.dialCode}` : 'GH +233'}
+                            {selectedAuthCountry?.dialCode || '+233'}
                           </Text>
+                          <Text style={styles.authCountryChevron}>▾</Text>
                         </Pressable>
                         <TextInput
                           value={authForm.phone}
@@ -8964,16 +9006,23 @@ const styles = StyleSheet.create({
   },
   authCountryChip: {
     minHeight: 58,
-    minWidth: 106,
+    minWidth: 108,
     borderRadius: 18,
     backgroundColor: '#f3f4f6',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 12,
+    flexDirection: 'row',
+    gap: 6,
+    paddingHorizontal: 14,
   },
   authCountryChipText: {
     color: '#111827',
-    fontSize: 15,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  authCountryChevron: {
+    color: '#111827',
+    fontSize: 14,
     fontWeight: '700',
   },
   authPhoneInput: {
