@@ -28,6 +28,7 @@ type User = {
   about: string;
   isBusiness: boolean;
   lastSeenAt?: string;
+  photoUri?: string;
 };
 
 type Message = {
@@ -160,6 +161,7 @@ type UpdateFeedEntry = {
   userId: string;
   name: string;
   avatar: string;
+  photoUri?: string;
   latestAt: string | null;
   items: StatusPost[];
 };
@@ -825,6 +827,7 @@ const buildUpdateFeed = (users: User[], statuses: StatusPost[]): UpdateFeedEntry
         userId: user.id,
         name: user.name,
         avatar: user.avatar,
+        photoUri: user.photoUri || '',
         latestAt: userStatuses[0]?.createdAt ?? null,
         items: userStatuses,
       };
@@ -1140,6 +1143,16 @@ const readUsers = async () => {
 
   await seedDatabaseIfNeeded();
   return withProjection(collectionsFor(db).users).toArray();
+};
+
+const readProfiles = async () => {
+  const db = await getDb();
+  if (!db) {
+    return [] as Profile[];
+  }
+
+  await seedDatabaseIfNeeded();
+  return withProjection(collectionsFor(db).profiles).toArray();
 };
 
 const readUserByPhone = async (phone: string) => {
@@ -1486,8 +1499,9 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     });
   }
 
-  const [users, chats, messages, contacts, calls, statuses, catalogItems] = await Promise.all([
+  const [rawUsers, profiles, chats, messages, contacts, calls, statuses, catalogItems] = await Promise.all([
     readUsers(),
+    readProfiles(),
     readChats(),
     readMessages(),
     readContacts(currentUserId),
@@ -1495,6 +1509,11 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     readStatuses(),
     readCatalogItems(),
   ]);
+  const photoByUserId = new Map(profiles.map((item) => [item.id, item.photoUri || '']));
+  const users = rawUsers.map((user) => ({
+    ...user,
+    photoUri: photoByUserId.get(user.id) || user.photoUri || '',
+  }));
   const visibleChats = chats
     .filter((chat) => chat.participants.includes(currentUserId))
     .map((chat) => {
