@@ -15,6 +15,7 @@ import {
   Animated,
   Easing,
   Image,
+  Linking,
   Modal,
   PermissionsAndroid,
   Platform,
@@ -49,9 +50,12 @@ const documentPickerModule = loadOptionalModule(() => require('@react-native-doc
 const DocumentPickerErrorCodes = documentPickerModule?.errorCodes ?? {};
 const isDocumentPickerErrorWithCode = documentPickerModule?.isErrorWithCode ?? (() => false);
 const pickDocument = documentPickerModule?.pick ?? null;
+const keepLocalDocumentCopy = documentPickerModule?.keepLocalCopy ?? null;
 const DocumentPickerTypes = documentPickerModule?.types ?? {};
 const launchImageLibrary = loadOptionalModule(() => require('react-native-image-picker'))?.launchImageLibrary
   ?? null;
+const Geolocation = loadOptionalModule(() => require('@react-native-community/geolocation'))?.default
+  ?? loadOptionalModule(() => require('@react-native-community/geolocation'));
 // Not autolinked in the current Android PackageList; keep disabled until linked.
 const Tts = null;
 
@@ -164,11 +168,7 @@ const statusFontOptions = ['System', 'serif', 'monospace'];
 const statusReactionOptions = ['❤️', '👍', '👎', '🔥', '😂'];
 const EMOJI_REGEX = /\p{Extended_Pictographic}/gu;
 const LAUGHING_EMOJIS = new Set(['😂', '🤣', '😆', '😄', '😹']);
-const API_BASE_URL = Platform.select({
-  // Use adb reverse for Android debug runs so the same host works on emulator and physical devices.
-  android: 'http://localhost:4000',
-  default: 'http://localhost:4000',
-});
+const API_BASE_URL = 'https://zynkup-api-597625475865.europe-west9.run.app';
 const DEVICE_STORAGE_KEY = 'zynkup-mobile-device-id';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
@@ -449,6 +449,12 @@ function AppContent() {
   const forgotPinFlowRef = useRef(false);
   const toastTimeoutRef = useRef(null);
   const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
+  const currentUserIdRef = useRef('');
+  const usersByIdRef = useRef({});
+  const chatScreenRef = useRef('list');
+  const selectedChatIdRef = useRef('');
+  const profileNameRef = useRef('');
+  const currentDeviceIdRef = useRef('');
 
   const emojiAnim = useRef(new Animated.Value(0)).current;
   const animationRef = useRef(null);
@@ -671,22 +677,33 @@ function AppContent() {
     showToast(exists ? 'Chat unarchived' : 'Chat archived', 'success', 1400);
   };
 
-  const mapServerMessage = (message, userId = currentUserId) => ({
-    id: message.id,
-    clientRef: message.clientRef,
-    mine: message.senderId === userId,
-    kind: message.deletedForEveryone ? 'text' : message.kind === 'file' ? 'text' : message.kind,
-    text: message.text,
-    time: formatClock(message.sentAt),
-    imageUri: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
-    audioUri: message.deletedForEveryone ? undefined : message.mediaUrls?.[0],
-    videoUri: message.deletedForEveryone ? undefined : message.kind === 'video' ? message.mediaUrls?.[0] : undefined,
-    durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
-    receiptState: message.state,
-    replyToMessageId: message.replyToMessageId,
-    replyPreview: message.replyPreview,
-    deletedForEveryone: Boolean(message.deletedForEveryone),
-  });
+  const mapServerMessage = (message, userId = currentUserId) => {
+    const deleted = Boolean(message.deletedForEveryone);
+    const mediaUrl = deleted ? undefined : message.mediaUrls?.[0];
+    const locationMatch = !deleted && message.kind !== 'file'
+      ? /^📍\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)(?:\|([\s\S]*))?$/.exec(message.text || '')
+      : null;
+    const kind = deleted ? 'text' : locationMatch ? 'location' : message.kind;
+
+    return {
+      id: message.id,
+      clientRef: message.clientRef,
+      mine: message.senderId === userId,
+      kind,
+      text: locationMatch ? (locationMatch[3]?.trim() || 'Shared location') : message.text,
+      time: formatClock(message.sentAt),
+      imageUri: kind === 'image' ? mediaUrl : undefined,
+      audioUri: kind === 'voice' || kind === 'audio' ? mediaUrl : undefined,
+      videoUri: kind === 'video' ? mediaUrl : undefined,
+      fileUri: kind === 'file' ? mediaUrl : undefined,
+      location: locationMatch ? `${locationMatch[1]},${locationMatch[2]}` : undefined,
+      durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
+      receiptState: message.state,
+      replyToMessageId: message.replyToMessageId,
+      replyPreview: message.replyPreview,
+      deletedForEveryone: deleted,
+    };
+  };
 
   const clearChatUnread = (chatId) => {
     if (!chatId || !currentUserId) {
@@ -777,11 +794,17 @@ function AppContent() {
                 chatId: chat.id,
                 senderId: currentUserId,
                 clientRef: `fwd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                kind: message.kind === 'image' || message.kind === 'voice' || message.kind === 'video' ? message.kind : 'text',
-                text: message.text || 'Forwarded message',
-                mediaUrls: message.imageUri || message.audioUri || message.videoUri
-                  ? [message.imageUri || message.audioUri || message.videoUri].filter(Boolean)
-                  : [],
+                kind: message.kind === 'location'
+                  ? 'text'
+                  : message.kind === 'audio'
+                    ? 'voice'
+                    : message.kind === 'image' || message.kind === 'voice' || message.kind === 'video' || message.kind === 'file'
+                      ? message.kind
+                      : 'text',
+                text: message.kind === 'location' && message.location
+                  ? `📍 ${message.location}|${message.text || 'Shared location'}`
+                  : (message.text || 'Forwarded message'),
+                mediaUrls: [message.imageUri, message.audioUri, message.videoUri, message.fileUri].filter((uri) => /^https?:\/\//i.test(uri || '')),
               }),
             }).catch(() => undefined);
             showToast(`Forwarded to ${chat.name}`, 'success', 1600);
@@ -1180,7 +1203,7 @@ function AppContent() {
       showToast('Enter a new 4–6 digit PIN.', 'error');
       return;
     }
-    if (!phoneAuthChallengeIdRef.current) {
+    if (!phoneAuthChallengeIdRef.current && !phoneAuthIdTokenRef.current) {
       showToast('Verify OTP first, then set a new PIN.', 'error');
       return;
     }
@@ -1192,7 +1215,8 @@ function AppContent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...authDevicePayload(),
-          challengeId: phoneAuthChallengeIdRef.current,
+          challengeId: phoneAuthChallengeIdRef.current || undefined,
+          idToken: phoneAuthIdTokenRef.current || undefined,
           pin: authForm.pin.trim(),
           platform: Platform.OS,
           label: `${Platform.OS} device`,
@@ -1256,12 +1280,19 @@ function AppContent() {
         return;
       }
 
-      // New user or account without PIN — verify via OTP.
+      // New user or account without PIN — real SMS via Firebase on release builds.
       forgotPinFlowRef.current = false;
-      phoneAuthProviderRef.current = 'backend';
-      await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
-    } catch {
-      showToast('Network error while checking this phone number.', 'error');
+      setAuthPendingAction('send-code');
+      await deliverPhoneOtp(countryCode, phoneNumber, normalizedPhone);
+    } catch (error) {
+      const firebaseCode = error?.code ?? '';
+      showToast(
+        firebaseCode
+          ? `SMS was not sent (${firebaseCode}). Check Firebase Phone auth billing and the test-number list.`
+          : error?.message || 'SMS was not sent. Check Firebase Phone auth.',
+        'error',
+        5200,
+      );
     } finally {
       setAuthPendingAction('');
     }
@@ -1292,13 +1323,29 @@ function AppContent() {
       throw new Error('native-webrtc-unavailable');
     }
 
-    if (callMediaStreamRef.current) {
-      return callMediaStreamRef.current;
+    const wantsVideo = String(kind || '').toLowerCase() === 'video';
+    if (Platform.OS === 'android') {
+      const permissions = [PermissionsAndroid.PERMISSIONS.RECORD_AUDIO];
+      if (wantsVideo) {
+        permissions.push(PermissionsAndroid.PERMISSIONS.CAMERA);
+      }
+      const results = await PermissionsAndroid.requestMultiple(permissions);
+      const denied = permissions.some((permission) => results[permission] !== PermissionsAndroid.RESULTS.GRANTED);
+      if (denied) {
+        throw new Error('permission-denied');
+      }
     }
+
+    const existing = callMediaStreamRef.current;
+    const existingHasVideo = existing?.getVideoTracks?.().some((track) => track.readyState === 'live');
+    if (existing && (!wantsVideo || existingHasVideo)) {
+      return existing;
+    }
+    existing?.getTracks?.().forEach((track) => track.stop());
 
     const stream = await mediaDevices.getUserMedia({
       audio: true,
-      video: kind === 'Video',
+      video: wantsVideo,
     });
     callMediaStreamRef.current = stream;
     setLocalCallStream(stream);
@@ -1568,7 +1615,7 @@ function AppContent() {
           item.id === incomingMessage.id ||
           (incomingMessage.clientRef && item.clientRef === incomingMessage.clientRef),
       );
-      const mapped = mapServerMessage(incomingMessage, currentUserId);
+      const mapped = mapServerMessage(incomingMessage, currentUserIdRef.current);
 
       if (existingIndex >= 0) {
         const next = [...existing];
@@ -1580,10 +1627,19 @@ function AppContent() {
     });
   };
 
+  currentUserIdRef.current = currentUserId;
+  usersByIdRef.current = usersById;
+  chatScreenRef.current = chatScreen;
+  selectedChatIdRef.current = selectedChatId;
+  profileNameRef.current = profile.name || '';
+  currentDeviceIdRef.current = currentDeviceId;
+
   const upsertStatus = (status) => {
+    const knownUsers = usersByIdRef.current;
+    const me = currentUserIdRef.current;
     const mappedStatus = {
       ...status,
-      author: usersById[status.userId]?.name ?? (status.userId === currentUserId ? 'You' : 'User'),
+      author: knownUsers[status.userId]?.name ?? (status.userId === me ? 'You' : 'User'),
       postedAt: formatClock(status.createdAt),
     };
 
@@ -1613,8 +1669,8 @@ function AppContent() {
         : [
             {
               userId: status.userId,
-              name: usersById[status.userId]?.name ?? (status.userId === currentUserId ? profile.name : 'Contact'),
-              avatar: usersById[status.userId]?.avatar ?? (status.userId === currentUserId ? profile.name.slice(0, 2).toUpperCase() : 'CT'),
+              name: knownUsers[status.userId]?.name ?? (status.userId === me ? profileNameRef.current : 'Contact'),
+              avatar: knownUsers[status.userId]?.avatar ?? (status.userId === me ? (profileNameRef.current || 'ZU').slice(0, 2).toUpperCase() : 'CT'),
               latestAt: status.createdAt,
               items: [status],
             },
@@ -1916,16 +1972,16 @@ function AppContent() {
     const socket = io(API_BASE_URL, { transports: ['websocket', 'polling'] });
     socketRef.current = socket;
     socket.on('system:ready', (payload) => {
-      if (payload.bootstrap && !currentDeviceId) {
+      if (payload.bootstrap && !currentDeviceIdRef.current) {
         applyBootstrapPayload(payload.bootstrap);
       }
     });
     socket.on('message:new', (message) => {
       reconcileIncomingMessage(message.chatId, message);
 
-      if (message.senderId !== currentUserId) {
+      if (message.senderId !== currentUserIdRef.current) {
         const settings = appSettingsRef.current;
-        const viewingChat = chatScreen === 'detail' && selectedChatId === message.chatId;
+        const viewingChat = chatScreenRef.current === 'detail' && selectedChatIdRef.current === message.chatId;
         const nextReceipt =
           viewingChat && settings.readReceiptsEnabled ? 'read' : 'delivered';
         void syncReceiptState(message.id, nextReceipt);
@@ -1935,7 +1991,7 @@ function AppContent() {
           !viewingChat &&
           !mutedChatIdsRef.current.includes(message.chatId)
         ) {
-          const senderName = usersById[message.senderId]?.name || 'New message';
+          const senderName = usersByIdRef.current[message.senderId]?.name || 'New message';
           const preview = settings.showNotificationPreview
             ? (message.text || (message.kind === 'image' ? 'Photo' : message.kind === 'voice' ? 'Voice message' : 'New message'))
             : 'New message';
@@ -1947,7 +2003,7 @@ function AppContent() {
       if (!message?.chatId) {
         return;
       }
-      if (scope === 'me' && userId !== currentUserId) {
+      if (scope === 'me' && userId !== currentUserIdRef.current) {
         return;
       }
       if (scope === 'me') {
@@ -1960,7 +2016,7 @@ function AppContent() {
       reconcileIncomingMessage(message.chatId, message);
     });
     socket.on('typing:update', ({ chatId, userId, typing }) => {
-      if (!chatId || userId === currentUserId) {
+      if (!chatId || userId === currentUserIdRef.current) {
         return;
       }
       setPeerTypingByChat((current) => ({ ...current, [chatId]: Boolean(typing) }));
@@ -1986,7 +2042,7 @@ function AppContent() {
       );
     });
     socket.on('chat:updated', (chat) => {
-      if (chat.viewerUserId && chat.viewerUserId !== currentUserId) {
+      if (chat.viewerUserId && chat.viewerUserId !== currentUserIdRef.current) {
         return;
       }
       setChatItems((current) =>
@@ -2003,12 +2059,12 @@ function AppContent() {
       );
     });
     socket.on('chat:created', (chat) => {
-      if (!(chat.participants ?? []).includes(currentUserId)) {
+      if (!(chat.participants ?? []).includes(currentUserIdRef.current)) {
         return;
       }
 
       setChatItems((current) => {
-        const mapped = mapChatFromServer(chat, currentUserId, usersById);
+        const mapped = mapChatFromServer(chat, currentUserIdRef.current, usersByIdRef.current);
         if (current.some((item) => item.id === mapped.id)) {
           return current;
         }
@@ -2044,7 +2100,7 @@ function AppContent() {
             title: item.title,
             price: `${item.currency ?? 'GHS'} ${item.price}`,
             category: item.category,
-            seller: profile.name,
+            seller: usersByIdRef.current[item.sellerId]?.name || 'Seller',
             description: item.description,
             stockQuantity: item.stockQuantity ?? 0,
             imageUri: item.imageUrls?.[0] ?? null,
@@ -2089,23 +2145,23 @@ function AppContent() {
       upsertStatus(status);
     });
     socket.on('call:created', (call) => {
-      if ((call.participantIds ?? []).includes(currentUserId)) {
+      if ((call.participantIds ?? []).includes(currentUserIdRef.current)) {
         upsertCall(call);
       }
     });
     socket.on('call:incoming', (call) => {
-      if ((call.participantIds ?? []).includes(currentUserId)) {
+      if ((call.participantIds ?? []).includes(currentUserIdRef.current)) {
         upsertCall(call);
       }
     });
     socket.on('call:updated', (call) => {
-      if ((call.participantIds ?? []).includes(currentUserId)) {
+      if ((call.participantIds ?? []).includes(currentUserIdRef.current)) {
         upsertCall(call);
       }
     });
     socket.on('call:participantJoined', ({ callId, userId }) => {
       const currentCall = activeCallRef.current;
-      if (!currentCall || currentCall.id !== callId || currentCall.initiatorId !== currentUserId) {
+      if (!currentCall || currentCall.id !== callId || currentCall.initiatorId !== currentUserIdRef.current) {
         return;
       }
 
@@ -2154,17 +2210,17 @@ function AppContent() {
       })();
     });
 
-    if (currentUserId) {
-      socket.emit('presence:update', { userId: currentUserId, presence: 'online' });
+    if (currentUserIdRef.current) {
+      socket.emit('presence:update', { userId: currentUserIdRef.current, presence: 'online' });
     }
 
     return () => {
-      if (currentUserId) {
-        socket.emit('presence:update', { userId: currentUserId, presence: 'offline' });
+      if (currentUserIdRef.current) {
+        socket.emit('presence:update', { userId: currentUserIdRef.current, presence: 'offline' });
       }
       socket.disconnect();
     };
-  }, [chatScreen, currentDeviceId, currentUserId, profile.name, selectedChatId, usersById]);
+  }, [currentUserId]);
 
   useEffect(() => {
     void (async () => {
@@ -2505,11 +2561,20 @@ function AppContent() {
       return;
     }
 
+    if (!catalogImageUris.length) {
+      showToast('Add a product photo before publishing.', 'error');
+      return;
+    }
+
     showToast('Saving catalog item...', 'info', 0);
     const uploadedImageUrls = await uploadUris(catalogImageUris, {
       names: catalogImageUris.map((_, index) => `catalog-${Date.now()}-${index}.jpg`),
       fallbackType: 'image/jpeg',
     }).catch(() => []);
+    if (!uploadedImageUrls.length) {
+      showToast('Photo upload failed. Check the connection and try again.', 'error', 3600);
+      return;
+    }
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/catalog`, {
@@ -2523,9 +2588,7 @@ function AppContent() {
           category: catalogForm.category,
           description: catalogForm.description.trim() || 'New item from your business catalog.',
           stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
-          imageUrls: uploadedImageUrls.length
-            ? uploadedImageUrls
-            : ['https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=900&q=80'],
+          imageUrls: uploadedImageUrls,
         }),
       });
       if (!response.ok) {
@@ -2560,8 +2623,22 @@ function AppContent() {
       }
       const payload = await response.json();
       if (payload.item) {
+        const item = payload.item;
         setCatalogItems((current) =>
-          current.map((item) => (item.id === payload.item.id ? { ...item, ...payload.item } : item)),
+          current.map((entry) =>
+            entry.id === item.id
+              ? {
+                  ...entry,
+                  title: item.title ?? entry.title,
+                  price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
+                  category: item.category ?? entry.category,
+                  description: item.description ?? entry.description,
+                  stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
+                  imageUri: item.imageUrls?.[0] ?? entry.imageUri,
+                  imageUris: item.imageUrls ?? entry.imageUris,
+                }
+              : entry,
+          ),
         );
       }
     } catch {
@@ -2686,31 +2763,54 @@ function AppContent() {
 
   const addAttachmentMessage = (kind, name, source, uri = null) => {
     const clientRef = `mobile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const normalizedKind = kind === 'document' ? 'file' : kind;
     appendMessage({
       id: `m${Date.now()}`,
       clientRef,
       mine: true,
-      kind,
+      kind: normalizedKind,
       text: name,
       time: 'Now',
       receiptState: 'sent',
-      attachment: { kind, name, source },
-      imageUri: kind === 'image' ? uri : undefined,
-      videoUri: kind === 'video' ? uri : undefined,
+      attachment: { kind: normalizedKind, name, source },
+      imageUri: normalizedKind === 'image' ? uri : undefined,
+      videoUri: normalizedKind === 'video' ? uri : undefined,
+      audioUri: normalizedKind === 'audio' || normalizedKind === 'voice' ? uri : undefined,
+      fileUri: normalizedKind === 'file' ? uri : undefined,
     });
     return clientRef;
   };
 
   const persistAttachmentMessage = async (kind, name, source, uri = null) => {
-    const clientRef = addAttachmentMessage(kind, name, source, uri);
+    if (!selectedChatId || !uri) {
+      showToast('Open a chat and choose a file first.', 'error');
+      return;
+    }
+    const normalizedKind = kind === 'document' ? 'file' : kind === 'audio' ? 'voice' : kind;
+    const clientRef = addAttachmentMessage(normalizedKind, name, source, uri);
+    const fallbackType =
+      normalizedKind === 'image'
+        ? 'image/jpeg'
+        : normalizedKind === 'video'
+          ? 'video/mp4'
+          : normalizedKind === 'voice'
+            ? 'audio/mpeg'
+            : 'application/octet-stream';
 
-    const uploadedUrls = uri
-      ? await uploadUris([uri], {
-          names: [name],
-          fallbackType:
-            kind === 'image' ? 'image/jpeg' : kind === 'video' ? 'video/mp4' : 'application/octet-stream',
-        }).catch(() => [])
-      : [];
+    let uploadedUrls = [];
+    try {
+      uploadedUrls = await uploadUris([uri], {
+        names: [name],
+        fallbackType: inferMimeType(uri, fallbackType),
+      });
+    } catch {
+      uploadedUrls = [];
+    }
+
+    if (!uploadedUrls.length) {
+      showToast('Upload failed. The file stayed on this phone only.', 'error', 3600);
+      return;
+    }
 
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
@@ -2719,11 +2819,13 @@ function AppContent() {
         chatId: selectedChatId,
         senderId: currentUserId,
         clientRef,
-        kind: kind === 'document' ? 'file' : kind,
-        text: name,
+        kind: normalizedKind,
+        text: name || (normalizedKind === 'voice' ? 'Audio' : 'File'),
         mediaUrls: uploadedUrls,
       }),
-    }).catch(() => undefined);
+    }).catch(() => {
+      showToast('Could not send that file.', 'error');
+    });
   };
 
   const openGallery = async (kind) => {
@@ -2754,19 +2856,92 @@ function AppContent() {
         ? [DocumentPickerTypes.images]
         : kind === 'video'
           ? [DocumentPickerTypes.video]
-          : [DocumentPickerTypes.allFiles];
+          : kind === 'audio'
+            ? [DocumentPickerTypes.audio || DocumentPickerTypes.allFiles]
+            : [DocumentPickerTypes.allFiles];
     try {
       const [asset] = await pickDocument({
         type,
-        copyTo: 'cachesDirectory',
         allowMultiSelection: false,
       });
-      persistAttachmentMessage(kind, asset.name, 'file manager', asset.uri);
+      let uri = asset.uri;
+      if (keepLocalDocumentCopy && asset.uri) {
+        const [copy] = await keepLocalDocumentCopy({
+          destination: 'cachesDirectory',
+          files: [{ uri: asset.uri, fileName: asset.name || `upload-${Date.now()}` }],
+        });
+        if (copy?.status === 'success' && copy.localUri) {
+          uri = copy.localUri;
+        }
+      }
+      persistAttachmentMessage(kind, asset.name || 'File', 'file manager', uri);
     } catch (error) {
       if (!(isDocumentPickerErrorWithCode(error) && error.code === DocumentPickerErrorCodes.OPERATION_CANCELED)) {
         Alert.alert('Files', 'Unable to open the file picker right now.');
       }
     }
+  };
+
+  const shareCurrentLocation = async () => {
+    setSheetStep('closed');
+    if (!selectedChatId) {
+      showToast('Open a chat before sharing your location.', 'error');
+      return;
+    }
+    if (!Geolocation?.getCurrentPosition) {
+      showToast('Location is not available in this build.', 'error');
+      return;
+    }
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION);
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        showToast('Allow location access to share where you are.', 'error');
+        return;
+      }
+    }
+
+    showToast('Finding your location...', 'info', 0);
+    Geolocation.getCurrentPosition(
+      (position) => {
+        const latitude = Number(position?.coords?.latitude);
+        const longitude = Number(position?.coords?.longitude);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          showToast('Could not read a GPS fix.', 'error');
+          return;
+        }
+        const coords = `${latitude.toFixed(6)},${longitude.toFixed(6)}`;
+        const clientRef = `mobile-loc-${Date.now()}`;
+        appendMessage({
+          id: `m${Date.now()}`,
+          clientRef,
+          mine: true,
+          kind: 'location',
+          text: 'Shared location',
+          location: coords,
+          time: 'Now',
+          receiptState: 'sent',
+        });
+        fetch(`${API_BASE_URL}/api/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chatId: selectedChatId,
+            senderId: currentUserId,
+            clientRef,
+            kind: 'text',
+            text: `📍 ${coords}|Shared location`,
+            mediaUrls: [],
+          }),
+        }).catch(() => {
+          showToast('Location could not be sent.', 'error');
+        });
+        showToast('Location sent', 'success', 1600);
+      },
+      () => {
+        showToast('Location timed out. Turn on GPS and try again.', 'error', 3600);
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 10000 },
+    );
   };
 
   const chooseAttachmentSource = async (source) => {
@@ -3024,10 +3199,37 @@ function AppContent() {
     showToast(
       payload.otpHint
         ? `Dev OTP ready. Use code ${payload.otpHint}.`
-        : 'Code sent. Enter the OTP to continue.',
-      'success',
+        : 'The server stored a code but did not send an SMS.',
+      payload.otpHint ? 'success' : 'error',
       4200,
     );
+  };
+
+  const deliverPhoneOtp = async (countryCode, phoneNumber, normalizedPhone) => {
+    const preferBackendOtp = typeof __DEV__ !== 'undefined' && __DEV__;
+    if (preferBackendOtp) {
+      await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
+      return;
+    }
+
+    if (!nativeFirebaseReady || !firebaseAuth || !firebaseConfigReady) {
+      throw new Error('Firebase phone auth is not available in this build.');
+    }
+
+    if (firebaseAuth.settings) {
+      firebaseAuth.settings.forceRecaptchaFlowForTesting = false;
+    }
+    phoneAuthIdTokenRef.current = '';
+    phoneAuthConfirmationRef.current = await firebaseAuth.signInWithPhoneNumber(normalizedPhone);
+    phoneAuthProviderRef.current = 'firebase';
+    phoneAuthChallengeIdRef.current = '';
+    setAuthForm((current) => ({
+      ...current,
+      otp: '',
+      verifiedPhone: normalizedPhone,
+    }));
+    setAuthMode('otp');
+    showToast('SMS sent by Firebase. Enter the code from your phone.', 'success', 4200);
   };
 
   const startPhoneAuth = async () => {
@@ -3052,53 +3254,12 @@ function AppContent() {
     setAuthPendingAction('send-code');
     showToast('Sending verification code...', 'info', 0);
 
-    // Emulators cannot complete Firebase reCAPTCHA/Play Integrity reliably, so
-    // development builds use the backend OTP challenge (code 123456).
-    const preferBackendOtp = typeof __DEV__ !== 'undefined' && __DEV__;
-
     try {
-      if (preferBackendOtp) {
-        await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
-        return;
-      }
-
-      if (!nativeFirebaseReady || !firebaseAuth) {
-        showToast(
-          'Firebase phone auth is not available in this runtime. Open the installed app, not Expo Go.',
-          'error',
-          3600,
-        );
-        return;
-      }
-
-      if (!firebaseConfigReady) {
-        showToast('Firebase mobile auth is not configured yet.', 'error');
-        return;
-      }
-
-      phoneAuthConfirmationRef.current = await firebaseAuth.signInWithPhoneNumber(normalizedPhone);
-      phoneAuthProviderRef.current = 'firebase';
-      phoneAuthChallengeIdRef.current = '';
-      setAuthForm((current) => ({
-        ...current,
-        otp: '',
-        verifiedPhone: normalizedPhone,
-      }));
-      setAuthMode('otp');
-      showToast('Code sent. Enter the OTP to continue.', 'success');
+      await deliverPhoneOtp(countryCode, phoneNumber, normalizedPhone);
     } catch (error) {
       const firebaseCode = error?.code ?? '';
       const firebaseMessage = error?.message ?? '';
       console.warn('Phone auth send failed', firebaseCode, firebaseMessage, normalizedPhone);
-
-      if (!preferBackendOtp) {
-        try {
-          await startBackendPhoneAuth(countryCode, phoneNumber, normalizedPhone);
-          return;
-        } catch (backendError) {
-          console.warn('Backend OTP fallback failed', backendError);
-        }
-      }
 
       const friendlyMessage =
         firebaseCode === 'auth/invalid-phone-number'
@@ -3251,15 +3412,65 @@ function AppContent() {
         return;
       }
 
+      const submitFirebaseSession = async (idToken, verifiedPhone) => {
+        const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...authDevicePayload(),
+            idToken,
+            phone: verifiedPhone,
+            forcePinReset: forgotPinFlowRef.current || undefined,
+            platform: Platform.OS,
+            label: `${Platform.OS} device`,
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          showToast(getBackendErrorMessage(payload, 'Unable to verify this phone on the server.'), 'error', 4200);
+          return false;
+        }
+        await applyVerifiedPhoneSession(payload, verifiedPhone);
+        return true;
+      };
+
+      const alreadySignedIn = firebaseAuth?.currentUser;
+      if (!phoneAuthIdTokenRef.current && alreadySignedIn?.phoneNumber) {
+        const signedInDigits = String(alreadySignedIn.phoneNumber).replace(/\D/g, '');
+        const expectedDigits = String(authForm.verifiedPhone || '').replace(/\D/g, '');
+        if (!expectedDigits || signedInDigits.endsWith(expectedDigits) || expectedDigits.endsWith(signedInDigits)) {
+          const existingToken = await alreadySignedIn.getIdToken(true).catch(() => '');
+          if (existingToken) {
+            phoneAuthIdTokenRef.current = existingToken;
+          }
+        }
+      }
+
+      if (phoneAuthIdTokenRef.current) {
+        await submitFirebaseSession(phoneAuthIdTokenRef.current, alreadySignedIn?.phoneNumber || authForm.verifiedPhone);
+        return;
+      }
+
       let credential = null;
       try {
         credential = await phoneAuthConfirmationRef.current.confirm(authForm.otp.trim());
       } catch (error) {
+        const signedInUser = firebaseAuth?.currentUser;
+        if (signedInUser?.phoneNumber) {
+          const recoveredToken = await signedInUser.getIdToken(true).catch(() => '');
+          if (recoveredToken) {
+            phoneAuthIdTokenRef.current = recoveredToken;
+            await submitFirebaseSession(recoveredToken, signedInUser.phoneNumber);
+            return;
+          }
+        }
         const firebaseCode = error?.code ?? '';
         showToast(
           firebaseCode === 'auth/invalid-verification-code'
-            ? 'Firebase rejected that code. Check the test number/code in Firebase and try again.'
-            : 'The OTP is invalid or expired.',
+            ? 'That code does not match this SMS. Correct the 6 digits and tap Verify again. The same code still works.'
+            : firebaseCode === 'auth/session-expired' || firebaseCode === 'auth/code-expired'
+              ? 'That SMS code expired. Tap Resend code.'
+              : 'The OTP could not be checked. Enter it again.',
           'error',
         );
         return;
@@ -3268,36 +3479,13 @@ function AppContent() {
       const verifiedPhone = credential?.user?.phoneNumber ?? authForm.verifiedPhone;
       const idToken = await credential?.user?.getIdToken(true);
       if (!idToken || !verifiedPhone) {
-        showToast('Firebase verification succeeded, but the secure token could not be read.', 'error', 3600);
+        showToast('Firebase accepted the code, but the secure token could not be read.', 'error', 3600);
         return;
       }
       phoneAuthIdTokenRef.current = idToken;
-
-      const response = await fetch(`${API_BASE_URL}/api/auth/phone/session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...authDevicePayload(),
-          idToken,
-          phone: verifiedPhone,
-          platform: Platform.OS,
-          label: `${Platform.OS} device`,
-        }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        showToast(getBackendErrorMessage(payload, 'Unable to verify this phone on the server.'), 'error', 4200);
-        return;
-      }
-
-      await applyVerifiedPhoneSession(payload, verifiedPhone);
-    } catch {
-      setAuthForm((current) => ({
-        ...current,
-        verifiedPhone: authForm.verifiedPhone,
-      }));
-      setAuthMode('profile');
-      showToast('Phone verified. Network sync is slow, so continue registration.', 'success', 3600);
+      await submitFirebaseSession(idToken, verifiedPhone);
+    } catch (error) {
+      showToast(error?.message || 'The code could not be checked. Enter it again.', 'error', 4200);
     } finally {
       setAuthPendingAction('');
     }
@@ -3628,10 +3816,19 @@ function AppContent() {
         audioUri: uri,
         durationLabel: getAudioDurationLabel(duration),
       });
-      const uploadedUrls = await uploadUris([uri], {
-        names: [`voice-${Date.now()}.mp4`],
-        fallbackType: inferMimeType(uri, 'audio/mp4'),
-      }).catch(() => []);
+      let uploadedUrls = [];
+      try {
+        uploadedUrls = await uploadUris([uri], {
+          names: [`voice-${Date.now()}.m4a`],
+          fallbackType: inferMimeType(uri, 'audio/mp4'),
+        });
+      } catch {
+        uploadedUrls = [];
+      }
+      if (!uploadedUrls.length) {
+        showToast('Voice note recorded, but upload failed.', 'error', 3600);
+        return;
+      }
       fetch(`${API_BASE_URL}/api/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3641,10 +3838,12 @@ function AppContent() {
           clientRef,
           kind: 'voice',
           text: 'Voice note',
-          mediaUrls: uploadedUrls.length ? uploadedUrls : [uri],
+          mediaUrls: uploadedUrls,
           durationSeconds: Math.max(1, Math.round(duration / 1000)),
         }),
-      }).catch(() => undefined);
+      }).catch(() => {
+        showToast('Voice note could not be sent.', 'error');
+      });
     } catch (error) {
       if (recordingRef.current) {
         recordingRef.current.removeRecordBackListener();
@@ -3735,7 +3934,19 @@ function AppContent() {
                 await openFiles('document');
               }}>
                 <Text style={styles.sheetOptionTitle}>Document</Text>
-                <Text style={styles.sheetOptionBody}>Open file manager</Text>
+                <Text style={styles.sheetOptionBody}>PDF, Word, and other files</Text>
+              </Pressable>
+              <Pressable style={styles.sheetOption} onPress={async () => {
+                setAttachmentType('audio');
+                setSheetStep('closed');
+                await openFiles('audio');
+              }}>
+                <Text style={styles.sheetOptionTitle}>Audio</Text>
+                <Text style={styles.sheetOptionBody}>Send a song or recording</Text>
+              </Pressable>
+              <Pressable style={styles.sheetOption} onPress={() => void shareCurrentLocation()}>
+                <Text style={styles.sheetOptionTitle}>Location</Text>
+                <Text style={styles.sheetOptionBody}>Share your current GPS position</Text>
               </Pressable>
             </>
           ) : (
@@ -3817,9 +4028,22 @@ function AppContent() {
             return;
           }
 
-          if (message.kind === 'voice') {
+          if (message.kind === 'voice' || message.kind === 'audio') {
             playVoiceMessage(message);
             return;
+          }
+
+          if (message.kind === 'file' && message.fileUri) {
+            Linking.openURL(message.fileUri).catch(() => {
+              showToast('Could not open that document.', 'error');
+            });
+            return;
+          }
+
+          if (message.kind === 'location' && message.location) {
+            Linking.openURL(`https://maps.google.com/?q=${encodeURIComponent(message.location)}`).catch(() => {
+              showToast('Could not open maps.', 'error');
+            });
           }
 
           if (emojiOnly) {
@@ -3845,11 +4069,41 @@ function AppContent() {
           </>
         ) : null}
 
-        {message.kind === 'voice' ? (
+        {message.kind === 'video' ? (
+          message.videoUri ? (
+            <Video
+              source={{ uri: message.videoUri }}
+              style={styles.messageImage}
+              resizeMode="cover"
+              paused
+              controls
+            />
+          ) : (
+            <Text style={styles.messageText}>{message.text || 'Video'}</Text>
+          )
+        ) : null}
+
+        {(message.kind === 'voice' || message.kind === 'audio') ? (
           <View style={styles.voiceNote}>
             <Text style={styles.voiceIcon}>▶</Text>
             <View style={styles.voiceBar} />
-            <Text style={styles.voiceDuration}>{message.durationLabel}</Text>
+            <Text style={styles.voiceDuration}>{message.durationLabel || message.text || 'Audio'}</Text>
+          </View>
+        ) : null}
+
+        {message.kind === 'file' ? (
+          <View style={styles.attachmentCard}>
+            <Text style={styles.attachmentTitle}>DOCUMENT</Text>
+            <Text style={styles.attachmentName}>{message.text || 'File'}</Text>
+            <Text style={styles.attachmentMeta}>{message.fileUri ? 'Tap to open' : 'Waiting for upload'}</Text>
+          </View>
+        ) : null}
+
+        {message.kind === 'location' ? (
+          <View style={styles.attachmentCard}>
+            <Text style={styles.attachmentTitle}>LOCATION</Text>
+            <Text style={styles.attachmentName}>{message.text || 'Shared location'}</Text>
+            <Text style={styles.attachmentMeta}>{message.location || 'Tap to open in maps'}</Text>
           </View>
         ) : null}
 
