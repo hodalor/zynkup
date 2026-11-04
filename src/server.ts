@@ -3665,8 +3665,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('call:ringing', ({ callId, userId }: { callId: string; userId: string }) => {
-    socket.to(callId).emit('call:peerRinging', { callId, userId });
+  socket.on('call:ringing', ({ callId, userId, initiatorId }: { callId: string; userId: string; initiatorId?: string }) => {
+    const event = { callId, userId };
+    socket.to(callId).emit('call:peerRinging', event);
+    if (initiatorId) {
+      io.to(`user:${initiatorId}`).emit('call:peerRinging', event);
+    }
   });
 
   socket.on('call:join', ({ callId, userId }: { callId: string; userId: string }) => {
