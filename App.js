@@ -29,6 +29,9 @@ import {
   TextInput,
   View,
   AppState,
+  BackHandler,
+  Keyboard,
+  Vibration,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { io } from 'socket.io-client';
@@ -177,7 +180,24 @@ const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const BOOTSTRAP_TIMEOUT_MS = 5000;
 const WEBRTC_CONFIGURATION = {
-  iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+  iceServers: [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+  ],
+};
+const CUE_SOUNDS = {
+  send: 'file:///android_asset/sounds/send.wav',
+  receive: 'file:///android_asset/sounds/receive.wav',
+  ringback: 'file:///android_asset/sounds/ringback.wav',
+  ringtone: 'file:///android_asset/sounds/ringtone.wav',
 };
 
 const COUNTRY_OPTIONS = Object.entries(countries)
@@ -306,6 +326,28 @@ const getAudioDurationLabel = (milliseconds) => {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = String(totalSeconds % 60).padStart(2, '0');
   return `${minutes}:${seconds}`;
+};
+
+const formatPlaybackClock = (milliseconds) => {
+  const totalSeconds = Math.max(0, Math.ceil(Number(milliseconds) || 0) / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
+};
+
+const formatCallStamp = (value) => {
+  if (!value) {
+    return '';
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return '';
+  }
+  const time = parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  if (parsed.toDateString() === new Date().toDateString()) {
+    return time;
+  }
+  return `${parsed.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
 };
 
 const formatClock = (value) => {
@@ -446,7 +488,16 @@ function AppContent() {
   const [remoteCallStream, setRemoteCallStream] = useState(null);
   const [callError, setCallError] = useState('');
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingPaused, setRecordingPaused] = useState(false);
   const [recordingLabel, setRecordingLabel] = useState('');
+  const [voiceDraft, setVoiceDraft] = useState(null);
+  const [voicePlayback, setVoicePlayback] = useState({ messageId: '', positionMs: 0, durationMs: 0, playing: false });
+  const [keyboardInset, setKeyboardInset] = useState(0);
+  const [chatMenuVisible, setChatMenuVisible] = useState(false);
+  const [peerProfileVisible, setPeerProfileVisible] = useState(false);
+  const [avatarPrompt, setAvatarPrompt] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [localVideoLarge, setLocalVideoLarge] = useState(false);
   const [activeStatusGroupIndex, setActiveStatusGroupIndex] = useState(null);
   const [activeStatusItemIndex, setActiveStatusItemIndex] = useState(0);
   const [statusProgress, setStatusProgress] = useState(0);
@@ -512,7 +563,19 @@ function AppContent() {
   const autoplayedRef = useRef(new Set());
   const recordingRef = useRef(null);
   const recordingDurationRef = useRef(0);
+  const recordingPausedRef = useRef(false);
   const currentSoundRef = useRef(null);
+  const playbackTokenRef = useRef(0);
+  const playbackBusyRef = useRef(false);
+  const uiSoundRef = useRef(null);
+  const ringSoundRef = useRef(null);
+  const playCueRef = useRef(() => undefined);
+  const closeStatusViewerRef = useRef(() => undefined);
+  const navigationStateRef = useRef({});
+  const pendingIceRef = useRef([]);
+  const remoteReadyRef = useRef(false);
+  const voiceBarWidthRef = useRef(160);
+  const recordPulse = useRef(new Animated.Value(1)).current;
   const socketRef = useRef(null);
   const updatesFeedRef = useRef([]);
   const statusGroupIndexRef = useRef(null);
@@ -591,11 +654,13 @@ function AppContent() {
         id: contact.id,
         name: contact.name,
         phone: contact.phone || '',
+        userId: contact.linkedUserId,
       })),
       ...chatItems.map((chat) => ({
         id: chat.id,
         name: chat.name,
         phone: usersById[chat.peerUserId]?.phone || '',
+        userId: chat.peerUserId,
       })),
     ];
 
@@ -741,6 +806,7 @@ function AppContent() {
       fileUri: kind === 'file' ? mediaUrl : undefined,
       location: locationMatch ? `${locationMatch[1]},${locationMatch[2]}` : undefined,
       durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
+      durationSeconds: message.durationSeconds,
       receiptState: message.state,
       replyToMessageId: message.replyToMessageId,
       replyPreview: message.replyPreview,
@@ -987,6 +1053,13 @@ function AppContent() {
         return;
       }
       setProfile((current) => ({ ...current, photoUri: uploaded[0] }));
+      setUsersById((current) => ({
+        ...current,
+        [currentUserId]: {
+          ...(current[currentUserId] ?? { id: currentUserId, name: profile.name, avatar: profile.name.slice(0, 2).toUpperCase() }),
+          photoUri: uploaded[0],
+        },
+      }));
       await saveProfileToServer({ photoUri: uploaded[0] });
     } catch {
       showToast('Could not upload profile photo. The preview stays on this phone.', 'error', 4200);
@@ -1397,8 +1470,11 @@ function AppContent() {
     peerConnectionRef.current = null;
     callMediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
     callMediaStreamRef.current = null;
+    pendingIceRef.current = [];
+    remoteReadyRef.current = false;
     setLocalCallStream(null);
     setRemoteCallStream(null);
+    setLocalVideoLarge(false);
   };
 
   const ensureCallMedia = async (kind) => {
@@ -1428,11 +1504,29 @@ function AppContent() {
 
     const stream = await mediaDevices.getUserMedia({
       audio: true,
-      video: wantsVideo,
+      video: wantsVideo ? { facingMode: 'user' } : false,
+    });
+    stream.getAudioTracks?.().forEach((track) => {
+      track.enabled = true;
     });
     callMediaStreamRef.current = stream;
     setLocalCallStream(stream);
     return stream;
+  };
+
+  const flushQueuedIce = async (connection) => {
+    const queued = pendingIceRef.current;
+    pendingIceRef.current = [];
+    for (const candidate of queued) {
+      await connection.addIceCandidate(new RTCIceCandidateNative(candidate)).catch(() => undefined);
+    }
+  };
+
+  const flipCallCamera = () => {
+    const track = localCallStream?.getVideoTracks?.()?.[0];
+    if (typeof track?._switchCamera === 'function') {
+      track._switchCamera();
+    }
   };
 
   const emitCallSignal = (callId, signalType, payload, toUserId) => {
@@ -1615,19 +1709,27 @@ function AppContent() {
     }
 
     const connection = new RTCPeerConnectionNative(WEBRTC_CONFIGURATION);
-    const remoteStream = await mediaDevices.getUserMedia({ audio: false, video: false }).catch(() => null);
+    const MediaStreamCtor = webRtcModule?.MediaStream;
+    const assembledRemote = MediaStreamCtor ? new MediaStreamCtor() : null;
     connection.ontrack = (event) => {
-      const [stream] = event.streams;
+      const stream = event.streams?.[0];
       if (stream) {
         setRemoteCallStream(stream);
-      } else if (remoteStream) {
-        remoteStream.addTrack(event.track);
-        setRemoteCallStream(remoteStream);
+        return;
+      }
+      if (assembledRemote && event.track && !assembledRemote.getTracks().some((track) => track.id === event.track.id)) {
+        assembledRemote.addTrack(event.track);
+        setRemoteCallStream(assembledRemote);
       }
     };
     connection.onicecandidate = (event) => {
       if (event.candidate) {
         emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), call.peerUserId);
+      }
+    };
+    connection.oniceconnectionstatechange = () => {
+      if (connection.iceConnectionState === 'failed') {
+        setCallError('Call media could not connect. Try again on a stronger network.');
       }
     };
     const localStream = await ensureCallMedia(call.kind);
@@ -1804,6 +1906,13 @@ function AppContent() {
     setAuthRequired(Boolean(payload.authRequired));
     setAuthVisible(Boolean(payload.authRequired) && !nextCurrentUserId);
     const nextUsersById = Object.fromEntries((payload.users ?? []).map((user) => [user.id, user]));
+    if (payload.profile?.photoUri && nextCurrentUserId) {
+      nextUsersById[nextCurrentUserId] = {
+        ...(nextUsersById[nextCurrentUserId] ?? { id: nextCurrentUserId, name: payload.profile.name, avatar: 'ZU' }),
+        photoUri: payload.profile.photoUri,
+        name: payload.profile.name || nextUsersById[nextCurrentUserId]?.name,
+      };
+    }
     setCurrentUserId(nextCurrentUserId);
     setCurrentDeviceId(payload.currentDeviceId ?? null);
     setUsersById(nextUsersById);
@@ -1862,9 +1971,10 @@ function AppContent() {
     );
     const nextCalls = (payload.calls ?? []).map((call) => mapCallFromServer(call, nextCurrentUserId, nextUsersById));
     setCalls(nextCalls);
-    const liveCall = nextCalls.find((call) => call.state === 'ongoing' || call.state === 'ringing') ?? null;
+    const incoming = nextCalls.find((call) => call.state === 'ringing' && call.initiatorId !== nextCurrentUserId) ?? null;
+    const liveCall = nextCalls.find((call) => call.state === 'ongoing' || (call.state === 'ringing' && call.initiatorId === nextCurrentUserId)) ?? null;
     setActiveCall(liveCall);
-    setIncomingCall(nextCalls.find((call) => call.state === 'ringing' && call.initiatorId !== nextCurrentUserId) ?? null);
+    setIncomingCall(incoming);
     setStatuses(
       (payload.statuses ?? []).map((status) => ({
         ...status,
@@ -2149,6 +2259,13 @@ function AppContent() {
         void syncReceiptState(message.id, nextReceipt);
 
         if (
+          settings.conversationTones &&
+          !mutedChatIdsRef.current.includes(message.chatId)
+        ) {
+          playCueRef.current('receive');
+        }
+
+        if (
           settings.messageNotifications &&
           !viewingChat &&
           !mutedChatIdsRef.current.includes(message.chatId)
@@ -2182,6 +2299,28 @@ function AppContent() {
         return;
       }
       setPeerTypingByChat((current) => ({ ...current, [chatId]: Boolean(typing) }));
+    });
+    socket.on('profile:updated', (updatedProfile) => {
+      if (!updatedProfile?.id) {
+        return;
+      }
+      setUsersById((current) => ({
+        ...current,
+        [updatedProfile.id]: {
+          ...(current[updatedProfile.id] ?? { id: updatedProfile.id, avatar: 'CT' }),
+          name: updatedProfile.name || current[updatedProfile.id]?.name,
+          about: updatedProfile.about ?? current[updatedProfile.id]?.about,
+          phone: updatedProfile.phone || current[updatedProfile.id]?.phone,
+          photoUri: updatedProfile.photoUri || '',
+        },
+      }));
+      setChatItems((current) =>
+        current.map((chat) =>
+          chat.peerUserId === updatedProfile.id
+            ? { ...chat, name: updatedProfile.name || chat.name, photoUri: updatedProfile.photoUri || '' }
+            : chat,
+        ),
+      );
     });
     socket.on('presence:changed', ({ userId, presence, lastSeenAt }) => {
       if (!userId) {
@@ -2331,6 +2470,9 @@ function AppContent() {
       void (async () => {
         try {
           const connection = await ensurePeerConnection(currentCall);
+          if (connection.localDescription) {
+            return;
+          }
           const offer = await connection.createOffer({
             offerToReceiveAudio: true,
             offerToReceiveVideo: currentCall.kind === 'Video',
@@ -2353,6 +2495,8 @@ function AppContent() {
           const connection = await ensurePeerConnection(currentCall);
           if (signalType === 'offer') {
             await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
+            remoteReadyRef.current = true;
+            await flushQueuedIce(connection);
             const answer = await connection.createAnswer();
             await connection.setLocalDescription(answer);
             emitCallSignal(callId, 'answer', answer, fromUserId);
@@ -2360,11 +2504,20 @@ function AppContent() {
           }
 
           if (signalType === 'answer') {
+            if (connection.signalingState === 'stable' && connection.remoteDescription) {
+              return;
+            }
             await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
+            remoteReadyRef.current = true;
+            await flushQueuedIce(connection);
             return;
           }
 
           if (signalType === 'ice-candidate' && payload) {
+            if (!remoteReadyRef.current || !connection.remoteDescription) {
+              pendingIceRef.current.push(payload);
+              return;
+            }
             await connection.addIceCandidate(new RTCIceCandidateNative(payload));
           }
         } catch {
@@ -2529,23 +2682,54 @@ function AppContent() {
   }, [activeCall]);
 
   useEffect(() => {
-    if (!activeCall || !socketRef.current) {
+    if (!activeCall || activeCall.state !== 'ongoing' || activeCall.initiatorId !== currentUserId) {
+      return undefined;
+    }
+    const call = activeCall;
+    const timer = setTimeout(() => {
+      if (peerConnectionRef.current?.localDescription || peerConnectionRef.current?.remoteDescription) {
+        return;
+      }
+      void (async () => {
+        try {
+          const connection = await ensurePeerConnection(call);
+          if (connection.localDescription || connection.remoteDescription) {
+            return;
+          }
+          const offer = await connection.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: call.kind === 'Video',
+          });
+          await connection.setLocalDescription(offer);
+          emitCallSignal(call.id, 'offer', offer, call.peerUserId);
+        } catch {
+          setCallError('Unable to start call media.');
+        }
+      })();
+    }, 900);
+    return () => clearTimeout(timer);
+  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, currentUserId]);
+
+  useEffect(() => {
+    const callId = activeCall?.id;
+    if (!callId || !socketRef.current) {
       return undefined;
     }
 
+    const callSnapshot = activeCallRef.current;
     setCallError('');
-    socketRef.current.emit('call:join', { callId: activeCall.id, userId: currentUserId });
-    if (activeCall.state === 'ringing' || activeCall.state === 'ongoing') {
-      void ensureCallMedia(activeCall.kind).catch(() => {
+    socketRef.current.emit('call:join', { callId, userId: currentUserId });
+    if (callSnapshot && (callSnapshot.state === 'ringing' || callSnapshot.state === 'ongoing')) {
+      void ensureCallMedia(callSnapshot.kind).catch(() => {
         setCallError('Camera or microphone permission was denied.');
       });
     }
 
     return () => {
-      socketRef.current?.emit('call:leave', { callId: activeCall.id, userId: currentUserId });
+      socketRef.current?.emit('call:leave', { callId, userId: currentUserId });
       closePeerConnection();
     };
-  }, [activeCall, currentUserId]);
+  }, [activeCall?.id, currentUserId]);
 
   const appendMessage = (message) => {
     setMessagesByChat((current) => ({
@@ -2568,8 +2752,9 @@ function AppContent() {
 
     if (mapped.state === 'ringing' && mapped.initiatorId !== currentUserId) {
       setIncomingCall(mapped);
-    }
-    if (mapped.state === 'ringing' || mapped.state === 'ongoing') {
+      setActiveCall((current) => (current?.id === mapped.id ? null : current));
+    } else if (mapped.state === 'ongoing' || (mapped.state === 'ringing' && mapped.initiatorId === currentUserId)) {
+      setIncomingCall((current) => (current?.id === mapped.id ? null : current));
       setActiveCall(mapped);
     }
     if (['completed', 'missed', 'declined'].includes(mapped.state)) {
@@ -2621,6 +2806,144 @@ function AppContent() {
     setStatusReactorsVisible(false);
     setEditingStatusCommentId(null);
   };
+
+  closeStatusViewerRef.current = closeStatusViewer;
+  navigationStateRef.current = {
+    chatScreen,
+    activeView,
+    chatMenuVisible,
+    peerProfileVisible,
+    avatarPrompt,
+    photoPreview,
+    mediaViewer,
+    callSheetVisible,
+    newChatVisible,
+    activeStatusGroupIndex,
+    incomingCall,
+    activeCall,
+  };
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const showSub = Keyboard.addListener(showEvent, (event) => {
+      setKeyboardInset(event?.endCoordinates?.height ?? 0);
+    });
+    const hideSub = Keyboard.addListener(hideEvent, () => setKeyboardInset(0));
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      const state = navigationStateRef.current;
+      if (state.photoPreview) {
+        setPhotoPreview(null);
+        return true;
+      }
+      if (state.avatarPrompt) {
+        setAvatarPrompt(null);
+        return true;
+      }
+      if (state.peerProfileVisible) {
+        setPeerProfileVisible(false);
+        return true;
+      }
+      if (state.chatMenuVisible) {
+        setChatMenuVisible(false);
+        return true;
+      }
+      if (state.mediaViewer) {
+        setMediaViewer(null);
+        return true;
+      }
+      if (state.callSheetVisible) {
+        setCallSheetVisible(false);
+        return true;
+      }
+      if (state.newChatVisible) {
+        setNewChatVisible(false);
+        return true;
+      }
+      if (state.activeStatusGroupIndex != null) {
+        closeStatusViewerRef.current();
+        return true;
+      }
+      if (state.incomingCall || state.activeCall) {
+        return true;
+      }
+      if (state.chatScreen === 'detail') {
+        setChatScreen('list');
+        return true;
+      }
+      if (state.activeView !== 'Chats') {
+        setActiveView('Chats');
+        return true;
+      }
+      return false;
+    });
+    return () => subscription.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!isRecording || recordingPaused) {
+      recordPulse.setValue(1);
+      return undefined;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(recordPulse, { toValue: 0.35, duration: 520, useNativeDriver: true }),
+        Animated.timing(recordPulse, { toValue: 1, duration: 520, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isRecording, recordingPaused, recordPulse]);
+
+  useEffect(() => {
+    const incomingRing = Boolean(incomingCall && incomingCall.state === 'ringing' && incomingCall.initiatorId !== currentUserId);
+    const outgoingRing = Boolean(activeCall && activeCall.state === 'ringing' && activeCall.initiatorId === currentUserId);
+    if (!incomingRing && !outgoingRing) {
+      ringSoundRef.current?.removePlaybackEndListener?.();
+      void ringSoundRef.current?.stopPlayer?.().catch(() => undefined);
+      Vibration.cancel();
+      return undefined;
+    }
+
+    const file = incomingRing ? CUE_SOUNDS.ringtone : CUE_SOUNDS.ringback;
+    let stopped = false;
+    const startLoop = async () => {
+      if (stopped || Platform.OS !== 'android') {
+        return;
+      }
+      try {
+        if (!ringSoundRef.current) {
+          ringSoundRef.current = createSound();
+        }
+        ringSoundRef.current.removePlaybackEndListener?.();
+        ringSoundRef.current.addPlaybackEndListener(() => {
+          if (!stopped) {
+            void startLoop();
+          }
+        });
+        await ringSoundRef.current.startPlayer(file);
+      } catch {
+        // The call screen still works if the tone asset cannot play.
+      }
+    };
+    void startLoop();
+    if (incomingRing) {
+      Vibration.vibrate([0, 480, 220, 480], true);
+    }
+    return () => {
+      stopped = true;
+      ringSoundRef.current?.removePlaybackEndListener?.();
+      void ringSoundRef.current?.stopPlayer?.().catch(() => undefined);
+      Vibration.cancel();
+    };
+  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, incomingCall?.id, incomingCall?.state, currentUserId]);
 
   const moveStatus = (direction) => {
     const currentGroupIndex = statusGroupIndexRef.current;
@@ -2694,6 +3017,7 @@ function AppContent() {
     };
 
     appendMessage(message);
+    playCueRef.current('send');
     emitTyping(false);
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
@@ -3861,8 +4185,9 @@ function AppContent() {
       return;
     }
 
-    const finalState =
-      activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? 'declined' : 'completed';
+    const finalState = activeCall.state === 'ringing'
+      ? (activeCall.initiatorId === currentUserId ? 'missed' : 'declined')
+      : 'completed';
     await updateCallState(activeCall.id, finalState, activeCallSeconds);
     closePeerConnection();
   };
@@ -3879,39 +4204,118 @@ function AppContent() {
     });
   };
 
-  const stopVoicePlayback = async () => {
-    if (!currentSoundRef.current) {
+  const playCue = async (name) => {
+    const source = CUE_SOUNDS[name];
+    if (!source || Platform.OS !== 'android') {
       return;
     }
+    try {
+      if (!uiSoundRef.current) {
+        uiSoundRef.current = createSound();
+      }
+      await uiSoundRef.current.stopPlayer().catch(() => undefined);
+      await uiSoundRef.current.startPlayer(source);
+    } catch {
+      // Message tones are optional if the device cannot open the asset.
+    }
+  };
+  playCueRef.current = playCue;
 
+  const stopVoicePlayback = async () => {
     const sound = currentSoundRef.current;
     currentSoundRef.current = null;
+    playbackTokenRef.current += 1;
+    setVoicePlayback({ messageId: '', positionMs: 0, durationMs: 0, playing: false });
+    if (!sound) {
+      return;
+    }
     sound.removePlayBackListener();
     sound.removePlaybackEndListener();
     await sound.stopPlayer().catch(() => undefined);
   };
 
   const playVoiceMessage = async (message) => {
-    if (!message.audioUri) {
-      Alert.alert('Voice note', 'This is a placeholder voice note preview.');
+    if (!message?.audioUri || playbackBusyRef.current) {
       return;
     }
 
+    const activeSound = currentSoundRef.current;
+    if (voicePlayback.messageId === message.id && activeSound) {
+      playbackBusyRef.current = true;
+      try {
+        if (voicePlayback.playing) {
+          await activeSound.pausePlayer();
+          setVoicePlayback((current) => ({ ...current, playing: false }));
+        } else {
+          await activeSound.resumePlayer();
+          setVoicePlayback((current) => ({ ...current, playing: true }));
+        }
+      } catch {
+        setVoicePlayback({ messageId: '', positionMs: 0, durationMs: 0, playing: false });
+      } finally {
+        playbackBusyRef.current = false;
+      }
+      return;
+    }
+
+    playbackBusyRef.current = true;
+    const token = playbackTokenRef.current + 1;
+    playbackTokenRef.current = token;
     try {
-      await stopVoicePlayback();
+      if (activeSound) {
+        activeSound.removePlayBackListener();
+        activeSound.removePlaybackEndListener();
+        currentSoundRef.current = null;
+        await activeSound.stopPlayer().catch(() => undefined);
+      }
+      if (token !== playbackTokenRef.current) {
+        return;
+      }
       const sound = createSound();
       currentSoundRef.current = sound;
+      sound.setSubscriptionDuration(0.1);
+      sound.addPlayBackListener((event) => {
+        if (playbackTokenRef.current !== token || currentSoundRef.current !== sound) {
+          return;
+        }
+        setVoicePlayback({
+          messageId: message.id,
+          positionMs: event.currentPosition ?? 0,
+          durationMs: event.duration || 0,
+          playing: true,
+        });
+      });
       sound.addPlaybackEndListener(() => {
         sound.removePlayBackListener();
         sound.removePlaybackEndListener();
         if (currentSoundRef.current === sound) {
           currentSoundRef.current = null;
         }
+        if (playbackTokenRef.current === token) {
+          setVoicePlayback({ messageId: '', positionMs: 0, durationMs: 0, playing: false });
+        }
       });
+      setVoicePlayback({ messageId: message.id, positionMs: 0, durationMs: 0, playing: true });
       await sound.startPlayer(message.audioUri);
-    } catch (error) {
-      Alert.alert('Voice note', 'Unable to play this recording on the current device.');
+    } catch {
+      if (currentSoundRef.current) {
+        currentSoundRef.current = null;
+      }
+      setVoicePlayback({ messageId: '', positionMs: 0, durationMs: 0, playing: false });
+      showToast('Unable to play this voice note.', 'error');
+    } finally {
+      playbackBusyRef.current = false;
     }
+  };
+
+  const seekVoiceMessage = async (message, ratio) => {
+    const sound = currentSoundRef.current;
+    if (!sound || voicePlayback.messageId !== message.id || !voicePlayback.durationMs) {
+      return;
+    }
+    const nextPosition = Math.max(0, Math.min(voicePlayback.durationMs - 150, ratio * voicePlayback.durationMs));
+    await sound.seekToPlayer(nextPosition).catch(() => undefined);
+    setVoicePlayback((current) => ({ ...current, positionMs: nextPosition }));
   };
 
   const startVoiceRecording = async () => {
@@ -3934,6 +4338,9 @@ function AppContent() {
       await recorder.startRecorder(undefined, VOICE_RECORDER_AUDIO_SET);
       recordingRef.current = recorder;
       recordingDurationRef.current = 0;
+      recordingPausedRef.current = false;
+      setRecordingPaused(false);
+      setVoiceDraft(null);
       setRecordingLabel('Recording 0:00');
       setIsRecording(true);
     } catch (error) {
@@ -3948,75 +4355,122 @@ function AppContent() {
     }
   };
 
-  const stopVoiceRecording = async () => {
+  const toggleRecordingPause = async () => {
+    const recorder = recordingRef.current;
+    if (!recorder) {
+      return;
+    }
+    try {
+      if (recordingPausedRef.current) {
+        await recorder.resumeRecorder();
+        recordingPausedRef.current = false;
+        setRecordingPaused(false);
+      } else {
+        await recorder.pauseRecorder();
+        recordingPausedRef.current = true;
+        setRecordingPaused(true);
+      }
+    } catch {
+      showToast('Could not pause the recording.', 'error');
+    }
+  };
+
+  const finishVoiceRecording = async () => {
     if (!recordingRef.current) {
       return;
     }
 
     try {
       const recorder = recordingRef.current;
+      if (recordingPausedRef.current) {
+        await recorder.resumeRecorder().catch(() => undefined);
+        recordingPausedRef.current = false;
+      }
       const duration = recordingDurationRef.current;
       const uri = await recorder.stopRecorder();
       recorder.removeRecordBackListener();
       recordingRef.current = null;
       recordingDurationRef.current = 0;
       setIsRecording(false);
+      setRecordingPaused(false);
       setRecordingLabel('');
 
       if (!uri) {
         return;
       }
 
-      const clientRef = `mobile-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      appendMessage({
-        id: `m${Date.now()}`,
-        clientRef,
-        mine: true,
-        kind: 'voice',
-        text: 'Voice note',
-        time: 'Now',
-        receiptState: 'sent',
-        audioUri: uri,
+      setVoiceDraft({
+        uri,
+        durationMs: duration,
         durationLabel: getAudioDurationLabel(duration),
       });
-      let uploadedUrls = [];
-      try {
-        uploadedUrls = await uploadUris([uri], {
-          names: [`voice-${Date.now()}.m4a`],
-          fallbackType: inferMimeType(uri, 'audio/mp4'),
-        });
-      } catch {
-        uploadedUrls = [];
-      }
-      if (!uploadedUrls.length) {
-        showToast('Voice note recorded, but upload failed.', 'error', 3600);
-        return;
-      }
-      fetch(`${API_BASE_URL}/api/messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chatId: selectedChatId,
-          senderId: currentUserId,
-          clientRef,
-          kind: 'voice',
-          text: 'Voice note',
-          mediaUrls: uploadedUrls,
-          durationSeconds: Math.max(1, Math.round(duration / 1000)),
-        }),
-      }).catch(() => {
-        showToast('Voice note could not be sent.', 'error');
-      });
-    } catch (error) {
+    } catch {
       if (recordingRef.current) {
         recordingRef.current.removeRecordBackListener();
         recordingRef.current = null;
       }
       recordingDurationRef.current = 0;
+      recordingPausedRef.current = false;
       setIsRecording(false);
+      setRecordingPaused(false);
       setRecordingLabel('');
-      Alert.alert('Recording failed', 'Voice note recording could not be completed.');
+      showToast('Voice note recording could not be completed.', 'error');
     }
+  };
+
+  const discardVoiceDraft = async () => {
+    await stopVoicePlayback();
+    setVoiceDraft(null);
+  };
+
+  const sendVoiceDraft = async () => {
+    if (!voiceDraft?.uri) {
+      return;
+    }
+    const { uri, durationMs, durationLabel } = voiceDraft;
+    await stopVoicePlayback();
+    setVoiceDraft(null);
+    const clientRef = `mobile-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    appendMessage({
+      id: `m${Date.now()}`,
+      clientRef,
+      mine: true,
+      kind: 'voice',
+      text: 'Voice note',
+      time: 'Now',
+      receiptState: 'sent',
+      audioUri: uri,
+      durationLabel,
+    });
+    playCueRef.current('send');
+    let uploadedUrls = [];
+    try {
+      uploadedUrls = await uploadUris([uri], {
+        names: [`voice-${Date.now()}.m4a`],
+        fallbackType: inferMimeType(uri, 'audio/mp4'),
+      });
+    } catch {
+      uploadedUrls = [];
+    }
+    if (!uploadedUrls.length) {
+      showToast('Voice note is on this phone, but the upload failed.', 'error', 3600);
+      return;
+    }
+    fetch(`${API_BASE_URL}/api/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chatId: selectedChatId,
+        senderId: currentUserId,
+        clientRef,
+        kind: 'voice',
+        text: 'Voice note',
+        mediaUrls: uploadedUrls,
+        durationSeconds: Math.max(1, Math.round(durationMs / 1000)),
+      }),
+    }).catch(() => {
+      showToast('Voice note could not be sent.', 'error');
+    });
   };
 
   const ensureCameraPermission = async () => {
@@ -4192,7 +4646,6 @@ function AppContent() {
           }
 
           if (message.kind === 'voice' || message.kind === 'audio') {
-            playVoiceMessage(message);
             return;
           }
 
@@ -4246,13 +4699,37 @@ function AppContent() {
           )
         ) : null}
 
-        {(message.kind === 'voice' || message.kind === 'audio') ? (
-          <View style={styles.voiceNote}>
-            <Text style={styles.voiceIcon}>▶</Text>
-            <View style={styles.voiceBar} />
-            <Text style={styles.voiceDuration}>{message.durationLabel || message.text || 'Audio'}</Text>
-          </View>
-        ) : null}
+        {(message.kind === 'voice' || message.kind === 'audio') ? (() => {
+          const active = voicePlayback.messageId === message.id;
+          const durationMs = active && voicePlayback.durationMs
+            ? voicePlayback.durationMs
+            : ((message.durationSeconds || 0) * 1000);
+          const positionMs = active ? voicePlayback.positionMs : 0;
+          const progress = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
+          const remainingLabel = active && durationMs
+            ? formatPlaybackClock(Math.max(0, durationMs - positionMs))
+            : (message.durationLabel || '0:00');
+          return (
+            <View style={styles.voiceNote}>
+              <Pressable style={styles.voicePlayButton} onPress={() => void playVoiceMessage(message)}>
+                <Text style={styles.voiceIcon}>{active && voicePlayback.playing ? '❚❚' : '▶'}</Text>
+              </Pressable>
+              <Pressable
+                style={styles.voiceBarTrack}
+                onLayout={(event) => {
+                  voiceBarWidthRef.current = event.nativeEvent.layout.width || voiceBarWidthRef.current;
+                }}
+                onPress={(event) => {
+                  const width = voiceBarWidthRef.current || 1;
+                  void seekVoiceMessage(message, event.nativeEvent.locationX / width);
+                }}
+              >
+                <View style={[styles.voiceBarFill, { width: `${Math.round(progress * 100)}%` }]} />
+              </Pressable>
+              <Text style={styles.voiceDuration}>{remainingLabel}</Text>
+            </View>
+          );
+        })() : null}
 
         {message.kind === 'file' ? (
           <View style={styles.attachmentCard}>
@@ -4335,8 +4812,13 @@ function AppContent() {
         </Pressable>
         <Pressable
           style={[styles.micButton, isRecording ? styles.micButtonRecording : null]}
-          onPressIn={startVoiceRecording}
-          onPressOut={stopVoiceRecording}
+          onPress={() => {
+            if (isRecording) {
+              void finishVoiceRecording();
+              return;
+            }
+            void startVoiceRecording();
+          }}
         >
           <Text style={styles.micButtonText}>{isRecording ? '■' : '🎤'}</Text>
         </Pressable>
@@ -4344,40 +4826,103 @@ function AppContent() {
     );
   };
 
-  const renderChatDetail = () => (
-    <View style={styles.detailScreen}>
+  const photoForUser = (userId) => {
+    if (!userId) {
+      return '';
+    }
+    if (userId === currentUserId) {
+      return profile.photoUri || usersById[userId]?.photoUri || '';
+    }
+    return usersById[userId]?.photoUri || '';
+  };
+
+  const userHasStatus = (userId) => updatesFeed.some((entry) => entry.userId === userId && entry.items?.length);
+
+  const openStatusForUser = (userId) => {
+    const index = updatesFeed.findIndex((entry) => entry.userId === userId);
+    if (index < 0) {
+      return;
+    }
+    setAvatarPrompt(null);
+    setActiveView('Status');
+    openStatusViewer(index);
+  };
+
+  const onAvatarPress = (userId, name) => {
+    if (!userId) {
+      return;
+    }
+    const photoUri = photoForUser(userId);
+    if (userHasStatus(userId)) {
+      setAvatarPrompt({ userId, name, photoUri });
+      return;
+    }
+    if (photoUri) {
+      setPhotoPreview({ uri: photoUri, name });
+    }
+  };
+
+  const renderPersonAvatar = ({ userId, name, size = 52, onPress }) => {
+    const photoUri = photoForUser(userId);
+    const hasStatus = userHasStatus(userId);
+    const innerSize = size - (hasStatus ? 6 : 0);
+    const body = (
+      <View
+        style={[
+          styles.personAvatarOuter,
+          {
+            width: size,
+            height: size,
+            borderRadius: size / 2,
+            borderWidth: hasStatus ? 2 : 0,
+            borderColor: '#25D366',
+          },
+        ]}
+      >
+        {photoUri ? (
+          <Image
+            source={{ uri: photoUri }}
+            style={{ width: innerSize, height: innerSize, borderRadius: innerSize / 2 }}
+          />
+        ) : (
+          <View style={[styles.personAvatarFallback, { width: innerSize, height: innerSize, borderRadius: innerSize / 2 }]}>
+            <Text style={styles.personAvatarLetter}>{(name || '?').slice(0, 1).toUpperCase()}</Text>
+          </View>
+        )}
+      </View>
+    );
+    if (!onPress) {
+      return body;
+    }
+    return (
+      <Pressable onPress={onPress} hitSlop={6}>
+        {body}
+      </Pressable>
+    );
+  };
+
+  const renderChatDetail = () => {
+    if (!activeChat) {
+      return null;
+    }
+    return (
+    <View style={[styles.detailScreen, keyboardInset ? { paddingBottom: keyboardInset } : null]}>
       <View style={styles.detailHeader}>
         <Pressable style={styles.iconCircle} onPress={() => setChatScreen('list')}>
           <Text style={styles.iconText}>←</Text>
         </Pressable>
-        <View style={styles.detailHeaderText}>
+        {renderPersonAvatar({
+          userId: activeChat.peerUserId,
+          name: activeChat.name,
+          size: 40,
+          onPress: () => onAvatarPress(activeChat.peerUserId, activeChat.name),
+        })}
+        <Pressable style={styles.detailHeaderText} onPress={() => setPeerProfileVisible(true)}>
           <Text style={styles.detailTitle}>{activeChat.name}</Text>
           <Text style={styles.detailSubtitle}>{getPresenceLabel(activeChat)}</Text>
-        </View>
+        </Pressable>
         <View style={styles.detailHeaderActions}>
-          <Pressable
-            style={styles.iconCircle}
-            onPress={() => {
-              Alert.alert(activeChat.name, 'Chat actions', [
-                {
-                  text: mutedChatIds.includes(activeChat.id) ? 'Unmute' : 'Mute',
-                  onPress: () => toggleMuteChat(activeChat.id),
-                },
-                {
-                  text: archivedChatIds.includes(activeChat.id) ? 'Unarchive' : 'Archive',
-                  onPress: () => {
-                    toggleArchiveChat(activeChat.id);
-                    setChatScreen('list');
-                  },
-                },
-                {
-                  text: favoriteChatIds.includes(activeChat.id) ? 'Unpin' : 'Pin',
-                  onPress: () => toggleFavoriteChat(activeChat.id),
-                },
-                { text: 'Cancel', style: 'cancel' },
-              ]);
-            }}
-          >
+          <Pressable style={styles.iconCircle} onPress={() => setChatMenuVisible(true)}>
             <Text style={styles.iconText}>⋮</Text>
           </Pressable>
           <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
@@ -4405,7 +4950,41 @@ function AppContent() {
 
       {isRecording ? (
         <View style={styles.recordingBanner}>
-          <Text style={styles.recordingBannerText}>{recordingLabel}</Text>
+          <Animated.View style={[styles.recordPulse, { opacity: recordPulse }]} />
+          <Text style={styles.recordingBannerText}>
+            {recordingPaused ? `Paused ${recordingLabel.replace('Recording ', '')}` : recordingLabel}
+          </Text>
+          <Pressable style={styles.draftAction} onPress={() => void toggleRecordingPause()}>
+            <Text style={styles.draftActionText}>{recordingPaused ? 'Resume' : 'Pause'}</Text>
+          </Pressable>
+          <Pressable style={styles.draftAction} onPress={() => void finishVoiceRecording()}>
+            <Text style={styles.draftActionText}>Done</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
+      {voiceDraft ? (
+        <View style={styles.recordingBanner}>
+          <Pressable
+            style={styles.voicePlayButton}
+            onPress={() => void playVoiceMessage({
+              id: 'voice-draft',
+              audioUri: voiceDraft.uri,
+              durationLabel: voiceDraft.durationLabel,
+              durationSeconds: Math.round((voiceDraft.durationMs || 0) / 1000),
+            })}
+          >
+            <Text style={styles.voiceIcon}>
+              {voicePlayback.messageId === 'voice-draft' && voicePlayback.playing ? '❚❚' : '▶'}
+            </Text>
+          </Pressable>
+          <Text style={styles.recordingBannerText}>{voiceDraft.durationLabel}</Text>
+          <Pressable style={styles.draftAction} onPress={() => void discardVoiceDraft()}>
+            <Text style={styles.draftActionText}>Discard</Text>
+          </Pressable>
+          <Pressable style={[styles.draftAction, styles.draftActionSend]} onPress={() => void sendVoiceDraft()}>
+            <Text style={styles.draftActionText}>Send</Text>
+          </Pressable>
         </View>
       ) : null}
 
@@ -4448,44 +5027,49 @@ function AppContent() {
         {renderComposerActions()}
       </View>
     </View>
-  );
+    );
+  };
 
   const renderChatList = () => {
     const recentChats = visibleChatItems.slice(0, 4);
     const earlierChats = visibleChatItems.slice(4);
-    const avatarPalette = ['#dff3ec', '#f8eedb', '#e3edf7', '#f0dff0', '#e6f4f1'];
 
     const renderChatRow = (chat, index) => (
-      <Pressable
-        key={chat.id}
-        style={styles.chatHomeRow}
-        onPress={() => {
-          setSelectedChatId(chat.id);
-          setChatScreen('detail');
-        }}
-        onLongPress={() => {
-          Alert.alert(chat.name, 'Chat actions', [
-            {
-              text: favoriteChatIds.includes(chat.id) ? 'Unpin' : 'Pin',
-              onPress: () => toggleFavoriteChat(chat.id),
-            },
-            {
-              text: mutedChatIds.includes(chat.id) ? 'Unmute' : 'Mute notifications',
-              onPress: () => toggleMuteChat(chat.id),
-            },
-            {
-              text: archivedChatIds.includes(chat.id) ? 'Unarchive' : 'Archive',
-              onPress: () => toggleArchiveChat(chat.id),
-            },
-            { text: 'Cancel', style: 'cancel' },
-          ]);
-        }}
-      >
-        <View style={[styles.chatHomeAvatar, { backgroundColor: avatarPalette[index % avatarPalette.length] }]}>
-          <Text style={styles.chatHomeAvatarText}>{chat.name.slice(0, 1).toUpperCase()}</Text>
+      <View key={chat.id} style={styles.chatHomeRow}>
+        <View style={styles.chatAvatarSlot}>
+          {renderPersonAvatar({
+            userId: chat.peerUserId,
+            name: chat.name,
+            size: 56,
+            onPress: () => onAvatarPress(chat.peerUserId, chat.name),
+          })}
           {chat.unread > 0 ? <View style={styles.chatHomePresenceDot} /> : null}
         </View>
-        <View style={styles.chatHomeCopy}>
+        <Pressable
+          style={styles.chatHomeCopy}
+          onPress={() => {
+            setSelectedChatId(chat.id);
+            setChatScreen('detail');
+          }}
+          onLongPress={() => {
+            Alert.alert(chat.name, 'Chat actions', [
+              {
+                text: favoriteChatIds.includes(chat.id) ? 'Unpin' : 'Pin',
+                onPress: () => toggleFavoriteChat(chat.id),
+              },
+              {
+                text: mutedChatIds.includes(chat.id) ? 'Unmute' : 'Mute notifications',
+                onPress: () => toggleMuteChat(chat.id),
+              },
+              {
+                text: archivedChatIds.includes(chat.id) ? 'Unarchive' : 'Archive',
+                onPress: () => toggleArchiveChat(chat.id),
+              },
+              { text: 'Cancel', style: 'cancel' },
+            ]);
+          }}
+        >
+          <View style={styles.chatHomeCopyInner}>
           <View style={styles.chatHomeTopRow}>
             <View style={styles.chatHomeNameRow}>
               {favoriteChatIds.includes(chat.id) ? (
@@ -4513,8 +5097,9 @@ function AppContent() {
               </View>
             )}
           </View>
-        </View>
-      </Pressable>
+          </View>
+        </Pressable>
+      </View>
     );
 
     return (
@@ -4621,13 +5206,51 @@ function AppContent() {
           <Text style={styles.cardBody}>Open a chat and start an audio or video call. Calls with your contacts show up here.</Text>
         </View>
       )}
-      {calls.map((call) => (
-        <View key={call.id} style={styles.card}>
-          <Text style={styles.cardTitle}>{call.name}</Text>
-          <Text style={styles.cardBody}>{call.kind} call · {call.state.charAt(0).toUpperCase() + call.state.slice(1)}</Text>
-          <Text style={styles.cardMeta}>{call.time}</Text>
-        </View>
-      ))}
+      {calls.map((call) => {
+        const outgoing = call.initiatorId === currentUserId;
+        const missed = !outgoing && (call.state === 'missed' || call.state === 'declined');
+        const directionLabel = missed
+          ? 'Missed'
+          : outgoing
+            ? (call.state === 'missed' || call.state === 'declined' ? 'Canceled' : 'Outgoing')
+            : 'Incoming';
+        const arrow = outgoing ? '↗' : '↙';
+        const started = formatCallStamp(call.startedAt) || call.time;
+        const ended = formatCallStamp(call.endedAt);
+        const duration = call.durationSeconds > 0 ? getAudioDurationLabel(call.durationSeconds * 1000) : '';
+        return (
+          <Pressable key={call.id} style={styles.callLogRow} onPress={() => {
+            const peerId = call.peerUserId;
+            if (!peerId) {
+              return;
+            }
+            const existing = chatItems.find((chat) => chat.peerUserId === peerId);
+            if (existing) {
+              setSelectedChatId(existing.id);
+              setChatScreen('detail');
+              setActiveView('Chats');
+              return;
+            }
+            void createDirectChat(peerId);
+          }}>
+            {renderPersonAvatar({
+              userId: call.peerUserId,
+              name: call.name,
+              size: 48,
+              onPress: () => onAvatarPress(call.peerUserId, call.name),
+            })}
+            <View style={styles.callLogCopy}>
+              <Text style={[styles.callLogName, missed ? styles.callLogMissed : null]}>{call.name}</Text>
+              <Text style={[styles.callLogMeta, missed ? styles.callLogMissed : null]}>
+                {arrow} {directionLabel}{duration ? ` · ${duration}` : ''} · {call.kind}
+              </Text>
+              <Text style={styles.callLogTime}>
+                {started}{ended ? ` – ${ended}` : ''}
+              </Text>
+            </View>
+          </Pressable>
+        );
+      })}
     </ScrollView>
   );
 
@@ -4686,9 +5309,13 @@ function AppContent() {
                 setPaySheet('send');
               }}
             >
-              <View style={[styles.quickSendAvatar, { backgroundColor: ['#dff3ec', '#f8eedb', '#dbe7f4', '#f0dff0'][index % 4] }]}>
-                <Text style={styles.quickSendAvatarText}>{contact.name.slice(0, 1).toUpperCase()}</Text>
-              </View>
+              {photoForUser(contact.userId) ? (
+                <Image source={{ uri: photoForUser(contact.userId) }} style={styles.quickSendAvatar} />
+              ) : (
+                <View style={[styles.quickSendAvatar, { backgroundColor: ['#dff3ec', '#f8eedb', '#dbe7f4', '#f0dff0'][index % 4] }]}>
+                  <Text style={styles.quickSendAvatarText}>{contact.name.slice(0, 1).toUpperCase()}</Text>
+                </View>
+              )}
               <Text numberOfLines={1} style={styles.quickSendName}>{contact.name.split(' ')[0]}</Text>
             </Pressable>
           ))}
@@ -4733,7 +5360,6 @@ function AppContent() {
   const renderStatus = () => {
     const myStatus = updatesFeed.find((entry) => entry.userId === currentUserId);
     const otherUpdates = updatesFeed.filter((entry) => entry.userId !== currentUserId);
-    const avatarPalette = ['#dff3ec', '#f8eedb', '#e3edf7', '#f0dff0'];
 
     return (
       <View style={styles.lightScreen}>
@@ -4768,11 +5394,7 @@ function AppContent() {
             return (
               <Pressable key={entry.userId} style={styles.statusFeedCard} onPress={() => openStatusViewer(feedIndex)}>
                 <View style={styles.statusFeedAvatarWrap}>
-                  <View style={styles.statusFeedAvatarRing}>
-                    <View style={[styles.statusFeedAvatar, { backgroundColor: avatarPalette[index % avatarPalette.length] }]}>
-                      <Text style={styles.statusFeedAvatarText}>{entry.name.slice(0, 1).toUpperCase()}</Text>
-                    </View>
-                  </View>
+                  {renderPersonAvatar({ userId: entry.userId, name: entry.name, size: 52 })}
                 </View>
                 <View style={styles.statusFeedCopy}>
                   <Text numberOfLines={1} style={styles.statusFeedName}>{entry.name}</Text>
@@ -6633,22 +7255,29 @@ function AppContent() {
                   <Text style={styles.cardBody}>No customers yet. Sync your phone book to find people already on ZynkUp.</Text>
                 )}
                 {contactItems.map((customer) => (
-                  <Pressable
-                    key={customer.id}
-                    style={styles.sheetOption}
-                    onPress={() => {
-                      if (customer.linkedUserId) {
-                        setBusinessPanel('');
-                        void createDirectChat(customer.linkedUserId);
-                      }
-                    }}
-                  >
-                    <Text style={styles.sheetOptionTitle}>{customer.name}</Text>
-                    <Text style={styles.sheetOptionBody}>
-                      {customer.phone}
-                      {customer.registered ? ' · On ZynkUp' : ' · Invite pending'}
-                    </Text>
-                  </Pressable>
+                  <View key={customer.id} style={styles.contactPickRow}>
+                    {renderPersonAvatar({
+                      userId: customer.linkedUserId,
+                      name: customer.name,
+                      size: 44,
+                      onPress: () => onAvatarPress(customer.linkedUserId, customer.name),
+                    })}
+                    <Pressable
+                      style={styles.contactPickCopy}
+                      onPress={() => {
+                        if (customer.linkedUserId) {
+                          setBusinessPanel('');
+                          void createDirectChat(customer.linkedUserId);
+                        }
+                      }}
+                    >
+                      <Text style={styles.sheetOptionTitle}>{customer.name}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        {customer.phone}
+                        {customer.registered ? ' · On ZynkUp' : ' · Invite pending'}
+                      </Text>
+                    </Pressable>
+                  </View>
                 ))}
               </ScrollView>
             ) : null}
@@ -6807,19 +7436,26 @@ function AppContent() {
                 }
 
                 return rows.map((entry) => (
-                  <Pressable
-                    key={entry.id}
-                    style={styles.sheetOption}
-                    onPress={() => {
-                      setNewChatVisible(false);
-                      void createDirectChat(entry.linkedUserId);
-                    }}
-                  >
-                    <Text style={styles.sheetOptionTitle}>{entry.name}</Text>
-                    <Text style={styles.sheetOptionBody}>
-                      {entry.phone} · {entry.presence === 'online' ? 'Online' : 'On ZynkUp'}
-                    </Text>
-                  </Pressable>
+                  <View key={entry.id} style={styles.contactPickRow}>
+                    {renderPersonAvatar({
+                      userId: entry.linkedUserId,
+                      name: entry.name,
+                      size: 44,
+                      onPress: () => onAvatarPress(entry.linkedUserId, entry.name),
+                    })}
+                    <Pressable
+                      style={styles.contactPickCopy}
+                      onPress={() => {
+                        setNewChatVisible(false);
+                        void createDirectChat(entry.linkedUserId);
+                      }}
+                    >
+                      <Text style={styles.sheetOptionTitle}>{entry.name}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        {entry.phone} · {entry.presence === 'online' ? 'Online' : 'On ZynkUp'}
+                      </Text>
+                    </Pressable>
+                  </View>
                 ));
               })()}
             </ScrollView>
@@ -6827,63 +7463,151 @@ function AppContent() {
         </Pressable>
       </Modal>
       <Modal
-        transparent
-        animationType="fade"
-        visible={Boolean(incomingCall)}
-        onRequestClose={() => setIncomingCall(null)}
+        animationType="slide"
+        visible={Boolean(incomingCall || activeCall)}
+        onRequestClose={() => undefined}
       >
-        <Pressable style={styles.dialogOverlay}>
-          <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>Incoming {incomingCall?.kind?.toLowerCase()} call</Text>
-            <Text style={styles.cardBody}>{incomingCall?.name} is calling you.</Text>
-            <View style={styles.storyActionRow}>
-              <Pressable style={[styles.storyActionButton, styles.storyActionButtonPrimary]} onPress={() => void acceptIncomingCall()}>
-                <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Answer</Text>
-              </Pressable>
-              <Pressable style={styles.storyActionButton} onPress={() => incomingCall ? void updateCallState(incomingCall.id, 'declined', 0) : undefined}>
-                <Text style={styles.storyActionButtonText}>Decline</Text>
-              </Pressable>
+        {(() => {
+          const call = activeCall || incomingCall;
+          if (!call) {
+            return null;
+          }
+          const localUrl = localCallStream?.toURL?.() || '';
+          const remoteUrl = remoteCallStream?.toURL?.() || '';
+          const mainUrl = localVideoLarge ? (localUrl || remoteUrl) : (remoteUrl || localUrl);
+          const pipUrl = remoteUrl && localUrl ? (localVideoLarge ? remoteUrl : localUrl) : '';
+          const waiting = call.state !== 'ongoing';
+          const canAnswer = call.state === 'ringing' && call.initiatorId !== currentUserId;
+          return (
+            <View style={styles.callScreen}>
+              {call.kind === 'Video' && mainUrl && RTCViewNative ? (
+                <RTCViewNative streamURL={mainUrl} style={styles.callStageMain} objectFit="cover" mirror={mainUrl === localUrl} />
+              ) : (
+                <View style={styles.callStageMain}>
+                  {renderPersonAvatar({ userId: call.peerUserId, name: call.name, size: 120 })}
+                </View>
+              )}
+              {call.kind === 'Video' && pipUrl && RTCViewNative ? (
+                <Pressable style={styles.callStagePip} onPress={() => setLocalVideoLarge((current) => !current)}>
+                  <RTCViewNative streamURL={pipUrl} style={styles.callStagePipVideo} objectFit="cover" mirror={pipUrl === localUrl} />
+                </Pressable>
+              ) : null}
+              <View style={styles.callScreenTop}>
+                <Text style={styles.callScreenName}>{call.name}</Text>
+                <Text style={styles.callScreenStatus}>
+                  {call.state === 'ongoing'
+                    ? getAudioDurationLabel(activeCallSeconds * 1000)
+                    : (canAnswer ? 'Incoming call' : 'Ringing')}
+                </Text>
+                <Text style={styles.callScreenStatus}>
+                  {waiting
+                    ? (canAnswer ? 'Ringing on their phone' : 'Calling…')
+                    : (remoteCallStream ? 'Connected' : 'Connecting media…')}
+                </Text>
+                {callError ? <Text style={styles.callScreenError}>{callError}</Text> : null}
+              </View>
+              <View style={styles.callScreenActions}>
+                {call.kind === 'Video' && call.state === 'ongoing' ? (
+                  <Pressable style={styles.callSideButton} onPress={flipCallCamera}>
+                    <Text style={styles.callSideButtonText}>Flip</Text>
+                  </Pressable>
+                ) : <View style={styles.callSideButton} />}
+                {canAnswer ? (
+                  <Pressable style={[styles.callRoundButton, styles.callAnswerButton]} onPress={() => void acceptIncomingCall()}>
+                    <Text style={styles.callRoundButtonText}>Answer</Text>
+                  </Pressable>
+                ) : <View style={styles.callRoundSpacer} />}
+                <Pressable
+                  style={[styles.callRoundButton, styles.callEndButton]}
+                  onPress={() => {
+                    if (canAnswer && incomingCall) {
+                      void updateCallState(incomingCall.id, 'declined', 0);
+                      return;
+                    }
+                    void endActiveCall();
+                  }}
+                >
+                  <Text style={styles.callRoundButtonText}>{call.state === 'ongoing' ? 'End' : 'Cancel'}</Text>
+                </Pressable>
+              </View>
             </View>
+          );
+        })()}
+      </Modal>
+      <Modal transparent animationType="fade" visible={chatMenuVisible} onRequestClose={() => setChatMenuVisible(false)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setChatMenuVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>{activeChat?.name || 'Chat'}</Text>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleMuteChat(activeChat.id); }}>
+              <Text style={styles.sheetOptionTitle}>{mutedChatIds.includes(activeChat?.id) ? 'Unmute' : 'Mute'}</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleArchiveChat(activeChat.id); setChatScreen('list'); }}>
+              <Text style={styles.sheetOptionTitle}>{archivedChatIds.includes(activeChat?.id) ? 'Unarchive' : 'Archive'}</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleFavoriteChat(activeChat.id); }}>
+              <Text style={styles.sheetOptionTitle}>{favoriteChatIds.includes(activeChat?.id) ? 'Unpin' : 'Pin'}</Text>
+            </Pressable>
+            <Pressable style={styles.sheetBack} onPress={() => setChatMenuVisible(false)}>
+              <Text style={styles.sheetBackText}>Close</Text>
+            </Pressable>
           </Pressable>
         </Pressable>
       </Modal>
-      <Modal
-        transparent
-        animationType="fade"
-        visible={Boolean(activeCall)}
-        onRequestClose={() => undefined}
-      >
-        <Pressable style={styles.dialogOverlay}>
+      <Modal transparent animationType="slide" visible={peerProfileVisible} onRequestClose={() => setPeerProfileVisible(false)}>
+        <View style={styles.peerProfileScreen}>
+          <Pressable style={styles.viewerClose} onPress={() => setPeerProfileVisible(false)}>
+            <Text style={styles.viewerCloseText}>Close</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => {
+              const photoUri = photoForUser(activeChat?.peerUserId);
+              if (photoUri) {
+                setPhotoPreview({ uri: photoUri, name: activeChat?.name });
+              }
+            }}
+          >
+            {renderPersonAvatar({ userId: activeChat?.peerUserId, name: activeChat?.name, size: 140 })}
+          </Pressable>
+          <Text style={styles.peerProfileName}>{activeChat?.name}</Text>
+          <Text style={styles.peerProfileMeta}>{getPresenceLabel(activeChat)}</Text>
+          <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.about || 'No about yet'}</Text>
+          <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.phone || ''}</Text>
+        </View>
+      </Modal>
+      <Modal transparent animationType="fade" visible={Boolean(avatarPrompt)} onRequestClose={() => setAvatarPrompt(null)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setAvatarPrompt(null)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>{activeCall?.kind} call</Text>
-            <Text style={styles.cardBody}>{activeCall?.name}</Text>
-            <Text style={styles.cardMeta}>{activeCall?.state === 'ongoing' ? getAudioDurationLabel(activeCallSeconds * 1000) : 'Ringing...'}</Text>
-            {callError ? <Text style={styles.cardBody}>{callError}</Text> : null}
-            {activeCall?.kind === 'Video' ? (
-              <View style={styles.callVideoRow}>
-                {localCallStream?.toURL && RTCViewNative ? <RTCViewNative streamURL={localCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Local video</Text></View>}
-                {remoteCallStream?.toURL && RTCViewNative ? <RTCViewNative streamURL={remoteCallStream.toURL()} style={styles.callVideoTile} objectFit="cover" /> : <View style={styles.callVideoTilePlaceholder}><Text style={styles.cardMeta}>Waiting for peer</Text></View>}
-              </View>
-            ) : (
-              <View style={styles.callAudioRow}>
-                <View style={styles.callAudioPill}><Text style={styles.cardMeta}>Your mic is live</Text></View>
-                <View style={styles.callAudioPill}><Text style={styles.cardMeta}>{remoteCallStream ? `${activeCall?.name} connected` : 'Waiting for peer'}</Text></View>
-              </View>
-            )}
-            <View style={styles.storyActionRow}>
-              {activeCall?.state === 'ringing' && activeCall?.initiatorId !== currentUserId ? (
-                <Pressable style={[styles.storyActionButton, styles.storyActionButtonPrimary]} onPress={() => void acceptIncomingCall()}>
-                  <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>Answer</Text>
-                </Pressable>
-              ) : null}
-              <Pressable style={[styles.storyActionButton, styles.storyActionButtonDone]} onPress={() => void endActiveCall()}>
-                <Text style={[styles.storyActionButtonText, styles.storyActionButtonTextPrimary]}>
-                  {activeCall?.state === 'ongoing' ? 'End Call' : 'Cancel'}
-                </Text>
-              </Pressable>
-            </View>
+            <Text style={styles.dialogTitle}>{avatarPrompt?.name}</Text>
+            <Text style={styles.cardBody}>This contact has a status update.</Text>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                if (avatarPrompt?.photoUri) {
+                  setPhotoPreview({ uri: avatarPrompt.photoUri, name: avatarPrompt.name });
+                }
+                setAvatarPrompt(null);
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>View profile photo</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => openStatusForUser(avatarPrompt?.userId)}>
+              <Text style={styles.sheetOptionTitle}>View status</Text>
+            </Pressable>
+            <Pressable style={styles.sheetBack} onPress={() => setAvatarPrompt(null)}>
+              <Text style={styles.sheetBackText}>Close</Text>
+            </Pressable>
           </Pressable>
         </Pressable>
+      </Modal>
+      <Modal transparent animationType="fade" visible={Boolean(photoPreview)} onRequestClose={() => setPhotoPreview(null)}>
+        <View style={styles.viewerOverlay}>
+          <Pressable style={styles.viewerClose} onPress={() => setPhotoPreview(null)}>
+            <Text style={styles.viewerCloseText}>Close</Text>
+          </Pressable>
+          {photoPreview?.uri ? (
+            <Image resizeMode="contain" source={{ uri: photoPreview.uri }} style={styles.viewerImage} />
+          ) : null}
+        </View>
       </Modal>
       <Modal
         transparent
@@ -7385,6 +8109,65 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginRight: 14,
     position: 'relative',
+  },
+  chatAvatarSlot: {
+    marginRight: 14,
+    position: 'relative',
+  },
+  chatHomeCopyInner: {
+    flex: 1,
+  },
+  personAvatarOuter: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#0b1418',
+  },
+  personAvatarFallback: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#d7efe4',
+  },
+  personAvatarLetter: {
+    color: '#10221b',
+    fontWeight: '800',
+    fontSize: 18,
+  },
+  contactPickRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 8,
+  },
+  contactPickCopy: {
+    flex: 1,
+  },
+  callLogRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#24343c',
+  },
+  callLogCopy: {
+    flex: 1,
+  },
+  callLogName: {
+    color: '#f4f7f8',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  callLogMeta: {
+    color: '#b7c6cc',
+    marginTop: 2,
+  },
+  callLogTime: {
+    color: '#8ea0a8',
+    marginTop: 2,
+    fontSize: 12,
+  },
+  callLogMissed: {
+    color: '#d11a2a',
   },
   chatHomeAvatarText: {
     color: '#111827',
@@ -8192,6 +8975,47 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     backgroundColor: 'rgba(255,255,255,0.32)',
   },
+  voicePlayButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.16)',
+  },
+  voiceBarTrack: {
+    flex: 1,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.28)',
+    overflow: 'hidden',
+    justifyContent: 'center',
+  },
+  voiceBarFill: {
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#7CFFB2',
+  },
+  recordPulse: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#ff4d4f',
+  },
+  draftAction: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  draftActionSend: {
+    backgroundColor: '#1f8f4e',
+  },
+  draftActionText: {
+    color: '#f6f7f8',
+    fontWeight: '700',
+    fontSize: 13,
+  },
   voiceDuration: {
     color: '#e3ecef',
     fontWeight: '700',
@@ -8348,11 +9172,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     backgroundColor: '#10222a',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
   },
   recordingBannerText: {
     color: '#ff7070',
     fontWeight: '700',
     fontSize: 13,
+    flex: 1,
   },
   secondaryScreen: {
     flex: 1,
@@ -9715,6 +10543,114 @@ const styles = StyleSheet.create({
   callAudioRow: {
     gap: 10,
     marginTop: 14,
+  },
+  callScreen: {
+    flex: 1,
+    backgroundColor: '#071015',
+  },
+  callStageMain: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#071015',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  callStagePip: {
+    position: 'absolute',
+    top: 88,
+    right: 16,
+    width: 112,
+    height: 168,
+    borderRadius: 16,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.3)',
+    backgroundColor: '#111',
+  },
+  callStagePipVideo: {
+    width: '100%',
+    height: '100%',
+  },
+  callScreenTop: {
+    position: 'absolute',
+    top: 54,
+    left: 20,
+    right: 140,
+  },
+  callScreenName: {
+    color: '#f7fbfc',
+    fontSize: 28,
+    fontWeight: '800',
+  },
+  callScreenStatus: {
+    color: '#d5e4ea',
+    marginTop: 4,
+    fontSize: 15,
+  },
+  callScreenError: {
+    color: '#ffb4b4',
+    marginTop: 8,
+  },
+  callScreenActions: {
+    position: 'absolute',
+    left: 24,
+    right: 24,
+    bottom: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  callRoundButton: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  callAnswerButton: {
+    backgroundColor: '#22c55e',
+  },
+  callEndButton: {
+    backgroundColor: '#ef4444',
+  },
+  callRoundButtonText: {
+    color: '#ffffff',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  callRoundSpacer: {
+    width: 84,
+    height: 84,
+  },
+  callSideButton: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.14)',
+  },
+  callSideButtonText: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  peerProfileScreen: {
+    flex: 1,
+    backgroundColor: '#0b1418',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    padding: 24,
+  },
+  peerProfileName: {
+    color: '#f7fbfc',
+    fontSize: 26,
+    fontWeight: '800',
+    marginTop: 16,
+  },
+  peerProfileMeta: {
+    color: '#c5d5dc',
+    fontSize: 15,
+    textAlign: 'center',
   },
   callAudioPill: {
     minHeight: 64,
