@@ -468,6 +468,12 @@ const createChatSchema = z.object({
   peerUserId: z.string().min(1),
 });
 
+const createRoomSchema = z.object({
+  userId: z.string().min(1),
+  title: z.string().trim().min(1).max(80),
+  memberIds: z.array(z.string().min(1)).min(1),
+});
+
 const pinCodeSchema = z.string().regex(/^\d{4,6}$/);
 
 const authLoginSchema = z.object({
@@ -1529,7 +1535,12 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
         return { ...chat, unreadCount: unreadForUser };
       }
 
-      const peerId = chat.participants.find((participantId) => participantId !== currentUserId);
+      const others = chat.participants.filter((participantId) => participantId !== currentUserId);
+      if (!others.length) {
+        return { ...chat, title: 'Message yourself', unreadCount: unreadForUser };
+      }
+
+      const peerId = others[0];
       const peerUser = users.find((user) => user.id === peerId);
       return {
         ...chat,
@@ -1729,7 +1740,8 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
     return null;
   }
 
-  const participants = [userId, peerUserId].sort();
+  const selfChat = userId === peerUserId;
+  const participants = selfChat ? [userId] : [userId, peerUserId].sort();
   const db = await getDb();
   if (!db) {
     const existing = seedChats.find(
@@ -1743,7 +1755,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
 
     const chat: Chat = {
       id: `c${Date.now()}`,
-      title: peerUser.name,
+      title: selfChat ? 'Message yourself' : peerUser.name,
       kind: 'direct',
       participants,
       unreadCount: 0,
@@ -1766,7 +1778,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
 
   const chat: Chat = {
     id: `c${Date.now()}`,
-    title: peerUser.name,
+    title: selfChat ? 'Message yourself' : peerUser.name,
     kind: 'direct',
     participants,
     unreadCount: 0,
@@ -1774,6 +1786,38 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
     updatedAt: new Date().toISOString(),
   };
   await collections.chats.insertOne(chat);
+  return chat;
+};
+
+const createChatRoom = async (userId: string, title: string, memberIds: string[]) => {
+  const users = await readUsers();
+  if (!users.some((user) => user.id === userId)) {
+    return null;
+  }
+  const participants = [...new Set([userId, ...memberIds])];
+  if (participants.length < 2) {
+    return null;
+  }
+
+  const chat: Chat = {
+    id: `c${Date.now()}`,
+    title,
+    kind: 'group',
+    participants,
+    unreadCount: 0,
+    unreadByUser: {},
+    lastMessagePreview: 'Chat room created',
+    updatedAt: new Date().toISOString(),
+  };
+
+  const db = await getDb();
+  if (!db) {
+    seedChats.unshift(chat);
+    return chat;
+  }
+
+  await seedDatabaseIfNeeded();
+  await collectionsFor(db).chats.insertOne(chat);
   return chat;
 };
 
@@ -3456,6 +3500,28 @@ app.post('/api/chats', async (req, res) => {
   return res.status(201).json({ chat });
 });
 
+app.post('/api/chats/rooms', async (req, res) => {
+  const parseResult = createRoomSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'A chat room needs a name and at least 2 people.',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const chat = await createChatRoom(
+    parseResult.data.userId,
+    parseResult.data.title,
+    parseResult.data.memberIds,
+  );
+  if (!chat) {
+    return res.status(400).json({ error: 'A chat room needs at least 2 people.' });
+  }
+
+  io.emit('chat:created', chat);
+  return res.status(201).json({ chat });
+});
+
 app.post('/api/messages', async (req, res) => {
   const parseResult = sendMessageSchema.safeParse(req.body);
 
@@ -3662,6 +3728,22 @@ io.on('connection', (socket) => {
   socket.on('user:join', ({ userId }: { userId?: string }) => {
     if (userId) {
       socket.join(`user:${userId}`);
+    }
+  });
+
+  socket.on('call:invite', ({
+    toUserId,
+    fromUserId,
+    fromName,
+    kind,
+  }: {
+    toUserId?: string;
+    fromUserId?: string;
+    fromName?: string;
+    kind?: string;
+  }) => {
+    if (toUserId) {
+      io.to(`user:${toUserId}`).emit('call:invite', { fromUserId, fromName, kind });
     }
   });
 
