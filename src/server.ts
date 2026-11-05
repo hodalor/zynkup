@@ -120,7 +120,17 @@ type StatusPost = {
   }>;
   createdAt: string;
   expiresAt: string;
-  audience: 'contacts' | 'close-friends';
+  audience: 'contacts' | 'close-friends' | 'public' | 'marketplace';
+};
+
+type ChatRequest = {
+  id: string;
+  fromUserId: string;
+  toUserId: string;
+  statusId?: string;
+  note?: string;
+  state: 'pending' | 'accepted' | 'rejected';
+  createdAt: string;
 };
 
 type CatalogItem = {
@@ -258,6 +268,7 @@ const seedUsers: User[] = [];
 const seedChats: Chat[] = [];
 const seedMessages: Message[] = [];
 const seedContacts: Contact[] = [];
+const seedChatRequests: ChatRequest[] = [];
 const seedCalls: Call[] = [];
 const seedStatuses: StatusPost[] = [];
 const seedCatalogItems: CatalogItem[] = [];
@@ -391,7 +402,7 @@ const createStatusSchema = z.object({
   fontFamily: z.string().min(2).max(40).optional(),
   fontSize: z.number().int().min(16).max(64).optional(),
   catalogItemId: z.string().min(1).max(80).optional(),
-  audience: z.enum(['contacts', 'close-friends']).default('contacts'),
+  audience: z.enum(['contacts', 'close-friends', 'public', 'marketplace']).default('contacts'),
 }).refine((value) => value.text.trim().length > 0 || value.assets.length > 0, {
   message: 'A status needs text or at least one asset',
 });
@@ -466,6 +477,13 @@ const markStatusViewSchema = z.object({
 const createChatSchema = z.object({
   userId: z.string().min(1),
   peerUserId: z.string().min(1),
+});
+
+const createChatRequestSchema = z.object({
+  fromUserId: z.string().min(1),
+  toUserId: z.string().min(1),
+  statusId: z.string().min(1).max(80).optional(),
+  note: z.string().max(180).optional(),
 });
 
 const createRoomSchema = z.object({
@@ -1116,6 +1134,7 @@ const collectionsFor = (db: Db) => ({
   calls: db.collection<Call>('calls'),
   statuses: db.collection<StatusPost>('statuses'),
   catalogItems: db.collection<CatalogItem>('catalogItems'),
+  chatRequests: db.collection<ChatRequest>('chatRequests'),
 });
 
 let seedPromise: Promise<void> | null = null;
@@ -1425,6 +1444,34 @@ const readContacts = async (ownerUserId?: string) => {
   return cursor.toArray();
 };
 
+const readChatRequests = async () => {
+  const db = await getDb();
+  if (!db) {
+    return [...seedChatRequests];
+  }
+  await seedDatabaseIfNeeded();
+  return collectionsFor(db).chatRequests.find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } }).toArray();
+};
+
+const saveChatRequest = async (request: ChatRequest) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedChatRequests.findIndex((item) => item.id === request.id);
+    if (index >= 0) {
+      seedChatRequests[index] = request;
+    } else {
+      seedChatRequests.unshift(request);
+    }
+    return request;
+  }
+  await seedDatabaseIfNeeded();
+  await collectionsFor(db).chatRequests.updateOne({ id: request.id }, { $set: request }, { upsert: true });
+  return request;
+};
+
+const countryKeyFor = (user?: User, profile?: Profile | null) =>
+  (profile?.countryCode || user?.phone || '').replace(/[^\d+]/g, '').slice(0, 4);
+
 const readCalls = async () => {
   const db = await getDb();
   if (!db) {
@@ -1512,15 +1559,17 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     });
   }
 
-  const [rawUsers, profiles, chats, messages, contacts, calls, statuses, catalogItems] = await Promise.all([
+  const [rawUsers, profiles, chats, messages, contacts, allContacts, calls, statuses, catalogItems, chatRequests] = await Promise.all([
     readUsers(),
     readProfiles(),
     readChats(),
     readMessages(),
     readContacts(currentUserId),
+    readContacts(),
     readCalls(),
     readStatuses(),
     readCatalogItems(),
+    readChatRequests(),
   ]);
   const photoByUserId = new Map(profiles.map((item) => [item.id, item.photoUri || '']));
   const users = rawUsers.map((user) => ({
@@ -1565,19 +1614,85 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     };
   });
 
+  const savedByMe = new Set(
+    contacts.map((contact) => contact.linkedUserId).filter((id): id is string => Boolean(id)),
+  );
+  const savedMe = new Set(
+    allContacts
+      .filter((contact) => contact.ownerUserId !== currentUserId && contact.linkedUserId === currentUserId)
+      .map((contact) => contact.ownerUserId),
+  );
+  const mutualUserIds = [...savedByMe].filter((id) => savedMe.has(id));
+  const mutualSet = new Set(mutualUserIds);
+  const acceptedUserIds = new Set(
+    chatRequests
+      .filter((request) => request.state === 'accepted' && (request.fromUserId === currentUserId || request.toUserId === currentUserId))
+      .map((request) => (request.fromUserId === currentUserId ? request.toUserId : request.fromUserId)),
+  );
+  const myCountry = countryKeyFor(
+    rawUsers.find((user) => user.id === currentUserId),
+    profile,
+  );
+  const profileById = new Map(profiles.map((item) => [item.id, item]));
+  const userById = new Map(rawUsers.map((user) => [user.id, user]));
+  const sameCountry = (userId: string) => countryKeyFor(userById.get(userId), profileById.get(userId)) === myCountry && Boolean(myCountry);
+  const visibleStatuses = statuses.filter((status) => {
+    if (status.userId === currentUserId) {
+      return true;
+    }
+    if (status.audience === 'public') {
+      return true;
+    }
+    if (status.audience === 'marketplace') {
+      return sameCountry(status.userId);
+    }
+    return mutualSet.has(status.userId);
+  });
+  const visibleCatalog = catalogItems.filter((item) => {
+    if (item.sellerId === currentUserId) {
+      return true;
+    }
+    if (mutualSet.has(item.sellerId)) {
+      return true;
+    }
+    return Boolean(item.isPublic) && sameCountry(item.sellerId);
+  });
+  const knownUserIds = new Set<string>([
+    currentUserId,
+    ...mutualUserIds,
+    ...acceptedUserIds,
+    ...visibleChats.flatMap((chat) => chat.participants),
+  ]);
+  const safeUsers = users.map((user) => {
+    if (knownUserIds.has(user.id)) {
+      return user;
+    }
+    const theirProfile = profileById.get(user.id);
+    const showPhoto = theirProfile?.profilePhotoPrivacy === 'everyone';
+    return {
+      ...user,
+      phone: '',
+      username: '',
+      about: '',
+      photoUri: showPhoto ? user.photoUri : '',
+    };
+  });
+
   return {
     authRequired: false,
     currentUserId,
     currentDeviceId: session?.deviceId ?? null,
     profile,
-    users,
+    users: safeUsers,
+    mutualUserIds,
+    chatRequests: chatRequests.filter((request) => request.fromUserId === currentUserId || request.toUserId === currentUserId),
     chats: visibleChats,
     messagesByChat: buildMessagesByChat(visibleMessages),
     contacts: mergedContacts,
     calls: visibleCalls,
-    statuses,
-    updatesFeed: buildUpdateFeed(users, statuses),
-    catalogItems,
+    statuses: visibleStatuses,
+    updatesFeed: buildUpdateFeed(safeUsers, visibleStatuses),
+    catalogItems: visibleCatalog,
     settingsMenu,
     architecture: {
       mode: 'whatsapp-inspired',
@@ -3520,6 +3635,82 @@ app.post('/api/chats/rooms', async (req, res) => {
 
   io.emit('chat:created', chat);
   return res.status(201).json({ chat });
+});
+
+app.delete('/api/chats/:chatId', async (req, res) => {
+  const userId = await resolveRequestUserId(req);
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || !userId || !chat.participants.includes(userId)) {
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+  if (chat.kind !== 'group') {
+    return res.status(400).json({ error: 'Only a chat room can be deleted.' });
+  }
+  const db = await getDb();
+  if (!db) {
+    const index = seedChats.findIndex((item) => item.id === chat.id);
+    if (index >= 0) {
+      seedChats.splice(index, 1);
+    }
+  } else {
+    await collectionsFor(db).chats.deleteOne({ id: chat.id });
+  }
+  io.emit('chat:deleted', { chatId: chat.id });
+  return res.json({ ok: true });
+});
+
+app.post('/api/chat-requests', async (req, res) => {
+  const parseResult = createChatRequestSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid chat request' });
+  }
+  const { fromUserId, toUserId, statusId, note } = parseResult.data;
+  if (fromUserId === toUserId) {
+    return res.status(400).json({ error: 'You cannot request yourself.' });
+  }
+  const existing = (await readChatRequests()).find((item) =>
+    item.state !== 'rejected'
+    && ((item.fromUserId === fromUserId && item.toUserId === toUserId)
+      || (item.fromUserId === toUserId && item.toUserId === fromUserId)));
+  if (existing) {
+    return res.status(200).json({ request: existing });
+  }
+  const request: ChatRequest = {
+    id: `r${Date.now()}`,
+    fromUserId,
+    toUserId,
+    statusId,
+    note,
+    state: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  await saveChatRequest(request);
+  io.emit('chat:request', request);
+  return res.status(201).json({ request });
+});
+
+app.post('/api/chat-requests/:requestId/:action', async (req, res) => {
+  const action = req.params.action;
+  if (action !== 'accept' && action !== 'reject') {
+    return res.status(400).json({ error: 'Unknown action' });
+  }
+  const requests = await readChatRequests();
+  const current = requests.find((item) => item.id === req.params.requestId);
+  if (!current) {
+    return res.status(404).json({ error: 'Request not found' });
+  }
+  const updated: ChatRequest = { ...current, state: action === 'accept' ? 'accepted' : 'rejected' };
+  await saveChatRequest(updated);
+  let chat = null;
+  if (action === 'accept') {
+    chat = await createOrFindDirectChat(current.toUserId, current.fromUserId);
+    if (chat) {
+      io.emit('chat:created', chat);
+    }
+  }
+  io.emit('chat:request', updated);
+  return res.json({ request: updated, chat });
 });
 
 app.post('/api/messages', async (req, res) => {
