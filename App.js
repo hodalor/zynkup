@@ -31,6 +31,7 @@ import {
   AppState,
   BackHandler,
   Keyboard,
+  NativeModules,
   Vibration,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -134,6 +135,7 @@ const MUTED_CHATS_STORAGE_KEY = 'zynkup-mobile-muted-chats';
 const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-mobile-archived-chats';
 const APP_LOCK_PIN_KEY = 'zynkup-mobile-app-lock-pin';
 const ACCOUNT_STORAGE_KEY = 'zynkup-mobile-account';
+const OUTBOX_STORAGE_KEY = 'zynkup-mobile-outbox';
 const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_APP_SETTINGS = {
   enterIsSend: true,
@@ -179,17 +181,20 @@ const DEVICE_STORAGE_KEY = 'zynkup-mobile-device-id';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const BOOTSTRAP_TIMEOUT_MS = 5000;
+const CueSound = NativeModules.CueSound;
 const WEBRTC_CONFIGURATION = {
+  iceCandidatePoolSize: 4,
   iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'] },
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.relay.metered.ca:80'] },
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turn:global.relay.metered.ca:80',
+        'turn:global.relay.metered.ca:80?transport=tcp',
+        'turn:global.relay.metered.ca:443',
+        'turns:global.relay.metered.ca:443?transport=tcp',
       ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
+      username: 'f6507426c0f4f89d0bda02e2',
+      credential: '7YF0907XexAfvkbL',
     },
   ],
 };
@@ -498,6 +503,9 @@ function AppContent() {
   const [avatarPrompt, setAvatarPrompt] = useState(null);
   const [photoPreview, setPhotoPreview] = useState(null);
   const [localVideoLarge, setLocalVideoLarge] = useState(false);
+  const [callPhase, setCallPhase] = useState('calling');
+  const [statusToolsOpen, setStatusToolsOpen] = useState(false);
+  const [cartItems, setCartItems] = useState([]);
   const [activeStatusGroupIndex, setActiveStatusGroupIndex] = useState(null);
   const [activeStatusItemIndex, setActiveStatusItemIndex] = useState(0);
   const [statusProgress, setStatusProgress] = useState(0);
@@ -574,6 +582,13 @@ function AppContent() {
   const navigationStateRef = useRef({});
   const pendingIceRef = useRef([]);
   const remoteReadyRef = useRef(false);
+  const iceRestartedRef = useRef(false);
+  const signalChainRef = useRef(Promise.resolve());
+  const outboxRef = useRef([]);
+  const outboxFlushRef = useRef(false);
+  const flushOutboxRef = useRef(() => undefined);
+  const threadRef = useRef(null);
+  const stickToLatestRef = useRef(true);
   const voiceBarWidthRef = useRef(160);
   const recordPulse = useRef(new Animated.Value(1)).current;
   const socketRef = useRef(null);
@@ -581,6 +596,8 @@ function AppContent() {
   const statusGroupIndexRef = useRef(null);
   const statusItemIndexRef = useRef(0);
   const activeCallRef = useRef(null);
+  const incomingCallRef = useRef(null);
+  const refreshSessionRef = useRef(() => undefined);
   const peerConnectionRef = useRef(null);
   const callMediaStreamRef = useRef(null);
   const [cameraPermissionGranted, setCameraPermissionGranted] = useState(false);
@@ -807,6 +824,7 @@ function AppContent() {
       location: locationMatch ? `${locationMatch[1]},${locationMatch[2]}` : undefined,
       durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
       durationSeconds: message.durationSeconds,
+      catalogItemId: message.catalogItemId,
       receiptState: message.state,
       replyToMessageId: message.replyToMessageId,
       replyPreview: message.replyPreview,
@@ -1113,7 +1131,7 @@ function AppContent() {
       : {}
   );
 
-  const hydrateBootstrapFromDevice = async (deviceIdHint) => {
+  const hydrateBootstrapFromDevice = async (deviceIdHint, options = {}) => {
     const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
     const deviceIds = [deviceIdHint, currentDeviceId, storedDeviceId].filter(Boolean);
     const uniqueDeviceIds = [...new Set(deviceIds)];
@@ -1130,7 +1148,7 @@ function AppContent() {
           }
           const payload = await response.json();
           if (payload?.currentUserId) {
-            applyBootstrapPayload(payload);
+            applyBootstrapPayload(payload, options);
             return payload;
           }
         } catch {
@@ -1143,6 +1161,9 @@ function AppContent() {
     }
 
     return null;
+  };
+  refreshSessionRef.current = () => {
+    void hydrateBootstrapFromDevice(currentDeviceIdRef.current, { preserveCall: true });
   };
 
   const signOutKeepAccount = async () => {
@@ -1468,6 +1489,7 @@ function AppContent() {
     peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop?.());
     peerConnectionRef.current?.close?.();
     peerConnectionRef.current = null;
+    iceRestartedRef.current = false;
     callMediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
     callMediaStreamRef.current = null;
     pendingIceRef.current = [];
@@ -1728,9 +1750,21 @@ function AppContent() {
       }
     };
     connection.oniceconnectionstatechange = () => {
-      if (connection.iceConnectionState === 'failed') {
-        setCallError('Call media could not connect. Try again on a stronger network.');
+      if (connection.iceConnectionState === 'connected' || connection.iceConnectionState === 'completed') {
+        setCallError('');
+        return;
       }
+      if (connection.iceConnectionState !== 'failed') {
+        return;
+      }
+      if (!iceRestartedRef.current) {
+        iceRestartedRef.current = true;
+        if (typeof connection.restartIce === 'function') {
+          connection.restartIce();
+          return;
+        }
+      }
+      setCallError('Call media could not connect. Try again on a stronger network.');
     };
     const localStream = await ensureCallMedia(call.kind);
     localStream.getTracks().forEach((track) => connection.addTrack(track, localStream));
@@ -1900,7 +1934,7 @@ function AppContent() {
     );
   };
 
-  const applyBootstrapPayload = (payload) => {
+  const applyBootstrapPayload = (payload, options = {}) => {
     const nextCurrentUserId = payload.currentUserId ?? '';
     setBootstrapReady(true);
     setAuthRequired(Boolean(payload.authRequired));
@@ -1961,20 +1995,43 @@ function AppContent() {
         presence: contact.presence,
       })),
     );
-    setMessagesByChat(
-      Object.fromEntries(
+    setMessagesByChat((current) => {
+      const next = Object.fromEntries(
         Object.entries(payload.messagesByChat ?? {}).map(([chatId, list]) => [
           chatId,
           list.map((message) => mapServerMessage(message, nextCurrentUserId)),
         ]),
-      ),
-    );
+      );
+      Object.entries(current).forEach(([chatId, list]) => {
+        const pending = (list ?? []).filter((message) => message.receiptState === 'pending');
+        if (!pending.length) {
+          return;
+        }
+        const serverList = next[chatId] ?? [];
+        const missing = pending.filter(
+          (message) => !serverList.some((item) => item.clientRef && item.clientRef === message.clientRef),
+        );
+        if (missing.length) {
+          next[chatId] = [...serverList, ...missing];
+        }
+      });
+      return next;
+    });
+    Object.values(payload.messagesByChat ?? {})
+      .flat()
+      .filter((message) => message.senderId !== nextCurrentUserId && message.state === 'sent')
+      .slice(-40)
+      .forEach((message) => {
+        void syncReceiptState(message.id, 'delivered');
+      });
     const nextCalls = (payload.calls ?? []).map((call) => mapCallFromServer(call, nextCurrentUserId, nextUsersById));
     setCalls(nextCalls);
-    const incoming = nextCalls.find((call) => call.state === 'ringing' && call.initiatorId !== nextCurrentUserId) ?? null;
-    const liveCall = nextCalls.find((call) => call.state === 'ongoing' || (call.state === 'ringing' && call.initiatorId === nextCurrentUserId)) ?? null;
-    setActiveCall(liveCall);
-    setIncomingCall(incoming);
+    if (!options.preserveCall) {
+      const incoming = nextCalls.find((call) => call.state === 'ringing' && call.initiatorId !== nextCurrentUserId) ?? null;
+      const liveCall = nextCalls.find((call) => call.state === 'ongoing' || (call.state === 'ringing' && call.initiatorId === nextCurrentUserId)) ?? null;
+      setActiveCall(liveCall);
+      setIncomingCall(incoming);
+    }
     setStatuses(
       (payload.statuses ?? []).map((status) => ({
         ...status,
@@ -1991,6 +2048,9 @@ function AppContent() {
         sellerId: item.sellerId,
         title: item.title,
         price: `${item.currency ?? 'GHS'} ${item.price}`,
+        priceAmount: item.price,
+        currency: item.currency,
+        isPublic: Boolean(item.isPublic),
         category: item.category,
         seller: payload.users?.find((user) => user.id === item.sellerId)?.name ?? 'Seller',
         description: item.description,
@@ -2029,7 +2089,8 @@ function AppContent() {
 
   useEffect(() => {
     activeCallRef.current = activeCall;
-  }, [activeCall]);
+    incomingCallRef.current = incomingCall;
+  }, [activeCall, incomingCall]);
 
   const stopEmojiPlayback = () => {
     timeoutsRef.current.forEach((timeout) => clearTimeout(timeout));
@@ -2232,6 +2293,10 @@ function AppContent() {
       if ((state === 'background' || state === 'inactive') && currentUserIdRef.current) {
         void writeRememberedAccount({ lastActiveAt: Date.now() });
       }
+      if (state === 'active' && currentUserIdRef.current && !activeCallRef.current && !incomingCallRef.current) {
+        refreshSessionRef.current();
+        flushOutboxRef.current();
+      }
     });
 
     return () => {
@@ -2243,6 +2308,21 @@ function AppContent() {
   useEffect(() => {
     const socket = io(API_BASE_URL, { transports: ['websocket', 'polling'] });
     socketRef.current = socket;
+    socket.on('connect', () => {
+      if (currentUserIdRef.current) {
+        socket.emit('user:join', { userId: currentUserIdRef.current });
+      }
+      flushOutboxRef.current();
+      if (!activeCallRef.current && !incomingCallRef.current) {
+        refreshSessionRef.current();
+      }
+    });
+    socket.on('call:peerRinging', ({ callId }) => {
+      const currentCall = activeCallRef.current;
+      if (currentCall && currentCall.id === callId && currentCall.initiatorId === currentUserIdRef.current) {
+        setCallPhase('ringing');
+      }
+    });
     socket.on('system:ready', (payload) => {
       if (payload.bootstrap && !currentDeviceIdRef.current) {
         applyBootstrapPayload(payload.bootstrap);
@@ -2401,6 +2481,9 @@ function AppContent() {
             sellerId: item.sellerId,
             title: item.title,
             price: `${item.currency || accountCurrency} ${item.price}`,
+            priceAmount: item.price,
+            currency: item.currency,
+            isPublic: Boolean(item.isPublic),
             category: item.category,
             seller: usersByIdRef.current[item.sellerId]?.name || 'Seller',
             description: item.description,
@@ -2420,6 +2503,9 @@ function AppContent() {
                 ...entry,
                 title: item.title ?? entry.title,
                 price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
+                priceAmount: item.price ?? entry.priceAmount,
+                currency: item.currency ?? entry.currency,
+                isPublic: item.isPublic == null ? entry.isPublic : Boolean(item.isPublic),
                 category: item.category ?? entry.category,
                 description: item.description ?? entry.description,
                 stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
@@ -2490,10 +2576,13 @@ function AppContent() {
         return;
       }
 
-      void (async () => {
+      signalChainRef.current = signalChainRef.current.then(async () => {
         try {
           const connection = await ensurePeerConnection(currentCall);
           if (signalType === 'offer') {
+            if (connection.remoteDescription && connection.signalingState === 'stable') {
+              return;
+            }
             await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
             remoteReadyRef.current = true;
             await flushQueuedIce(connection);
@@ -2523,7 +2612,7 @@ function AppContent() {
         } catch {
           setCallError('Call signaling lost sync.');
         }
-      })();
+      }).catch(() => undefined);
     });
 
     if (currentUserIdRef.current) {
@@ -2716,14 +2805,9 @@ function AppContent() {
       return undefined;
     }
 
-    const callSnapshot = activeCallRef.current;
     setCallError('');
     socketRef.current.emit('call:join', { callId, userId: currentUserId });
-    if (callSnapshot && (callSnapshot.state === 'ringing' || callSnapshot.state === 'ongoing')) {
-      void ensureCallMedia(callSnapshot.kind).catch(() => {
-        setCallError('Camera or microphone permission was denied.');
-      });
-    }
+    socketRef.current.emit('user:join', { userId: currentUserId });
 
     return () => {
       socketRef.current?.emit('call:leave', { callId, userId: currentUserId });
@@ -2903,47 +2987,97 @@ function AppContent() {
   }, [isRecording, recordingPaused, recordPulse]);
 
   useEffect(() => {
+    if (activeCall?.id) {
+      setCallPhase('calling');
+    }
+  }, [activeCall?.id]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ringing' || activeCall.initiatorId !== currentUserId) {
+      return;
+    }
+    if (usersById[activeCall.peerUserId]?.presence === 'online') {
+      setCallPhase('ringing');
+    }
+  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, activeCall?.peerUserId, usersById]);
+
+  useEffect(() => {
+    if (!incomingCall || incomingCall.state !== 'ringing') {
+      return;
+    }
+    socketRef.current?.emit('call:ringing', {
+      callId: incomingCall.id,
+      userId: currentUserId,
+      initiatorId: incomingCall.initiatorId,
+    });
+  }, [incomingCall?.id, incomingCall?.state, currentUserId]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ongoing') {
+      return undefined;
+    }
+    void ensureCallMedia(activeCall.kind).catch(() => {
+      setCallError('Camera or microphone permission was denied.');
+    });
+    CueSound?.setSpeaker?.(true);
+    return () => {
+      CueSound?.setSpeaker?.(false);
+    };
+  }, [activeCall?.id, activeCall?.state, activeCall?.kind]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ringing' || activeCall.initiatorId !== currentUserId) {
+      return undefined;
+    }
+    const callId = activeCall.id;
+    const timer = setTimeout(() => {
+      void updateCallState(callId, 'missed', 0);
+    }, 60000);
+    return () => clearTimeout(timer);
+  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId]);
+
+  useEffect(() => {
     const incomingRing = Boolean(incomingCall && incomingCall.state === 'ringing' && incomingCall.initiatorId !== currentUserId);
     const outgoingRing = Boolean(activeCall && activeCall.state === 'ringing' && activeCall.initiatorId === currentUserId);
     if (!incomingRing && !outgoingRing) {
-      ringSoundRef.current?.removePlaybackEndListener?.();
-      void ringSoundRef.current?.stopPlayer?.().catch(() => undefined);
+      CueSound?.stop?.();
       Vibration.cancel();
       return undefined;
     }
 
-    const file = incomingRing ? CUE_SOUNDS.ringtone : CUE_SOUNDS.ringback;
-    let stopped = false;
-    const startLoop = async () => {
-      if (stopped || Platform.OS !== 'android') {
-        return;
-      }
-      try {
-        if (!ringSoundRef.current) {
-          ringSoundRef.current = createSound();
-        }
-        ringSoundRef.current.removePlaybackEndListener?.();
-        ringSoundRef.current.addPlaybackEndListener(() => {
-          if (!stopped) {
-            void startLoop();
-          }
-        });
-        await ringSoundRef.current.startPlayer(file);
-      } catch {
-        // The call screen still works if the tone asset cannot play.
-      }
-    };
-    void startLoop();
+    const peerOnline = Boolean(activeCall && usersById[activeCall.peerUserId]?.presence === 'online');
+    const tone = incomingRing ? 'ringtone' : ((callPhase === 'ringing' || peerOnline) ? 'ringing' : 'calling');
+    CueSound?.start?.(tone, true);
     if (incomingRing) {
       Vibration.vibrate([0, 480, 220, 480], true);
     }
     return () => {
-      stopped = true;
-      ringSoundRef.current?.removePlaybackEndListener?.();
-      void ringSoundRef.current?.stopPlayer?.().catch(() => undefined);
+      CueSound?.stop?.();
       Vibration.cancel();
     };
-  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, incomingCall?.id, incomingCall?.state, currentUserId]);
+  }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, incomingCall?.id, incomingCall?.state, currentUserId, callPhase]);
+
+  useEffect(() => {
+    if (chatScreen !== 'detail') {
+      return undefined;
+    }
+    stickToLatestRef.current = true;
+    const timer = setTimeout(() => threadRef.current?.scrollToEnd({ animated: false }), 60);
+    return () => clearTimeout(timer);
+  }, [chatScreen, selectedChatId]);
+
+  useEffect(() => {
+    void AsyncStorage.getItem(OUTBOX_STORAGE_KEY).then((raw) => {
+      if (!raw) {
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) {
+        outboxRef.current = parsed;
+        flushOutboxRef.current();
+      }
+    }).catch(() => undefined);
+  }, []);
 
   const moveStatus = (direction) => {
     const currentGroupIndex = statusGroupIndexRef.current;
@@ -2996,8 +3130,69 @@ function AppContent() {
     closeStatusViewer();
   };
 
+  const rememberOutbox = async (items) => {
+    outboxRef.current = items;
+    await AsyncStorage.setItem(OUTBOX_STORAGE_KEY, JSON.stringify(items)).catch(() => undefined);
+  };
+
+  const flushOutbox = async () => {
+    if (outboxFlushRef.current) {
+      return;
+    }
+    outboxFlushRef.current = true;
+    try {
+      const queue = [...outboxRef.current];
+      for (const entry of queue) {
+        try {
+          let body = entry.body;
+          if (entry.localUri && !(body.mediaUrls ?? []).length) {
+            const uploaded = await uploadUris([entry.localUri], {
+              names: [entry.uploadName || `upload-${Date.now()}`],
+              fallbackType: entry.uploadType || 'application/octet-stream',
+            });
+            if (!uploaded.length) {
+              continue;
+            }
+            body = { ...body, mediaUrls: uploaded };
+          }
+          const response = await fetch(`${API_BASE_URL}/api/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) {
+            continue;
+          }
+          const payload = await response.json().catch(() => ({}));
+          if (payload.message) {
+            reconcileIncomingMessage(body.chatId, payload.message);
+          }
+          await rememberOutbox(outboxRef.current.filter((item) => item.clientRef !== entry.clientRef));
+        } catch {
+          // Leave the message pending until the network returns.
+        }
+      }
+    } finally {
+      outboxFlushRef.current = false;
+    }
+  };
+  flushOutboxRef.current = flushOutbox;
+
+  const queueOutgoing = (body, extras = {}) => {
+    const entry = {
+      clientRef: body.clientRef,
+      body,
+      localUri: extras.localUri,
+      uploadName: extras.uploadName,
+      uploadType: extras.uploadType,
+    };
+    const next = [...outboxRef.current.filter((item) => item.clientRef !== body.clientRef), entry];
+    void rememberOutbox(next);
+    void flushOutbox();
+  };
+
   const sendMessage = () => {
-    if (!messageDraft.trim()) {
+    if (!messageDraft.trim() || !selectedChatId) {
       return;
     }
 
@@ -3011,7 +3206,7 @@ function AppContent() {
       kind,
       text,
       time: 'Now',
-      receiptState: 'sent',
+      receiptState: 'pending',
       replyToMessageId: replyTarget?.id,
       replyPreview: replyTarget?.text?.slice(0, 140),
     };
@@ -3019,20 +3214,16 @@ function AppContent() {
     appendMessage(message);
     playCueRef.current('send');
     emitTyping(false);
-    fetch(`${API_BASE_URL}/api/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId: selectedChatId,
-        senderId: currentUserId,
-        clientRef,
-        kind,
-        text,
-        mediaUrls: [],
-        replyToMessageId: replyTarget?.id,
-        replyPreview: replyTarget?.text?.slice(0, 140),
-      }),
-    }).catch(() => undefined);
+    queueOutgoing({
+      chatId: selectedChatId,
+      senderId: currentUserId,
+      clientRef,
+      kind,
+      text,
+      mediaUrls: [],
+      replyToMessageId: replyTarget?.id,
+      replyPreview: replyTarget?.text?.slice(0, 140),
+    });
     setMessageDraft('');
     setReplyTarget(null);
     setEmojiTrayVisible(false);
@@ -3118,6 +3309,9 @@ function AppContent() {
                   ...entry,
                   title: item.title ?? entry.title,
                   price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
+                  priceAmount: item.price ?? entry.priceAmount,
+                  currency: item.currency ?? entry.currency,
+                  isPublic: item.isPublic == null ? entry.isPublic : Boolean(item.isPublic),
                   category: item.category ?? entry.category,
                   description: item.description ?? entry.description,
                   stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
@@ -3182,6 +3376,134 @@ function AppContent() {
       setPaySheet(paySheet === 'history' ? 'history' : '');
     } catch {
       showToast('Network error while starting payment.', 'error');
+    }
+  };
+
+  const setCatalogVisibility = async (item, isPublic) => {
+    const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(item.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isPublic }),
+    });
+    if (!response.ok) {
+      showToast('Could not update this product.', 'error');
+      return false;
+    }
+    setCatalogItems((current) => current.map((entry) => (entry.id === item.id ? { ...entry, isPublic } : entry)));
+    showToast(isPublic ? 'Catalog is now public.' : 'Catalog is private.', 'success');
+    return true;
+  };
+
+  const ensureDirectChatId = async (peerUserId) => {
+    const existing = chatItems.find((chat) => chat.peerUserId === peerUserId);
+    if (existing) {
+      return existing.id;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/chats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, peerUserId }),
+    });
+    if (!response.ok) {
+      return '';
+    }
+    const payload = await response.json();
+    const mappedChat = mapChatFromServer(payload.chat, currentUserId, usersById);
+    setChatItems((current) => (current.some((item) => item.id === mappedChat.id) ? current : [mappedChat, ...current]));
+    return mappedChat.id;
+  };
+
+  const sendCatalogCard = async (item, peerUserId) => {
+    if (!peerUserId || peerUserId === currentUserId) {
+      return;
+    }
+    const chatId = await ensureDirectChatId(peerUserId);
+    if (!chatId) {
+      showToast('Could not open the chat for this product.', 'error');
+      return;
+    }
+    const clientRef = `catalog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const text = `${item.title} · ${item.price}`;
+    setMessagesByChat((current) => ({
+      ...current,
+      [chatId]: [...(current[chatId] ?? []), {
+        id: `m${Date.now()}`,
+        clientRef,
+        mine: true,
+        kind: item.imageUri ? 'image' : 'text',
+        text,
+        time: 'Now',
+        receiptState: 'pending',
+        imageUri: item.imageUri,
+        catalogItemId: item.id,
+      }],
+    }));
+    queueOutgoing({
+      chatId,
+      senderId: currentUserId,
+      clientRef,
+      kind: item.imageUri ? 'image' : 'text',
+      text,
+      mediaUrls: item.imageUri ? [item.imageUri] : [],
+      catalogItemId: item.id,
+    });
+    setSelectedChatId(chatId);
+    setChatScreen('detail');
+    setActiveView('Chats');
+    setPeerProfileVisible(false);
+  };
+
+  const postCatalogToStatus = async (item) => {
+    if (!item.isPublic) {
+      const madePublic = await setCatalogVisibility(item, true);
+      if (!madePublic) {
+        return;
+      }
+    }
+    const response = await fetch(`${API_BASE_URL}/api/statuses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: currentUserId,
+        text: `${item.title} · ${item.price}`,
+        catalogItemId: item.id,
+        assets: item.imageUri ? [{ kind: 'image', url: item.imageUri, caption: item.title }] : [],
+        audience: 'contacts',
+      }),
+    });
+    if (!response.ok) {
+      showToast('Could not post this product to status.', 'error');
+      return;
+    }
+    showToast('Product posted to status with Add to cart.', 'success');
+  };
+
+  const payForCatalogItem = async (item, sellerId) => {
+    const amount = Number(item.priceAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast('This product has no price yet.', 'error');
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/payments/intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'send',
+        amount,
+        currency: item.currency || accountCurrency,
+        note: item.title,
+      }),
+    });
+    if (!response.ok) {
+      showToast('Payment could not be started.', 'error');
+      return;
+    }
+    if (item.stockQuantity > 0) {
+      void adjustCatalogStock(item.id, item.stockQuantity - 1);
+    }
+    showToast(`Payment started for ${item.title}.`, 'success');
+    if (sellerId && sellerId !== currentUserId) {
+      await sendCatalogCard({ ...item, title: `Paid · ${item.title}` }, sellerId);
     }
   };
 
@@ -3258,7 +3580,7 @@ function AppContent() {
       kind: normalizedKind,
       text: name,
       time: 'Now',
-      receiptState: 'sent',
+      receiptState: 'pending',
       attachment: { kind: normalizedKind, name, source },
       imageUri: normalizedKind === 'image' ? uri : undefined,
       videoUri: normalizedKind === 'video' ? uri : undefined,
@@ -3283,35 +3605,17 @@ function AppContent() {
           : normalizedKind === 'voice'
             ? 'audio/mpeg'
             : 'application/octet-stream';
-
-    let uploadedUrls = [];
-    try {
-      uploadedUrls = await uploadUris([uri], {
-        names: [name],
-        fallbackType: inferMimeType(uri, fallbackType),
-      });
-    } catch {
-      uploadedUrls = [];
-    }
-
-    if (!uploadedUrls.length) {
-      showToast('Upload failed. The file stayed on this phone only.', 'error', 3600);
-      return;
-    }
-
-    fetch(`${API_BASE_URL}/api/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId: selectedChatId,
-        senderId: currentUserId,
-        clientRef,
-        kind: normalizedKind,
-        text: name || (normalizedKind === 'voice' ? 'Audio' : 'File'),
-        mediaUrls: uploadedUrls,
-      }),
-    }).catch(() => {
-      showToast('Could not send that file.', 'error');
+    queueOutgoing({
+      chatId: selectedChatId,
+      senderId: currentUserId,
+      clientRef,
+      kind: normalizedKind,
+      text: name || (normalizedKind === 'voice' ? 'Audio' : 'File'),
+      mediaUrls: [],
+    }, {
+      localUri: uri,
+      uploadName: name || `file-${Date.now()}`,
+      uploadType: inferMimeType(uri, fallbackType),
     });
   };
 
@@ -3406,21 +3710,15 @@ function AppContent() {
           text: 'Shared location',
           location: coords,
           time: 'Now',
-          receiptState: 'sent',
+          receiptState: 'pending',
         });
-        fetch(`${API_BASE_URL}/api/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chatId: selectedChatId,
-            senderId: currentUserId,
-            clientRef,
-            kind: 'text',
-            text: `📍 ${coords}|Shared location`,
-            mediaUrls: [],
-          }),
-        }).catch(() => {
-          showToast('Location could not be sent.', 'error');
+        queueOutgoing({
+          chatId: selectedChatId,
+          senderId: currentUserId,
+          clientRef,
+          kind: 'text',
+          text: `📍 ${coords}|Shared location`,
+          mediaUrls: [],
         });
         showToast('Location sent', 'success', 1600);
       },
@@ -4205,6 +4503,10 @@ function AppContent() {
   };
 
   const playCue = async (name) => {
+    if (CueSound?.start) {
+      CueSound.start(name, false);
+      return;
+    }
     const source = CUE_SOUNDS[name];
     if (!source || Platform.OS !== 'android') {
       return;
@@ -4438,38 +4740,23 @@ function AppContent() {
       kind: 'voice',
       text: 'Voice note',
       time: 'Now',
-      receiptState: 'sent',
+      receiptState: 'pending',
       audioUri: uri,
       durationLabel,
     });
     playCueRef.current('send');
-    let uploadedUrls = [];
-    try {
-      uploadedUrls = await uploadUris([uri], {
-        names: [`voice-${Date.now()}.m4a`],
-        fallbackType: inferMimeType(uri, 'audio/mp4'),
-      });
-    } catch {
-      uploadedUrls = [];
-    }
-    if (!uploadedUrls.length) {
-      showToast('Voice note is on this phone, but the upload failed.', 'error', 3600);
-      return;
-    }
-    fetch(`${API_BASE_URL}/api/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId: selectedChatId,
-        senderId: currentUserId,
-        clientRef,
-        kind: 'voice',
-        text: 'Voice note',
-        mediaUrls: uploadedUrls,
-        durationSeconds: Math.max(1, Math.round(durationMs / 1000)),
-      }),
-    }).catch(() => {
-      showToast('Voice note could not be sent.', 'error');
+    queueOutgoing({
+      chatId: selectedChatId,
+      senderId: currentUserId,
+      clientRef,
+      kind: 'voice',
+      text: 'Voice note',
+      mediaUrls: [],
+      durationSeconds: Math.max(1, Math.round(durationMs / 1000)),
+    }, {
+      localUri: uri,
+      uploadName: `voice-${Date.now()}.m4a`,
+      uploadType: inferMimeType(uri, 'audio/mp4'),
     });
   };
 
@@ -4622,7 +4909,7 @@ function AppContent() {
     const emojis = extractEmojiTokens(message.text ?? '');
     const emojiOnly = isEmojiOnlyMessage(message.text ?? '');
 
-    const receiptGlyph = message.receiptState === 'sent' ? '✓' : '✓✓';
+    const receiptGlyph = message.receiptState === 'pending' ? '◌' : message.receiptState === 'sent' ? '✓' : '✓✓';
 
     return (
       <Pressable
@@ -4765,6 +5052,27 @@ function AppContent() {
         ) : null}
 
         {message.kind === 'text' ? <Text style={styles.messageText}>{message.text}</Text> : null}
+        {message.catalogItemId ? (
+          <View style={styles.catalogActionRow}>
+            <Pressable
+              style={styles.draftAction}
+              onPress={() => {
+                const product = catalogItems.find((item) => item.id === message.catalogItemId);
+                if (product) {
+                  void payForCatalogItem(product, product.sellerId);
+                }
+              }}
+            >
+              <Text style={styles.draftActionText}>Pay</Text>
+            </Pressable>
+            <Pressable
+              style={styles.draftAction}
+              onPress={() => void Share.share({ message: message.text || 'Product' })}
+            >
+              <Text style={styles.draftActionText}>Share</Text>
+            </Pressable>
+          </View>
+        ) : null}
 
         {message.attachment && message.kind !== 'image' ? (
           <View style={styles.attachmentCard}>
@@ -4934,7 +5242,27 @@ function AppContent() {
         </View>
       </View>
 
-      <ScrollView style={styles.thread} contentContainerStyle={styles.threadContent}>
+      <ScrollView
+        ref={threadRef}
+        style={styles.thread}
+        contentContainerStyle={styles.threadContent}
+        onContentSizeChange={() => {
+          if (stickToLatestRef.current) {
+            threadRef.current?.scrollToEnd({ animated: false });
+          }
+        }}
+        onScrollBeginDrag={() => {
+          stickToLatestRef.current = false;
+        }}
+        onScroll={(event) => {
+          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+          const distanceFromBottom = contentSize.height - layoutMeasurement.height - contentOffset.y;
+          if (distanceFromBottom < 120) {
+            stickToLatestRef.current = true;
+          }
+        }}
+        scrollEventThrottle={80}
+      >
         {messages.map(renderBubble)}
       </ScrollView>
 
@@ -6693,25 +7021,25 @@ function AppContent() {
                     text: 'Photo',
                     time: 'Now',
                     imageUri: mediaUrl,
-                    receiptState: 'sent',
+                    receiptState: 'pending',
                     replyToMessageId: replyTarget?.id,
                     replyPreview: replyTarget?.text?.slice(0, 140),
                   };
                   appendMessage(message);
-                  fetch(`${API_BASE_URL}/api/messages`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chatId: selectedChatId,
-                      senderId: currentUserId,
-                      clientRef,
-                      kind: 'image',
-                      text: 'Photo',
-                      mediaUrls: [mediaUrl],
-                      replyToMessageId: replyTarget?.id,
-                      replyPreview: replyTarget?.text?.slice(0, 140),
-                    }),
-                  }).catch(() => undefined);
+                  queueOutgoing({
+                    chatId: selectedChatId,
+                    senderId: currentUserId,
+                    clientRef,
+                    kind: 'image',
+                    text: 'Photo',
+                    mediaUrls: uploaded[0] ? [uploaded[0]] : [],
+                    replyToMessageId: replyTarget?.id,
+                    replyPreview: replyTarget?.text?.slice(0, 140),
+                  }, uploaded[0] ? {} : {
+                    localUri: uri,
+                    uploadName: `camera-${Date.now()}.jpg`,
+                    uploadType: 'image/jpeg',
+                  });
                   setReplyTarget(null);
                   showToast('Photo sent', 'success');
                 } catch {
@@ -6730,8 +7058,8 @@ function AppContent() {
         visible={statusComposerVisible}
         onRequestClose={() => setStatusComposerVisible(false)}
       >
-        <View style={styles.statusComposerOverlay}>
-          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+        <View style={[styles.statusComposerOverlay, statusComposerMode === 'text' ? styles.statusComposerOverlayFill : null]}>
+          <View style={[styles.statusComposerSheet, statusComposerMode === 'text' ? styles.statusComposerSheetFill : null, { paddingBottom: modalBottomInset }]}>
             <View style={styles.statusComposerHeader}>
               <Text style={styles.statusComposerTitle}>Create status</Text>
               <Pressable onPress={() => setStatusComposerVisible(false)}>
@@ -6761,19 +7089,27 @@ function AppContent() {
               ))}
             </View>
             {statusComposerMode === 'text' ? (
-              <View style={[styles.statusComposerPreview, { backgroundColor: statusBackgroundColor }]}>
-                <Text
+              <ScrollView
+                style={[styles.statusCanvasScroll, { backgroundColor: statusBackgroundColor }]}
+                contentContainerStyle={styles.statusCanvasContent}
+                keyboardShouldPersistTaps="handled"
+              >
+                <TextInput
+                  value={statusDraft}
+                  onChangeText={setStatusDraft}
+                  placeholder="Type a status"
+                  placeholderTextColor="rgba(255,255,255,0.72)"
+                  multiline
+                  textAlign="center"
                   style={[
-                    styles.statusComposerPreviewText,
+                    styles.statusCanvasInput,
                     {
                       fontSize: statusFontSize,
                       fontFamily: statusFontFamily === 'System' ? undefined : statusFontFamily,
                     },
                   ]}
-                >
-                  {statusDraft || 'Type your status'}
-                </Text>
-              </View>
+                />
+              </ScrollView>
             ) : (
               <Pressable
                 style={styles.statusMediaPicker}
@@ -6798,16 +7134,23 @@ function AppContent() {
                 ) : null}
               </Pressable>
             )}
-            <TextInput
-              value={statusDraft}
-              onChangeText={setStatusDraft}
-              placeholder={statusComposerMode === 'text' ? 'Share an update' : 'Add a caption (optional)'}
-              placeholderTextColor="#7d8b92"
-              multiline
-              style={styles.textArea}
-            />
+            {statusComposerMode === 'text' ? null : (
+              <TextInput
+                value={statusDraft}
+                onChangeText={setStatusDraft}
+                placeholder="Add a caption (optional)"
+                placeholderTextColor="#7d8b92"
+                multiline
+                style={styles.textArea}
+              />
+            )}
             {statusComposerMode === 'text' ? (
               <>
+                <Pressable style={styles.statusToolsToggle} onPress={() => setStatusToolsOpen((current) => !current)}>
+                  <Text style={styles.statusToolsToggleText}>{statusToolsOpen ? 'Hide style' : 'Style ▾'}</Text>
+                </Pressable>
+                {statusToolsOpen ? (
+                  <ScrollView style={styles.statusToolsPanel}>
                 <Text style={styles.statusOptionLabel}>Background</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.statusOptionRow}>
                   {statusBackgroundOptions.map((color) => (
@@ -6846,6 +7189,8 @@ function AppContent() {
                     </Pressable>
                   ))}
                 </View>
+                  </ScrollView>
+                ) : null}
               </>
             ) : null}
             <Pressable style={styles.sendButtonWide} onPress={() => void postStatus()}>
@@ -6936,6 +7281,21 @@ function AppContent() {
                   <Text style={styles.storyCaptionBody}>
                     {activeStatusItem?.text || activeStatusItem?.assets?.[0]?.caption || 'Status update'}
                   </Text>
+                  {activeStatusItem?.catalogItemId ? (
+                    <Pressable
+                      style={styles.sendButtonWide}
+                      onPress={() => {
+                        const product = catalogItems.find((item) => item.id === activeStatusItem.catalogItemId);
+                        if (!product) {
+                          showToast('That product is no longer available.', 'error');
+                          return;
+                        }
+                        void sendCatalogCard(product, activeStatusItem.userId);
+                      }}
+                    >
+                      <Text style={styles.sendButtonText}>Add to cart</Text>
+                    </Pressable>
+                  ) : null}
                   <View style={styles.storyStatsRow}>
                     <Pressable onPress={openViewerList}>
                       <Text style={styles.storyStatText}>Views {activeStatusItem?.views?.length ?? 0}</Text>
@@ -7240,6 +7600,14 @@ function AppContent() {
                           <Text style={styles.stockButtonText}>+</Text>
                         </Pressable>
                       </View>
+                      <View style={styles.catalogActionRow}>
+                        <Pressable style={styles.catalogChip} onPress={() => void setCatalogVisibility(item, !item.isPublic)}>
+                          <Text style={styles.catalogChipText}>{item.isPublic ? 'Public' : 'Make public'}</Text>
+                        </Pressable>
+                        <Pressable style={styles.catalogChip} onPress={() => void postCatalogToStatus(item)}>
+                          <Text style={styles.catalogChipText}>Post to status</Text>
+                        </Pressable>
+                      </View>
                     </View>
                   </View>
                 ))}
@@ -7476,15 +7844,24 @@ function AppContent() {
           const remoteUrl = remoteCallStream?.toURL?.() || '';
           const mainUrl = localVideoLarge ? (localUrl || remoteUrl) : (remoteUrl || localUrl);
           const pipUrl = remoteUrl && localUrl ? (localVideoLarge ? remoteUrl : localUrl) : '';
-          const waiting = call.state !== 'ongoing';
           const canAnswer = call.state === 'ringing' && call.initiatorId !== currentUserId;
+          const peerOnline = usersById[call.peerUserId]?.presence === 'online' || callPhase === 'ringing';
+          const callerPhase = call.initiatorId === currentUserId ? (peerOnline ? 'Ringing' : 'Calling...') : 'Incoming call';
+          const remoteLive = Boolean(remoteCallStream?.getTracks?.()?.some((track) => track.readyState === 'live' && track.enabled));
+          const photoUri = photoForUser(call.peerUserId);
           return (
             <View style={styles.callScreen}>
               {call.kind === 'Video' && mainUrl && RTCViewNative ? (
                 <RTCViewNative streamURL={mainUrl} style={styles.callStageMain} objectFit="cover" mirror={mainUrl === localUrl} />
               ) : (
                 <View style={styles.callStageMain}>
-                  {renderPersonAvatar({ userId: call.peerUserId, name: call.name, size: 120 })}
+                  {photoUri ? (
+                    <Image source={{ uri: photoUri }} style={styles.callFullPhoto} resizeMode="cover" />
+                  ) : (
+                    <View style={styles.callFullPhotoFallback}>
+                      <Text style={styles.callFullPhotoLetter}>{(call.name || '?').slice(0, 1).toUpperCase()}</Text>
+                    </View>
+                  )}
                 </View>
               )}
               {call.kind === 'Video' && pipUrl && RTCViewNative ? (
@@ -7496,13 +7873,8 @@ function AppContent() {
                 <Text style={styles.callScreenName}>{call.name}</Text>
                 <Text style={styles.callScreenStatus}>
                   {call.state === 'ongoing'
-                    ? getAudioDurationLabel(activeCallSeconds * 1000)
-                    : (canAnswer ? 'Incoming call' : 'Ringing')}
-                </Text>
-                <Text style={styles.callScreenStatus}>
-                  {waiting
-                    ? (canAnswer ? 'Ringing on their phone' : 'Calling…')
-                    : (remoteCallStream ? 'Connected' : 'Connecting media…')}
+                    ? `${getAudioDurationLabel(activeCallSeconds * 1000)} · ${remoteLive ? 'Connected' : 'Connecting'}`
+                    : callerPhase}
                 </Text>
                 {callError ? <Text style={styles.callScreenError}>{callError}</Text> : null}
               </View>
@@ -7572,6 +7944,30 @@ function AppContent() {
           <Text style={styles.peerProfileMeta}>{getPresenceLabel(activeChat)}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.about || 'No about yet'}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.phone || ''}</Text>
+          <ScrollView style={styles.peerCatalogList}>
+            <Text style={styles.peerProfileName}>Catalog</Text>
+            {catalogItems.filter((item) => item.sellerId === activeChat?.peerUserId && item.isPublic).length ? null : (
+              <Text style={styles.peerProfileMeta}>No public products yet.</Text>
+            )}
+            {catalogItems.filter((item) => item.sellerId === activeChat?.peerUserId && item.isPublic).map((item) => (
+              <View key={item.id} style={styles.peerCatalogCard}>
+                {item.imageUri ? <Image source={{ uri: item.imageUri }} style={styles.peerCatalogImage} /> : null}
+                <Text style={styles.sheetOptionTitle}>{item.title}</Text>
+                <Text style={styles.sheetOptionBody}>{item.price}</Text>
+                <View style={styles.catalogActionRow}>
+                  <Pressable style={styles.draftAction} onPress={() => void sendCatalogCard(item, activeChat?.peerUserId)}>
+                    <Text style={styles.draftActionText}>Add to cart</Text>
+                  </Pressable>
+                  <Pressable style={styles.draftAction} onPress={() => void payForCatalogItem(item, activeChat?.peerUserId)}>
+                    <Text style={styles.draftActionText}>Pay</Text>
+                  </Pressable>
+                  <Pressable style={styles.draftAction} onPress={() => void Share.share({ message: `${item.title} · ${item.price}` })}>
+                    <Text style={styles.draftActionText}>Share</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </ScrollView>
         </View>
       </Modal>
       <Modal transparent animationType="fade" visible={Boolean(avatarPrompt)} onRequestClose={() => setAvatarPrompt(null)}>
@@ -10252,6 +10648,42 @@ const styles = StyleSheet.create({
     padding: 20,
     gap: 14,
   },
+  statusComposerOverlayFill: {
+    justifyContent: 'flex-start',
+  },
+  statusComposerSheetFill: {
+    flex: 1,
+    borderRadius: 0,
+  },
+  statusCanvasScroll: {
+    flex: 1,
+    borderRadius: 18,
+  },
+  statusCanvasContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    padding: 24,
+  },
+  statusCanvasInput: {
+    color: '#ffffff',
+    fontWeight: '800',
+    textAlign: 'center',
+    minHeight: 180,
+  },
+  statusToolsToggle: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  statusToolsToggleText: {
+    color: '#f6f7f8',
+    fontWeight: '700',
+  },
+  statusToolsPanel: {
+    maxHeight: 180,
+  },
   statusComposerHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -10554,6 +10986,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  callFullPhoto: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  callFullPhotoFallback: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#163028',
+  },
+  callFullPhotoLetter: {
+    color: '#f7fbfc',
+    fontSize: 96,
+    fontWeight: '800',
+  },
   callStagePip: {
     position: 'absolute',
     top: 88,
@@ -10651,6 +11097,37 @@ const styles = StyleSheet.create({
     color: '#c5d5dc',
     fontSize: 15,
     textAlign: 'center',
+  },
+  peerCatalogList: {
+    alignSelf: 'stretch',
+    marginTop: 18,
+    maxHeight: 320,
+  },
+  peerCatalogCard: {
+    paddingVertical: 10,
+    gap: 6,
+  },
+  peerCatalogImage: {
+    width: '100%',
+    height: 140,
+    borderRadius: 12,
+  },
+  catalogActionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+  },
+  catalogChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: '#12324a',
+  },
+  catalogChipText: {
+    color: '#f4f8fb',
+    fontWeight: '700',
+    fontSize: 13,
   },
   callAudioPill: {
     minHeight: 64,
