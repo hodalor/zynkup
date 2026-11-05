@@ -49,6 +49,8 @@ type Message = {
   catalogItemId?: string;
   deletedForEveryone?: boolean;
   deletedFor?: string[];
+  anonymous?: boolean;
+  anonymousDay?: string;
 };
 
 type Chat = {
@@ -56,6 +58,7 @@ type Chat = {
   title: string;
   kind: 'direct' | 'group';
   participants: string[];
+  adminIds?: string[];
   unreadCount: number;
   unreadByUser?: Record<string, number>;
   lastMessagePreview: string;
@@ -355,6 +358,7 @@ const sendMessageSchema = z.object({
   replyToMessageId: z.string().min(1).optional(),
   replyPreview: z.string().max(280).optional(),
   catalogItemId: z.string().min(1).max(80).optional(),
+  anonymous: z.boolean().optional(),
 });
 
 const clearChatUnreadSchema = z.object({
@@ -846,6 +850,34 @@ const buildMessagesByChat = (messages: Message[]) =>
     accumulator[message.chatId] = [...current, message];
     return accumulator;
   }, {});
+
+const anonymousDayKey = () =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Lusaka' }).format(new Date());
+
+const presentMessage = (message: Message, viewerId: string): Message => {
+  if (!message.anonymous || message.senderId === viewerId) {
+    return message;
+  }
+  return { ...message, senderId: 'anonymous' };
+};
+
+const chatAdmins = (chat: Chat) => (chat.adminIds?.length ? chat.adminIds : chat.participants.slice(0, 1));
+
+const saveChatRecord = async (chat: Chat) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedChats.findIndex((item) => item.id === chat.id);
+    if (index >= 0) {
+      seedChats[index] = chat;
+    } else {
+      seedChats.unshift(chat);
+    }
+    return chat;
+  }
+  await seedDatabaseIfNeeded();
+  await collectionsFor(db).chats.updateOne({ id: chat.id }, { $set: chat }, { upsert: true });
+  return chat;
+};
 
 const buildUpdateFeed = (users: User[], statuses: StatusPost[]): UpdateFeedEntry[] =>
   users
@@ -1643,6 +1675,12 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
   const userById = new Map(rawUsers.map((user) => [user.id, user]));
   const sameCountry = (userId: string) => countryKeyFor(userById.get(userId), profileById.get(userId)) === myCountry && Boolean(myCountry);
   const visibleStatuses = statuses.filter((status) => {
+    const expiry = status.expiresAt
+      ? new Date(status.expiresAt).getTime()
+      : new Date(status.createdAt).getTime() + 24 * 60 * 60 * 1000;
+    if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+      return false;
+    }
     if (status.userId === currentUserId) {
       return true;
     }
@@ -1693,7 +1731,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     mutualUserIds,
     chatRequests: chatRequests.filter((request) => request.fromUserId === currentUserId || request.toUserId === currentUserId),
     chats: visibleChats,
-    messagesByChat: buildMessagesByChat(visibleMessages),
+    messagesByChat: buildMessagesByChat(visibleMessages.map((message) => presentMessage(message, currentUserId))),
     contacts: mergedContacts,
     calls: visibleCalls,
     statuses: visibleStatuses,
@@ -1925,6 +1963,7 @@ const createChatRoom = async (userId: string, title: string, memberIds: string[]
     title,
     kind: 'group',
     participants,
+    adminIds: [userId],
     unreadCount: 0,
     unreadByUser: {},
     lastMessagePreview: 'Chat room created',
@@ -3653,6 +3692,9 @@ app.delete('/api/chats/:chatId', async (req, res) => {
   if (chat.kind !== 'group') {
     return res.status(400).json({ error: 'Only a chat room can be deleted.' });
   }
+  if (!chatAdmins(chat).includes(userId)) {
+    return res.status(403).json({ error: 'Only a group admin can delete this room.' });
+  }
   const db = await getDb();
   if (!db) {
     const index = seedChats.findIndex((item) => item.id === chat.id);
@@ -3664,6 +3706,108 @@ app.delete('/api/chats/:chatId', async (req, res) => {
   }
   io.emit('chat:deleted', { chatId: chat.id });
   return res.json({ ok: true });
+});
+
+app.patch('/api/chats/:chatId', async (req, res) => {
+  const userId = String(req.body?.userId || '');
+  const title = String(req.body?.title || '').trim();
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || chat.kind !== 'group' || !chat.participants.includes(userId)) {
+    return res.status(404).json({ error: 'Chat room not found' });
+  }
+  if (!chatAdmins(chat).includes(userId)) {
+    return res.status(403).json({ error: 'Only a group admin can rename this room.' });
+  }
+  if (title.length < 2 || title.length > 80) {
+    return res.status(400).json({ error: 'Enter a room name between 2 and 80 characters.' });
+  }
+  const updated = { ...chat, title, adminIds: chatAdmins(chat), updatedAt: new Date().toISOString() };
+  await saveChatRecord(updated);
+  io.emit('chat:updated', updated);
+  return res.json({ chat: updated });
+});
+
+app.post('/api/chats/:chatId/members', async (req, res) => {
+  const userId = String(req.body?.userId || '');
+  const memberIds = Array.isArray(req.body?.memberIds) ? req.body.memberIds.map(String) : [];
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || chat.kind !== 'group' || !chat.participants.includes(userId)) {
+    return res.status(404).json({ error: 'Chat room not found' });
+  }
+  if (!chatAdmins(chat).includes(userId)) {
+    return res.status(403).json({ error: 'Only a group admin can add people.' });
+  }
+  const known = new Set((await readUsers()).map((user) => user.id));
+  const participants = [...new Set([...chat.participants, ...memberIds.filter((id: string) => known.has(id))])];
+  const updated = { ...chat, participants, adminIds: chatAdmins(chat), updatedAt: new Date().toISOString() };
+  await saveChatRecord(updated);
+  io.emit('chat:updated', updated);
+  return res.json({ chat: updated });
+});
+
+app.delete('/api/chats/:chatId/members/:memberId', async (req, res) => {
+  const userId = String(req.query.userId || '');
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || chat.kind !== 'group' || !chat.participants.includes(userId)) {
+    return res.status(404).json({ error: 'Chat room not found' });
+  }
+  const targetId = req.params.memberId;
+  const self = userId === targetId;
+  if (!self && !chatAdmins(chat).includes(userId)) {
+    return res.status(403).json({ error: 'Only a group admin can remove people.' });
+  }
+  if (!chat.participants.includes(targetId)) {
+    return res.status(404).json({ error: 'That person is not in this room.' });
+  }
+  const participants = chat.participants.filter((id) => id !== targetId);
+  if (!participants.length) {
+    const db = await getDb();
+    if (!db) {
+      const index = seedChats.findIndex((item) => item.id === chat.id);
+      if (index >= 0) seedChats.splice(index, 1);
+    } else {
+      await collectionsFor(db).chats.deleteOne({ id: chat.id });
+    }
+    io.emit('chat:deleted', { chatId: chat.id });
+    return res.json({ ok: true, deleted: true });
+  }
+  let adminIds = chatAdmins(chat).filter((id) => id !== targetId);
+  if (!adminIds.length) adminIds = [participants[0]];
+  const updated = { ...chat, participants, adminIds, updatedAt: new Date().toISOString() };
+  await saveChatRecord(updated);
+  io.emit('chat:updated', updated);
+  io.emit('chat:membership', { chatId: chat.id, userId: targetId, removed: true });
+  return res.json({ chat: updated });
+});
+
+app.post('/api/chats/:chatId/admins', async (req, res) => {
+  const userId = String(req.body?.userId || '');
+  const memberId = String(req.body?.memberId || '');
+  const grant = req.body?.admin !== false;
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || chat.kind !== 'group' || !chat.participants.includes(userId) || !chat.participants.includes(memberId)) {
+    return res.status(404).json({ error: 'Chat room not found' });
+  }
+  if (!chatAdmins(chat).includes(userId)) {
+    return res.status(403).json({ error: 'Only a group admin can change admins.' });
+  }
+  let adminIds = chatAdmins(chat);
+  if (grant) {
+    adminIds = [...new Set([...adminIds, memberId])];
+  } else {
+    adminIds = adminIds.filter((id) => id !== memberId);
+    if (!adminIds.length) {
+      return res.status(400).json({ error: 'A room needs at least one admin.' });
+    }
+  }
+  const updated = { ...chat, adminIds, updatedAt: new Date().toISOString() };
+  await saveChatRecord(updated);
+  io.emit('chat:updated', updated);
+  return res.json({ chat: updated });
 });
 
 app.post('/api/chat-requests', async (req, res) => {
@@ -3730,18 +3874,34 @@ app.post('/api/messages', async (req, res) => {
   }
 
   const payload = parseResult.data;
+  const chat = (await readChats()).find((item) => item.id === payload.chatId);
+
+  if (!chat || !chat.participants.includes(payload.senderId)) {
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+  if (payload.anonymous && chat.kind !== 'group') {
+    return res.status(400).json({ error: 'Anonymous messages are only for chat rooms.' });
+  }
+  const anonymousDay = payload.anonymous ? anonymousDayKey() : undefined;
+  let anonymousUsed = 0;
+  if (payload.anonymous) {
+    anonymousUsed = (await readMessages()).filter((item) =>
+      item.chatId === payload.chatId
+      && item.senderId === payload.senderId
+      && item.anonymous
+      && item.anonymousDay === anonymousDay,
+    ).length;
+    if (anonymousUsed >= 5) {
+      return res.status(429).json({ error: 'You can send 5 anonymous messages in this room each day.' });
+    }
+  }
   if (payload.clientRef) {
     const existing = (await readMessages()).find(
       (item) => item.chatId === payload.chatId && item.clientRef === payload.clientRef,
     );
     if (existing) {
-      return res.status(200).json({ message: existing });
+      return res.status(200).json({ message: presentMessage(existing, payload.senderId) });
     }
-  }
-  const chat = (await readChats()).find((item) => item.id === payload.chatId);
-
-  if (!chat) {
-    return res.status(404).json({ error: 'Chat not found' });
   }
 
   let replyPreview = payload.replyPreview?.trim() || undefined;
@@ -3766,17 +3926,21 @@ app.post('/api/messages', async (req, res) => {
     replyToMessageId: payload.replyToMessageId,
     replyPreview,
     catalogItemId: payload.catalogItemId,
+    anonymous: Boolean(payload.anonymous),
+    anonymousDay,
   };
 
   await persistMessage(message);
   const updatedChat = await updateChatAfterMessage(
     payload.chatId,
-    payload.text,
+    payload.anonymous ? 'Anonymous message' : payload.text,
     message.sentAt,
     payload.senderId,
   );
 
-  io.emit('message:new', message);
+  for (const participantId of chat.participants) {
+    io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+  }
   if (updatedChat) {
     for (const participantId of chat.participants) {
       io.emit('chat:updated', {
@@ -3787,7 +3951,10 @@ app.post('/api/messages', async (req, res) => {
     }
   }
 
-  return res.status(201).json({ message });
+  return res.status(201).json({
+    message: presentMessage(message, payload.senderId),
+    anonymousRemaining: payload.anonymous ? Math.max(0, 4 - anonymousUsed) : undefined,
+  });
 });
 
 app.post('/api/chats/:chatId/read', async (req, res) => {
