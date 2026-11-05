@@ -1469,8 +1469,14 @@ const saveChatRequest = async (request: ChatRequest) => {
   return request;
 };
 
-const countryKeyFor = (user?: User, profile?: Profile | null) =>
-  (profile?.countryCode || user?.phone || '').replace(/[^\d+]/g, '').slice(0, 4);
+const countryKeyFor = (user?: User, profile?: Profile | null) => {
+  const digits = String(profile?.countryCode || user?.phone || '').replace(/\D/g, '');
+  const match = CURRENCY_BY_CALLING_CODE
+    .slice()
+    .sort((left, right) => right[0].length - left[0].length)
+    .find(([code]) => digits.startsWith(code));
+  return match?.[0] || digits.slice(0, 3);
+};
 
 const readCalls = async () => {
   const db = await getDb();
