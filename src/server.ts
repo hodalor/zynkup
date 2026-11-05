@@ -396,7 +396,7 @@ const statusAssetSchema = z.object({
 
 const createStatusSchema = z.object({
   userId: z.string().min(1),
-  text: z.string().max(280).default(''),
+  text: z.string().max(700).default(''),
   assets: z.array(statusAssetSchema).max(10).default([]),
   backgroundColor: z.string().min(4).max(30).optional(),
   fontFamily: z.string().min(2).max(40).optional(),
