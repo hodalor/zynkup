@@ -1,0 +1,19 @@
+# Netlify site for the Zynkup web app. Connect the GitHub repo on the `web` branch.
+[build]
+  command = "npm run build"
+  publish = "build"
+
+[build.environment]
+  NODE_VERSION = "22"
+  REACT_APP_API_BASE_URL = "https://zynkup-api-597625475865.europe-west9.run.app"
+  REACT_APP_SOCKET_URL = "https://zynkup-api-597625475865.europe-west9.run.app"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/static/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

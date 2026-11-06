@@ -309,6 +309,7 @@ function App() {
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [users, setUsers] = useState<AppUser[]>([]);
   const [statusText, setStatusText] = useState('');
+  const [statusAudience, setStatusAudience] = useState<'contacts' | 'public' | 'marketplace'>('contacts');
   const [statusAssetFiles, setStatusAssetFiles] = useState<File[]>([]);
   const [statusComposerVisible, setStatusComposerVisible] = useState(false);
   const [statusBackgroundColor, setStatusBackgroundColor] = useState('#10233e');
@@ -340,6 +341,7 @@ function App() {
   const [desktopPin, setDesktopPin] = useState('');
   const [linkError, setLinkError] = useState('');
   const [linkedDevices, setLinkedDevices] = useState<LinkedDevice[]>([]);
+  const [linkedDeviceSlots, setLinkedDeviceSlots] = useState({ linkedCount: 0, limit: 4, remaining: 4 });
   const [profile, setProfile] = useState({
     name: 'Temwa Lesa',
     about: 'Seller, founder, and product operator.',
@@ -919,6 +921,11 @@ function App() {
 
     const payload = await response.json();
     setLinkedDevices(payload.devices ?? []);
+    setLinkedDeviceSlots({
+      linkedCount: payload.linkedCount ?? (payload.devices ?? []).length,
+      limit: payload.limit ?? 4,
+      remaining: payload.remaining ?? 4,
+    });
   }, []);
 
   const createDesktopLinkRequest = useCallback(async () => {
@@ -1970,7 +1977,7 @@ function App() {
         fontFamily: statusFontFamily === 'System' ? undefined : statusFontFamily,
         fontSize: statusFontSize,
         assets: assetUrls.map((url: string) => ({ kind: 'image', url })),
-        audience: 'contacts',
+        audience: statusAudience,
       }),
     }).catch(() => undefined);
     setStatusText('');
@@ -2601,6 +2608,7 @@ function App() {
 
         <div className="business-panel">
           <h3>Linked Devices</h3>
+          <p>{linkedDeviceSlots.linkedCount} of {linkedDeviceSlots.limit} web devices linked. {linkedDeviceSlots.remaining} left.</p>
           <button className="settings-auth-button" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">
             Refresh Linked Devices
           </button>
@@ -2752,7 +2760,7 @@ function App() {
             <li>Scan this QR code to sync chats, contacts, calls, status, and profile.</li>
           </ol>
           <p>Desktop mirrors your mobile in real time while both devices stay online.</p>
-          <small>You can link up to 5 devices. If you hit the limit, log out from one of your linked devices first.</small>
+          <small>Web linking is limited to 4 devices. The phone app itself is not one of those slots. Log out of a linked browser to free one.</small>
         </div>
         <div className="desktop-link-qr-panel">
           {linkQrDataUrl ? <img alt="Link Zynkup desktop" src={linkQrDataUrl} /> : <div className="desktop-link-qr-placeholder">Preparing QR...</div>}
@@ -3057,6 +3065,22 @@ function App() {
                   type="button"
                 >
                   {size}
+                </button>
+              ))}
+            </div>
+            <div className="status-composer-options">
+              {([
+                ['contacts', 'My contacts'],
+                ['public', 'Public'],
+                ['marketplace', 'Marketplace'],
+              ] as const).map(([id, label]) => (
+                <button
+                  key={id}
+                  className={statusAudience === id ? 'active' : ''}
+                  onClick={() => setStatusAudience(id)}
+                  type="button"
+                >
+                  {label}
                 </button>
               ))}
             </div>
