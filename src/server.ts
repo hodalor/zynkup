@@ -14,6 +14,7 @@ import morgan from 'morgan';
 import path from 'path';
 import { Server } from 'socket.io';
 import { z } from 'zod';
+import { findPhoneBlock, mountAdmin, readAppConfig } from './adminApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file';
@@ -148,6 +149,11 @@ type CatalogItem = {
   imageUrls: string[];
   stockQuantity: number;
   isPublic?: boolean;
+  location?: string;
+  condition?: 'New' | 'Used';
+  takenDown?: boolean;
+  boostedUntil?: string | null;
+  boostText?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -172,6 +178,8 @@ type Profile = {
   aboutPrivacy?: 'everyone' | 'contacts' | 'nobody';
   statusPrivacy?: 'contacts' | 'close-friends' | 'nobody';
   readReceiptsEnabled?: boolean;
+  blocked?: boolean;
+  blockedUntil?: string | null;
 };
 
 type UpdateFeedEntry = {
@@ -189,6 +197,7 @@ type DeviceSession = {
   userId: string;
   platform: string;
   label: string;
+  kind?: 'phone' | 'linked';
   createdAt: string;
   lastSeenAt: string;
 };
@@ -235,6 +244,8 @@ type BootstrapPayload = {
   statuses: StatusPost[];
   updatesFeed: UpdateFeedEntry[];
   catalogItems: CatalogItem[];
+  notice?: { text: string } | null;
+  anonymousDailyLimit?: number;
   settingsMenu: string[];
   architecture: {
     mode: string;
@@ -324,7 +335,7 @@ const FIREBASE_MESSAGING_SENDER_ID = process.env.FIREBASE_MESSAGING_SENDER_ID ??
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL ?? '';
 const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY ?? '').replace(/\\n/g, '\n');
 const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? '';
-const MAX_DEVICES_PER_USER = 5;
+const MAX_LINKED_DEVICES = 4;
 const LINK_REQUEST_TTL_MS = 1000 * 60 * 5;
 const GCS_BUCKET = process.env.GCS_BUCKET ?? process.env.GOOGLE_CLOUD_STORAGE_BUCKET ?? '';
 const MEDIA_STORAGE_MODE: MediaStorageMode =
@@ -432,10 +443,12 @@ const createCatalogItemSchema = z.object({
   price: z.number().positive(),
   currency: z.string().min(3).max(5).default('GHS'),
   category: z.string().min(2).max(40),
-  description: z.string().min(2).max(400),
-  imageUrls: z.array(z.string().url()).min(1).max(10),
+  description: z.string().min(2).max(2000),
+  imageUrls: z.array(z.string().url()).min(1).max(8),
   stockQuantity: z.number().int().nonnegative().default(0),
   isPublic: z.boolean().optional(),
+  location: z.string().max(80).optional(),
+  condition: z.enum(['New', 'Used']).optional(),
 });
 
 const updateCatalogItemSchema = z.object({
@@ -443,10 +456,13 @@ const updateCatalogItemSchema = z.object({
   price: z.number().positive().optional(),
   currency: z.string().min(3).max(5).optional(),
   category: z.string().min(2).max(40).optional(),
-  description: z.string().min(2).max(400).optional(),
-  imageUrls: z.array(z.string().url()).min(1).max(10).optional(),
+  description: z.string().min(2).max(2000).optional(),
+  imageUrls: z.array(z.string().url()).min(1).max(8).optional(),
   stockQuantity: z.number().int().nonnegative().optional(),
   isPublic: z.boolean().optional(),
+  location: z.string().max(80).optional(),
+  condition: z.enum(['New', 'Used']).optional(),
+  takenDown: z.boolean().optional(),
 });
 
 const paymentIntentSchema = z.object({
@@ -455,6 +471,7 @@ const paymentIntentSchema = z.object({
   currency: z.string().min(3).max(5).default('GHS'),
   phone: z.string().min(6).max(30).optional(),
   note: z.string().max(160).optional(),
+  userId: z.string().min(1).optional(),
   provider: z.enum(['mtn_momo', 'vodafone_cash', 'airteltigo']).default('mtn_momo'),
 });
 
@@ -507,6 +524,8 @@ const authLoginSchema = z.object({
   phone: z.string().min(7).max(30),
   phoneNumber: z.string().min(4).max(20).optional(),
   pin: pinCodeSchema,
+  challengeId: z.string().min(6).optional(),
+  idToken: z.string().min(32).optional(),
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
 });
@@ -514,6 +533,7 @@ const authLoginSchema = z.object({
 const phoneLookupSchema = z.object({
   countryCode: z.string().min(1).max(8),
   phoneNumber: z.string().min(4).max(20),
+  deviceId: z.string().min(8).optional(),
 });
 
 const resetPinSchema = z.object({
@@ -621,6 +641,7 @@ const ensureSessionSchema = z.object({
   preferredUserId: z.string().min(1).optional(),
   platform: z.string().min(2).max(40).default('unknown'),
   label: z.string().min(2).max(80).default('Primary device'),
+  kind: z.enum(['phone', 'linked']).optional(),
 });
 
 const app = express();
@@ -918,6 +939,24 @@ const normalizePhone = (countryCode: string, phoneNumber: string) => {
 };
 
 const sanitizePhone = (phoneNumber: string) => phoneNumber.replace(/[^\d+]/g, '');
+
+const rejectIfBlocked = async (
+  res: { status: (code: number) => { json: (body: unknown) => void } },
+  phone: string,
+) => {
+  const block = await findPhoneBlock(getDb, phone);
+  if (!block) return false;
+  const until = block.until ? String(block.until) : null;
+  res.status(403).json({
+    error: until
+      ? 'This number is paused. You can try again when the wait ends.'
+      : 'This number cannot register or sign in on ZynkUp.',
+    code: 'NUMBER_BLOCKED',
+    until,
+    remainingMs: until ? Math.max(0, new Date(until).getTime() - Date.now()) : null,
+  });
+  return true;
+};
 
 const CURRENCY_BY_CALLING_CODE: Array<[string, string]> = [
   ['233', 'GHS'],
@@ -1338,14 +1377,22 @@ const readSessionsByUserId = async (userId: string) => {
   return collectionsFor(db).sessions.find({ userId }, { projection: { _id: 0 } }).toArray();
 };
 
-const canOpenAnotherSession = async (userId: string, deviceId?: string | null) => {
-  if (!userId) {
-    return true;
-  }
+const isLinkedSession = (session: DeviceSession) => session.kind === 'linked' || session.platform === 'web';
 
-  const sessions = await readSessionsByUserId(userId);
-  const uniqueSessions = sessions.filter((session) => session.deviceId !== deviceId);
-  return uniqueSessions.length < MAX_DEVICES_PER_USER;
+const linkedDeviceSummary = async (userId: string, deviceId?: string | null) => {
+  const sessions = userId ? await readSessionsByUserId(userId) : [];
+  const linked = sessions.filter((session) => isLinkedSession(session) && session.deviceId !== deviceId);
+  return {
+    linkedCount: linked.length,
+    limit: MAX_LINKED_DEVICES,
+    remaining: Math.max(0, MAX_LINKED_DEVICES - linked.length),
+  };
+};
+
+const canOpenAnotherSession = async (userId: string, deviceId?: string | null) => {
+  if (!userId) return true;
+  const summary = await linkedDeviceSummary(userId, deviceId);
+  return summary.remaining > 0;
 };
 
 const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
@@ -1356,6 +1403,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
     ? users.find((user) => user.id === input.preferredUserId)?.id
     : undefined;
   const deviceId = input.deviceId ?? crypto.randomUUID();
+  const kind = input.kind ?? (input.platform === 'web' ? 'linked' : 'phone');
 
   const db = await getDb();
   if (!db) {
@@ -1364,6 +1412,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
       existing.userId = explicitUserId === undefined ? existing.userId : explicitUserId;
       existing.platform = input.platform;
       existing.label = input.label;
+      existing.kind = kind;
       existing.lastSeenAt = nowIso;
       return existing;
     }
@@ -1374,6 +1423,7 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
       userId: explicitUserId ?? '',
       platform: input.platform,
       label: input.label,
+      kind,
       createdAt: nowIso,
       lastSeenAt: nowIso,
     };
@@ -1393,15 +1443,25 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
           userId,
           platform: input.platform,
           label: input.label,
+          kind,
           lastSeenAt: nowIso,
         },
       },
     );
+    if (kind === 'phone' && userId) {
+      await collections.sessions.deleteMany({
+        userId,
+        deviceId: { $ne: deviceId },
+        platform: { $ne: 'web' },
+        kind: { $ne: 'linked' },
+      });
+    }
     return {
       ...existing,
       userId,
       platform: input.platform,
       label: input.label,
+      kind,
       lastSeenAt: nowIso,
     };
   }
@@ -1412,10 +1472,19 @@ const ensureSession = async (input: z.infer<typeof ensureSessionSchema>) => {
     userId: explicitUserId ?? '',
     platform: input.platform,
     label: input.label,
+    kind,
     createdAt: nowIso,
     lastSeenAt: nowIso,
   };
   await collections.sessions.insertOne(session);
+  if (kind === 'phone' && session.userId) {
+    await collections.sessions.deleteMany({
+      userId: session.userId,
+      deviceId: { $ne: deviceId },
+      platform: { $ne: 'web' },
+      kind: { $ne: 'linked' },
+    });
+  }
   return session;
 };
 
@@ -1681,7 +1750,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     const expiry = status.expiresAt
       ? new Date(status.expiresAt).getTime()
       : new Date(status.createdAt).getTime() + 24 * 60 * 60 * 1000;
-    if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+    if (status.audience !== 'marketplace' && (!Number.isFinite(expiry) || expiry <= Date.now())) {
       return false;
     }
     if (status.userId === currentUserId) {
@@ -1696,8 +1765,14 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     return mutualSet.has(status.userId);
   });
   const visibleCatalog = catalogItems.filter((item) => {
+    if (item.takenDown && item.sellerId !== currentUserId) {
+      return false;
+    }
     if (item.sellerId === currentUserId) {
       return true;
+    }
+    if (item.takenDown) {
+      return false;
     }
     if (mutualSet.has(item.sellerId)) {
       return true;
@@ -1725,6 +1800,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     };
   });
 
+  const appConfig = await readAppConfig(getDb);
   return {
     authRequired: false,
     currentUserId,
@@ -1740,6 +1816,8 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     statuses: visibleStatuses,
     updatesFeed: buildUpdateFeed(safeUsers, visibleStatuses),
     catalogItems: visibleCatalog,
+    notice: appConfig.bannerActive && appConfig.bannerText ? { text: appConfig.bannerText } : null,
+    anonymousDailyLimit: appConfig.anonymousDailyLimit,
     settingsMenu,
     architecture: {
       mode: 'whatsapp-inspired',
@@ -2559,9 +2637,10 @@ app.post('/api/link/confirm', async (req, res) => {
   const userProfile = await readProfile(parseResult.data.userId);
   if (!(await canOpenAnotherSession(parseResult.data.userId, linkRequest.deviceId))) {
     return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
+      error: '4 of 4 web devices are already linked. Log out of one on your phone to free a slot.',
       code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
+      limit: MAX_LINKED_DEVICES,
+      remaining: 0,
     });
   }
 
@@ -2637,9 +2716,10 @@ app.post('/api/link/verify-pin', async (req, res) => {
 
   if (!(await canOpenAnotherSession(linkRequest.userId, linkRequest.deviceId))) {
     return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
+      error: '4 of 4 web devices are already linked. Log out of one on your phone to free a slot.',
       code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
+      limit: MAX_LINKED_DEVICES,
+      remaining: 0,
     });
   }
 
@@ -2672,6 +2752,7 @@ app.post('/api/auth/phone/lookup', async (req, res) => {
   }
 
   const phone = normalizePhone(parseResult.data.countryCode, parseResult.data.phoneNumber);
+  if (await rejectIfBlocked(res, phone)) return;
   const user = await readUserByPhone(phone);
   if (!user) {
     return res.json({
@@ -2682,9 +2763,14 @@ app.post('/api/auth/phone/lookup', async (req, res) => {
   }
 
   const profile = await readProfile(user.id);
+  const knownDevice = Boolean(
+    parseResult.data.deviceId
+    && (await readSessionsByUserId(user.id)).some((session) => session.deviceId === parseResult.data.deviceId),
+  );
   return res.json({
     registered: true,
     hasPin: Boolean(profile?.pinHash),
+    otpRequired: Boolean(profile?.pinHash) && !knownDevice,
     phone: user.phone,
     name: user.name,
   });
@@ -2699,6 +2785,8 @@ app.post('/api/auth/phone/start', async (req, res) => {
     });
   }
 
+  const phone = normalizePhone(parseResult.data.countryCode, parseResult.data.phoneNumber);
+  if (await rejectIfBlocked(res, phone)) return;
   const challenge = await createOtpChallenge(parseResult.data.countryCode, parseResult.data.phoneNumber);
   return res.status(201).json({
     challengeId: challenge.id,
@@ -2758,6 +2846,7 @@ app.post('/api/auth/phone/verify', async (req, res) => {
         verified: true,
         registrationRequired: false,
         pinLoginRequired: true,
+        challengeId: verifiedChallenge.id,
         phone: verifiedChallenge.normalizedPhone,
         countryCode: verifiedChallenge.countryCode,
         name: existingUser.name,
@@ -2765,13 +2854,6 @@ app.post('/api/auth/phone/verify', async (req, res) => {
     }
 
     // Account exists but has no PIN yet — open session and let client set one.
-    if (!(await canOpenAnotherSession(existingUser.id, parseResult.data.deviceId))) {
-      return res.status(409).json({
-        error: 'Device limit reached. Log out from one of your linked devices and try again.',
-        code: 'DEVICE_LIMIT_REACHED',
-        limit: MAX_DEVICES_PER_USER,
-      });
-    }
     const session = await ensureSession({
       deviceId: parseResult.data.deviceId,
       preferredUserId: existingUser.id,
@@ -2836,14 +2918,6 @@ app.post('/api/auth/pin/reset', async (req, res) => {
     appLockEnabled: true,
   });
 
-  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
-  }
-
   const session = await ensureSession({
     deviceId: parseResult.data.deviceId,
     preferredUserId: user.id,
@@ -2901,14 +2975,6 @@ app.post('/api/auth/phone/session', async (req, res) => {
       pinLoginRequired: true,
       phone: verifiedIdentity.phoneNumber,
       name: existingUser.name,
-    });
-  }
-
-  if (!(await canOpenAnotherSession(existingUser.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
     });
   }
 
@@ -2970,13 +3036,6 @@ app.post('/api/auth/phone/complete', async (req, res) => {
     }
     throw error;
   }
-  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
-  }
   const session = await ensureSession({
     deviceId: parseResult.data.deviceId,
     preferredUserId: user.id,
@@ -3008,6 +3067,7 @@ app.post('/api/auth/phone/register', async (req, res) => {
     });
   }
 
+  if (await rejectIfBlocked(res, verifiedIdentity.phoneNumber)) return;
   const existing = await readUserByPhone(verifiedIdentity.phoneNumber);
   if (existing) {
     return res.status(409).json({ error: 'A user with that phone already exists' });
@@ -3031,14 +3091,6 @@ app.post('/api/auth/phone/register', async (req, res) => {
     }
     throw error;
   }
-  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
-  }
-
   const session = await ensureSession({
     deviceId: parseResult.data.deviceId,
     preferredUserId: user.id,
@@ -3064,6 +3116,7 @@ app.post('/api/auth/login', async (req, res) => {
   const phone = parseResult.data.countryCode && parseResult.data.phoneNumber
     ? normalizePhone(parseResult.data.countryCode, parseResult.data.phoneNumber)
     : sanitizePhone(parseResult.data.phone);
+  if (await rejectIfBlocked(res, phone)) return;
   const user = await readUserByPhone(phone);
   if (!user) {
     return res.status(404).json({ error: 'No account found for that phone number' });
@@ -3076,16 +3129,36 @@ app.post('/api/auth/login', async (req, res) => {
       code: 'PIN_REQUIRED',
     });
   }
+  const knownDevice = Boolean(
+    parseResult.data.deviceId
+    && (await readSessionsByUserId(user.id)).some((session) => session.deviceId === parseResult.data.deviceId),
+  );
+  if (!knownDevice) {
+    let proved = false;
+    if (parseResult.data.challengeId) {
+      const challenge = await readOtpChallenge(parseResult.data.challengeId);
+      proved = Boolean(
+        challenge?.verifiedAt
+        && challenge.normalizedPhone.replace(/\D/g, '') === phone.replace(/\D/g, ''),
+      );
+    }
+    if (!proved && parseResult.data.idToken) {
+      try {
+        const identity = await verifyFirebasePhoneIdentity(parseResult.data.idToken, phone);
+        proved = identity.phoneNumber.replace(/\D/g, '') === phone.replace(/\D/g, '');
+      } catch {
+        proved = false;
+      }
+    }
+    if (!proved) {
+      return res.status(403).json({
+        error: 'This install is new. Confirm the SMS code for this number, then enter your PIN.',
+        code: 'OTP_REQUIRED',
+      });
+    }
+  }
   if (profile.pinHash !== hashPin(parseResult.data.pin)) {
     return res.status(401).json({ error: 'Incorrect PIN' });
-  }
-
-  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
   }
 
   const session = await ensureSession({
@@ -3127,13 +3200,6 @@ app.post('/api/auth/register', async (req, res) => {
     }
     throw error;
   }
-  if (!(await canOpenAnotherSession(user.id, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
-  }
   const session = await ensureSession({
     deviceId: parseResult.data.deviceId,
     preferredUserId: user.id,
@@ -3159,14 +3225,6 @@ app.post('/api/auth/switch', async (req, res) => {
   const users = await readUsers();
   if (!users.some((user) => user.id === parseResult.data.userId)) {
     return res.status(404).json({ error: 'User not found' });
-  }
-
-  if (!(await canOpenAnotherSession(parseResult.data.userId, parseResult.data.deviceId))) {
-    return res.status(409).json({
-      error: 'Device limit reached. Log out from one of your linked devices and try again.',
-      code: 'DEVICE_LIMIT_REACHED',
-      limit: MAX_DEVICES_PER_USER,
-    });
   }
 
   const session = await ensureSession({
@@ -3212,17 +3270,76 @@ app.post('/api/contacts/sync', async (req, res) => {
   });
 });
 
+app.post('/api/directory/lookup', async (req, res) => {
+  const phone = sanitizePhone(String(req.body?.phone || ''));
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 8) {
+    return res.status(400).json({ error: 'Enter a full phone number.' });
+  }
+  const users = await readUsers();
+  const profiles = await readProfiles();
+  const user = users.find((item) => {
+    const tail = item.phone.replace(/\D/g, '').slice(-9);
+    return tail.length >= 8 && (digits.endsWith(tail) || tail.endsWith(digits.slice(-9)));
+  });
+  if (!user) {
+    return res.json({ registered: false, phone });
+  }
+  const profile = profiles.find((item) => item.id === user.id);
+  return res.json({
+    registered: true,
+    user: {
+      id: user.id,
+      name: user.name,
+      phone: user.phone,
+      username: profile?.username || '',
+      avatar: user.avatar,
+      photoUri: profile?.photoUri || '',
+    },
+  });
+});
+
+app.post('/api/contacts/save', async (req, res) => {
+  const ownerUserId = String(req.body?.ownerUserId || '');
+  const linkedUserId = String(req.body?.linkedUserId || '');
+  const name = String(req.body?.name || '').trim();
+  const phone = String(req.body?.phone || '').trim();
+  if (!ownerUserId || !linkedUserId || !name) {
+    return res.status(400).json({ error: 'Missing contact details.' });
+  }
+  const contact: Contact = {
+    id: `contact-${ownerUserId}-${linkedUserId}`,
+    ownerUserId,
+    name,
+    phone,
+    normalizedPhone: sanitizePhone(phone),
+    linkedUserId,
+    registered: true,
+    presence: 'offline',
+  };
+  const db = await getDb();
+  if (!db) {
+    const index = seedContacts.findIndex((item) => item.id === contact.id);
+    if (index >= 0) seedContacts[index] = contact;
+    else seedContacts.unshift(contact);
+  } else {
+    await collectionsFor(db).contacts.updateOne({ id: contact.id }, { $set: contact }, { upsert: true });
+  }
+  return res.status(201).json({ contact });
+});
+
 app.get('/api/devices', async (req, res) => {
   const userId = typeof req.query.userId === 'string' ? req.query.userId.trim() : '';
   if (!userId) {
     return res.status(400).json({ error: 'Missing userId' });
   }
 
-  const devices = await readSessionsByUserId(userId);
+  const devices = (await readSessionsByUserId(userId)).filter(isLinkedSession);
   return res.json({
-    devices: devices
-      .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt))
-      .slice(0, MAX_DEVICES_PER_USER),
+    devices: devices.sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt)),
+    linkedCount: devices.length,
+    limit: MAX_LINKED_DEVICES,
+    remaining: Math.max(0, MAX_LINKED_DEVICES - devices.length),
   });
 });
 
@@ -3294,6 +3411,17 @@ app.post('/api/statuses', async (req, res) => {
   }
 
   const createdAt = new Date().toISOString();
+  if (parseResult.data.audience === 'marketplace' && parseResult.data.catalogItemId) {
+    const existingStatuses = await readStatuses();
+    const alreadyPosted = existingStatuses.find((status) =>
+      status.userId === parseResult.data.userId
+      && status.catalogItemId === parseResult.data.catalogItemId
+      && status.audience === 'marketplace',
+    );
+    if (alreadyPosted) {
+      return res.status(200).json({ status: alreadyPosted, duplicate: true });
+    }
+  }
   const status: StatusPost = {
     id: `s${Date.now()}`,
     userId: parseResult.data.userId,
@@ -3312,7 +3440,9 @@ app.post('/api/statuses', async (req, res) => {
     comments: [],
     views: [],
     createdAt,
-    expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString(),
+    expiresAt: parseResult.data.audience === 'marketplace'
+      ? new Date('2099-01-01T00:00:00.000Z').toISOString()
+      : new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString(),
     audience: parseResult.data.audience,
   };
 
@@ -3465,6 +3595,16 @@ app.post('/api/catalog', async (req, res) => {
 
   const timestamp = new Date().toISOString();
   const sellerId = parseResult.data.sellerId ?? await resolveRequestUserId(req);
+  const titleKey = parseResult.data.title.trim().toLowerCase();
+  const existingItems = await readCatalogItems();
+  const duplicate = existingItems.find((item) =>
+    item.sellerId === sellerId
+    && !item.takenDown
+    && item.title.trim().toLowerCase() === titleKey,
+  );
+  if (duplicate) {
+    return res.status(409).json({ error: 'This product is already in your catalog. Edit it instead of posting it again.' });
+  }
   const sellerProfile = sellerId ? await readProfile(sellerId) : null;
   const sellerCurrency = sellerProfile?.currency
     || (sellerProfile?.phone || sellerProfile?.countryCode
@@ -3481,6 +3621,11 @@ app.post('/api/catalog', async (req, res) => {
     imageUrls: parseResult.data.imageUrls,
     stockQuantity: parseResult.data.stockQuantity ?? 0,
     isPublic: Boolean(parseResult.data.isPublic),
+    location: parseResult.data.location?.trim() || '',
+    condition: parseResult.data.condition || 'New',
+    takenDown: false,
+    boostedUntil: null,
+    boostText: '',
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -3526,6 +3671,42 @@ app.patch('/api/catalog/:itemId', async (req, res) => {
   return res.json({ item: updated });
 });
 
+app.post('/api/catalog/:itemId/feature', async (req, res) => {
+  const items = await readCatalogItems();
+  const existing = items.find((item) => item.id === req.params.itemId);
+  if (!existing) return res.status(404).json({ error: 'Product not found' });
+  const days = Math.min(90, Math.max(1, Number(req.body?.days) || 7));
+  const note = String(req.body?.note || '').trim().slice(0, 180);
+  const userId = String(req.body?.userId || existing.sellerId);
+  if (userId !== existing.sellerId) return res.status(403).json({ error: 'Only the seller can feature this product.' });
+  const db = await getDb();
+  if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+  const request = {
+    id: `boost-${Date.now()}`,
+    itemId: existing.id,
+    userId,
+    title: existing.title,
+    days,
+    note,
+    amount: days * 20,
+    currency: existing.currency,
+    state: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  await db.collection('boostRequests').insertOne({ ...request });
+  await db.collection('payments').insertOne({
+    id: `pay-boost-${request.id}`,
+    action: 'feature',
+    amount: request.amount,
+    currency: request.currency,
+    userId,
+    note: `Feature ${existing.title} for ${days} days`,
+    status: 'pending',
+    createdAt: request.createdAt,
+  });
+  return res.status(201).json({ request });
+});
+
 app.post('/api/payments/intent', async (req, res) => {
   const parseResult = paymentIntentSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -3546,6 +3727,10 @@ app.post('/api/payments/intent', async (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
+  const db = await getDb();
+  if (db) {
+    await db.collection('payments').insertOne({ ...intent });
+  }
   return res.status(201).json({
     intent,
     message:
@@ -3606,8 +3791,23 @@ app.post('/api/calls', async (req, res) => {
   };
 
   await persistCall(call);
-  io.emit('call:created', call);
-  io.emit('call:incoming', call);
+  const caller = (await readUsers()).find((user) => user.id === call.initiatorId);
+  const callerProfile = caller ? await readProfile(caller.id) : null;
+  const deliveredCall = {
+    ...call,
+    caller: caller
+      ? {
+          id: caller.id,
+          name: caller.name,
+          phone: caller.phone,
+          username: callerProfile?.username || '',
+          avatar: caller.avatar,
+          photoUri: callerProfile?.photoUri || '',
+        }
+      : null,
+  };
+  io.emit('call:created', deliveredCall);
+  io.emit('call:incoming', deliveredCall);
 
   return res.status(201).json({ call });
 });
@@ -3894,8 +4094,9 @@ app.post('/api/messages', async (req, res) => {
       && item.anonymous
       && item.anonymousDay === anonymousDay,
     ).length;
-    if (anonymousUsed >= 5) {
-      return res.status(429).json({ error: 'You can send 5 anonymous messages in this room each day.' });
+    const anonymousLimit = (await readAppConfig(getDb)).anonymousDailyLimit;
+    if (anonymousUsed >= anonymousLimit) {
+      return res.status(429).json({ error: `You can send ${anonymousLimit} anonymous messages in this room each day.` });
     }
   }
   if (payload.clientRef) {
@@ -3941,8 +4142,23 @@ app.post('/api/messages', async (req, res) => {
     payload.senderId,
   );
 
+  const senderUser = (await readUsers()).find((user) => user.id === message.senderId);
+  const senderProfile = senderUser ? await readProfile(senderUser.id) : null;
   for (const participantId of chat.participants) {
-    io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+    const delivered = presentMessage(message, participantId);
+    io.to(`user:${participantId}`).emit('message:new', {
+      ...delivered,
+      sender: delivered.senderId === 'anonymous' || !senderUser
+        ? undefined
+        : {
+            id: senderUser.id,
+            name: senderUser.name,
+            phone: senderUser.phone,
+            username: senderProfile?.username || '',
+            avatar: senderUser.avatar,
+            photoUri: senderProfile?.photoUri || '',
+          },
+    });
   }
   if (updatedChat) {
     for (const participantId of chat.participants) {
@@ -3956,7 +4172,9 @@ app.post('/api/messages', async (req, res) => {
 
   return res.status(201).json({
     message: presentMessage(message, payload.senderId),
-    anonymousRemaining: payload.anonymous ? Math.max(0, 4 - anonymousUsed) : undefined,
+    anonymousRemaining: payload.anonymous
+      ? Math.max(0, (await readAppConfig(getDb)).anonymousDailyLimit - 1 - anonymousUsed)
+      : undefined,
   });
 });
 
@@ -4184,6 +4402,19 @@ const connectMongoInBackground = async () => {
     console.error('MongoDB connected, but startup cleanup failed:', error);
   }
 };
+
+mountAdmin(app, {
+  getDb,
+  readUsers,
+  readProfiles,
+  readMessages,
+  readCalls,
+  readStatuses,
+  readCatalogItems,
+  updateProfile: (userId, changes) => updateProfile(userId, changes as Partial<Profile>),
+  countryKeyFor: (user, profile) => countryKeyFor(user as User | undefined, profile as Profile | null | undefined),
+  hashPin,
+});
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
