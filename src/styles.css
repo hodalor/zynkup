@@ -1,0 +1,114 @@
+:root {
+  color: #e7f3ee;
+  background: #0c1412;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+.app-shell {
+  height: 100vh;
+  display: grid;
+  grid-template-columns: 248px 1fr;
+  grid-template-rows: 68px 1fr 42px;
+}
+.brand, .topbar, .footer {
+  background: #101a17;
+  border-bottom: 1px solid #24332d;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px;
+  border-right: 1px solid #24332d;
+}
+.logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: #1f8f72;
+  color: white;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+}
+.brand strong { display: block; font-size: 16px; }
+.brand span { color: #8eaaa0; font-size: 12px; }
+.topbar, .footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 22px;
+}
+.topbar h1 { margin: 0; font-size: 18px; }
+.footer { border-top: 1px solid #24332d; border-bottom: 0; color: #8eaaa0; font-size: 12px; }
+.sidebar {
+  grid-row: 2 / 4;
+  background: #101a17;
+  border-right: 1px solid #24332d;
+  overflow: auto;
+  padding: 12px;
+}
+.sidebar button {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: #d5e8e1;
+  border: 0;
+  border-radius: 10px;
+  padding: 11px 12px;
+  margin-bottom: 4px;
+}
+.sidebar button.active, .sidebar button:hover { background: #1a2b26; }
+.content { overflow: auto; padding: 22px; background: #0c1412; }
+.cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card, .panel, .modal, .login-card {
+  background: #16211e;
+  border: 1px solid #294038;
+  border-radius: 16px;
+}
+.card { padding: 14px 16px; }
+.card b { display: block; font-size: 26px; margin-top: 6px; }
+.card span, .muted { color: #8eaaa0; }
+.toolbar { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; }
+input, select, textarea {
+  background: #0f1916;
+  color: #e7f3ee;
+  border: 1px solid #345248;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+textarea { min-height: 90px; width: 100%; }
+.primary, .ghost, .danger {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+.primary { background: #1f8f72; color: white; }
+.ghost { background: #24382f; color: #e7f3ee; }
+.danger { background: #8d3a3a; color: white; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #24332d; font-size: 14px; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover { background: #1a2b26; }
+.charts { display: grid; grid-template-columns: 1.2fr 1fr; gap: 12px; }
+.panel { padding: 16px; }
+.bar-row { display: grid; grid-template-columns: 120px 1fr 36px; gap: 8px; align-items: center; margin: 8px 0; }
+.bar { height: 8px; background: #24382f; border-radius: 99px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: #1f8f72; }
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; padding: 20px; }
+.modal { width: min(560px, 100%); padding: 18px; }
+.modal h2 { margin: 0 0 12px; }
+.stack { display: grid; gap: 10px; }
+.login-wrap { min-height: 100vh; display: grid; place-items: center; }
+.login-card { width: min(420px, calc(100% - 32px)); padding: 24px; }
+.error { color: #ffb4b4; }
+.detail-grid { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; }
+@media (max-width: 720px) {
+  .app-shell { grid-template-columns: 1fr; grid-template-rows: 68px auto 1fr 42px; }
+  .sidebar { grid-row: auto; max-height: 180px; }
+  .cards, .charts { grid-template-columns: 1fr 1fr; }
+}
