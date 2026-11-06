@@ -29,6 +29,7 @@ type User = {
   isBusiness: boolean;
   lastSeenAt?: string;
   photoUri?: string;
+  username?: string;
 };
 
 type Message = {
@@ -225,6 +226,8 @@ type BootstrapPayload = {
   currentDeviceId: string | null;
   profile: Profile;
   users: User[];
+  mutualUserIds?: string[];
+  chatRequests?: ChatRequest[];
   chats: Chat[];
   messagesByChat: Record<string, Message[]>;
   contacts: Contact[];
