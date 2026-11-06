@@ -21,7 +21,7 @@ type Message = {
   id: string;
   clientRef?: string;
   sender: 'me' | 'other';
-  kind: 'text' | 'image' | 'voice' | 'file' | 'video';
+  kind: 'text' | 'image' | 'voice' | 'file' | 'video' | 'call';
   text: string;
   time: string;
   imageUrl?: string;
@@ -31,6 +31,7 @@ type Message = {
   receiptState?: ReceiptState;
   replyToMessageId?: string;
   replyPreview?: string;
+  callKind?: 'audio' | 'video';
   deletedForEveryone?: boolean;
 };
 
@@ -108,6 +109,7 @@ type AppUser = {
   phone: string;
   presence?: string;
   lastSeenAt?: string;
+  photoUri?: string;
 };
 
 type LinkedDevice = {
@@ -265,6 +267,7 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   receiptState: message.state,
   replyToMessageId: message.replyToMessageId,
   replyPreview: message.replyPreview,
+  callKind: message.callKind,
   deletedForEveryone: Boolean(message.deletedForEveryone),
 });
 
@@ -302,6 +305,9 @@ function App() {
   const [localCallStream, setLocalCallStream] = useState<MediaStream | null>(null);
   const [remoteCallStream, setRemoteCallStream] = useState<MediaStream | null>(null);
   const [callError, setCallError] = useState<string | null>(null);
+  const [callMuted, setCallMuted] = useState(false);
+  const [callCameraOff, setCallCameraOff] = useState(false);
+  const [remoteCameraOff, setRemoteCameraOff] = useState(false);
   const [mediaViewer, setMediaViewer] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -453,20 +459,33 @@ function App() {
   };
 
   const ensureCallMedia = async (kind: 'audio' | 'video') => {
-    if (callMediaStreamRef.current) {
-      return callMediaStreamRef.current;
+    const existing = callMediaStreamRef.current;
+    const liveVideo = existing?.getVideoTracks().some((track) => track.readyState === 'live');
+    if (existing && (kind === 'audio' || liveVideo)) {
+      return existing;
+    }
+    if (existing && kind === 'video') {
+      const videoOnly = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: 'user' } });
+      const videoTrack = videoOnly.getVideoTracks()[0];
+      if (!videoTrack) {
+        throw new Error('camera');
+      }
+      existing.addTrack(videoTrack);
+      callMediaStreamRef.current = existing;
+      setLocalCallStream(new MediaStream(existing.getTracks()));
+      return existing;
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: true,
-      video: kind === 'video',
+      video: kind === 'video' ? { facingMode: 'user' } : false,
     });
     callMediaStreamRef.current = stream;
     setLocalCallStream(stream);
     return stream;
   };
 
-  const emitCallSignal = (callId: string, signalType: 'offer' | 'answer' | 'ice-candidate', payload: unknown, toUserId?: string) => {
+  const emitCallSignal = (callId: string, signalType: string, payload: unknown, toUserId?: string) => {
     socketRef.current?.emit('call:signal', {
       callId,
       fromUserId: currentUserId,
@@ -1188,7 +1207,8 @@ function App() {
       reconcileIncomingMessage(message.chatId, message);
 
       if (message.senderId !== currentUserId) {
-        const viewingChat = activeView === 'chats' && message.chatId === selectedChatId;
+        const pageVisible = typeof document === 'undefined' || document.visibilityState === 'visible';
+        const viewingChat = pageVisible && activeView === 'chats' && message.chatId === selectedChatId;
         const settings = appSettingsRef.current;
         void syncReceiptState(
           message.id,
@@ -1337,6 +1357,22 @@ function App() {
         return;
       }
 
+      if (signalType === 'camera') {
+        setRemoteCameraOff(payload?.enabled === false);
+        return;
+      }
+      if (signalType === 'video-upgrade') {
+        const accept = window.confirm('Switch this call to video?');
+        if (!accept) return;
+        emitCallSignal(callId, 'video-upgrade-accept', { accepted: true }, fromUserId);
+        void enableVideoOnCall().catch(() => setCallError('The camera did not start.'));
+        return;
+      }
+      if (signalType === 'video-upgrade-accept') {
+        void enableVideoOnCall().catch(() => setCallError('The camera did not start.'));
+        return;
+      }
+
       void (async () => {
         try {
           const connection = await ensurePeerConnection(currentCall);
@@ -1463,7 +1499,7 @@ function App() {
   }, [activeView, selectedChatId]);
 
   useEffect(() => {
-    if (activeView !== 'chats' || !appSettings.readReceiptsEnabled) {
+    if (document.visibilityState !== 'visible' || activeView !== 'chats' || !appSettings.readReceiptsEnabled) {
       return;
     }
 
@@ -1548,11 +1584,11 @@ function App() {
 
   useEffect(() => {
     attachStreamToVideo(localVideoRef.current, localCallStream);
-  }, [localCallStream]);
+  }, [localCallStream, callCameraOff, activeCall?.kind]);
 
   useEffect(() => {
     attachStreamToVideo(remoteVideoRef.current, remoteCallStream);
-  }, [remoteCallStream]);
+  }, [remoteCallStream, remoteCameraOff, activeCall?.kind]);
 
   useEffect(() => {
     if (!activeCall || !socketRef.current) {
@@ -1613,24 +1649,67 @@ function App() {
     }
   };
 
-  const startCall = async (kind: 'audio' | 'video') => {
-    if (!activeChat?.peerUserId) {
+  const setCallAudioMuted = (muted: boolean) => {
+    setCallMuted(muted);
+    callMediaStreamRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
+  };
+
+  const setCallVideoEnabled = (enabled: boolean) => {
+    setCallCameraOff(!enabled);
+    callMediaStreamRef.current?.getVideoTracks().forEach((track) => {
+      track.enabled = enabled;
+    });
+    const call = activeCallRef.current;
+    if (call) emitCallSignal(call.id, 'camera', { enabled }, call.peerUserId);
+  };
+
+  const enableVideoOnCall = async () => {
+    const connection = peerConnectionRef.current;
+    const call = activeCallRef.current;
+    if (!connection || !call) return;
+    const stream = await ensureCallMedia('video');
+    const videoTrack = stream.getVideoTracks().find((track) => track.readyState === 'live');
+    if (!videoTrack) throw new Error('camera');
+    videoTrack.enabled = true;
+    const sender = connection.getSenders().find((item) => item.track?.kind === 'video');
+    if (sender) {
+      await sender.replaceTrack(videoTrack);
+    } else {
+      connection.addTrack(videoTrack, stream);
+    }
+    setCallCameraOff(false);
+    setActiveCall((current) => (current ? { ...current, kind: 'video' } : current));
+    emitCallSignal(call.id, 'camera', { enabled: true }, call.peerUserId);
+    if (connection.signalingState === 'stable') {
+      const offer = await connection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await connection.setLocalDescription(offer);
+      emitCallSignal(call.id, 'offer', offer, call.peerUserId);
+    }
+  };
+
+  const startCall = async (kind: 'audio' | 'video', peerUserId = activeChat?.peerUserId) => {
+    if (!peerUserId || peerUserId === currentUserId) {
       return;
     }
 
     setCallSheetVisible(false);
+    setCallMuted(false);
+    setCallCameraOff(false);
+    setRemoteCameraOff(false);
     try {
       await ensureCallMedia(kind);
       setCallError(null);
     } catch {
-      setCallError('Camera or microphone permission was denied.');
+      setCallError(kind === 'video' ? 'Camera or microphone permission was denied.' : 'Microphone permission was denied.');
       return;
     }
     const response = await fetch(`${API_BASE_URL}/api/calls`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        participantIds: [currentUserId, activeChat.peerUserId],
+        participantIds: [currentUserId, peerUserId],
         initiatorId: currentUserId,
         kind,
         direction: 'outgoing',
@@ -1667,8 +1746,9 @@ function App() {
       return;
     }
 
-    const finalState: CallState =
-      activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? 'declined' : 'completed';
+    const finalState: CallState = activeCall.state === 'ringing'
+      ? (activeCall.initiatorId === currentUserId ? 'missed' : 'declined')
+      : 'completed';
     await updateCallState(activeCall.id, finalState, activeCallSeconds);
     closePeerConnection();
   };
@@ -2187,6 +2267,17 @@ function App() {
 
         <section className="desktop-canvas">
           {messages.map((message) => (
+            message.kind === 'call' ? (
+              <button
+                className="call-thread"
+                key={message.id}
+                onClick={() => void startCall(message.callKind === 'video' ? 'video' : 'audio', activeChat.peerUserId)}
+                type="button"
+              >
+                <strong>{message.text || 'Call'}</strong>
+                <small>{message.time} · Call again</small>
+              </button>
+            ) : (
             <article
               className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''}`}
               key={message.id}
@@ -2216,6 +2307,7 @@ function App() {
                 {appSettings.readReceiptsEnabled ? renderReceipt(message) : null}
               </div>
             </article>
+            )
           ))}
         </section>
 
@@ -2291,27 +2383,29 @@ function App() {
         </div>
       </header>
       <section className="calls-list">
-        {calls.length ? calls.map((call) => (
-          <article className="call-history-row" key={call.id}>
+        {calls.length ? calls.map((call) => {
+          const missed = call.direction === 'incoming' && (call.state === 'missed' || call.state === 'declined');
+          return (
+          <article className={`call-history-row ${missed ? 'missed' : ''}`} key={call.id}>
             <div>
               <strong>{call.peerName}</strong>
-              <small>{call.kind} · {call.state} · {formatClock(call.startedAt)}</small>
+              <small>
+                {call.direction === 'outgoing' ? 'Outgoing' : missed ? 'Missed' : 'Incoming'}
+                {' · '}
+                {call.kind === 'video' ? 'Video' : 'Voice'}
+                {' · '}
+                {formatClock(call.startedAt)}
+              </small>
             </div>
             <button
-              onClick={() => {
-                const chat = chatItems.find((item) => item.peerUserId === call.peerUserId);
-                if (chat) {
-                  setSelectedChatId(chat.id);
-                  setActiveView('chats');
-                  setCallSheetVisible(true);
-                }
-              }}
+              onClick={() => void startCall(call.kind, call.peerUserId)}
               type="button"
             >
-              Call again
+              {call.kind === 'video' ? 'Video call' : 'Voice call'}
             </button>
           </article>
-        )) : <p>No calls yet. Start one from a chat header.</p>}
+          );
+        }) : <p>No calls yet. Start one from a chat header.</p>}
       </section>
     </main>
   );
@@ -2860,49 +2954,62 @@ function App() {
         <div className="call-type-backdrop" onClick={() => setCallSheetVisible(false)} />
       ) : null}
 
-      {incomingCall ? (
-        <div className="modal-overlay">
-          <div className="dialog-card call-card">
-            <h3>Incoming {incomingCall.kind} call</h3>
-            <p>{incomingCall.peerName} is calling you now.</p>
-            <div className="call-card-actions">
-              <button className="status-viewer-action reply" onClick={() => void acceptIncomingCall()} type="button">Answer</button>
-              <button className="status-viewer-action" onClick={() => void updateCallState(incomingCall.id, 'declined', 0)} type="button">Decline</button>
+      {activeCall ? (() => {
+        const peer = users.find((user) => user.id === activeCall.peerUserId);
+        const peerPhoto = peer?.photoUri || '';
+        const localVideoLive = Boolean(localCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live')) && !callCameraOff;
+        const remoteVideoLive = Boolean(remoteCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live' && !track.muted)) && !remoteCameraOff;
+        const showRemoteVideo = activeCall.kind === 'video' && remoteVideoLive;
+        const showLocalVideo = activeCall.kind === 'video' && localVideoLive;
+        const canAnswer = activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId;
+        const answered = activeCall.state === 'ongoing';
+        return (
+          <div className="call-stage">
+            {showRemoteVideo ? (
+              <video autoPlay className="call-stage-main" playsInline ref={remoteVideoRef} />
+            ) : (
+              <div className="call-stage-fallback">
+                {peerPhoto ? <img alt="" src={peerPhoto} /> : <span>{(activeCall.peerName || '?').slice(0, 1).toUpperCase()}</span>}
+              </div>
+            )}
+            {activeCall.kind === 'video' && (showLocalVideo || profile.photoUrl) ? (
+              <div className="call-stage-pip">
+                {showLocalVideo ? (
+                  <video autoPlay muted playsInline ref={localVideoRef} />
+                ) : (
+                  profile.photoUrl ? <img alt="" src={profile.photoUrl} /> : <span>You</span>
+                )}
+              </div>
+            ) : null}
+            <div className="call-stage-top">
+              <strong>{activeCall.peerName}</strong>
+              <span>
+                {answered
+                  ? formatDurationLabel(activeCallSeconds)
+                  : canAnswer
+                    ? `Incoming ${activeCall.kind === 'video' ? 'video' : 'voice'} call`
+                    : 'Ringing...'}
+              </span>
+              {callError ? <em>{callError}</em> : null}
             </div>
-          </div>
-        </div>
-      ) : null}
-
-      {activeCall ? (
-        <div className="modal-overlay">
-          <div className="dialog-card call-card active">
-            <h3>{activeCall.kind === 'video' ? 'Video Call' : 'Audio Call'}</h3>
-            <p>{activeCall.peerName}</p>
-            <strong>{activeCall.state === 'ongoing' ? formatDurationLabel(activeCallSeconds) : 'Ringing...'}</strong>
-            {callError ? <p>{callError}</p> : null}
-            <div className={`call-media-grid ${activeCall.kind === 'video' ? 'video' : 'audio'}`}>
+            <div className="call-stage-actions">
+              <button disabled={!answered} onClick={() => setCallAudioMuted(!callMuted)} type="button">{callMuted ? 'Unmute' : 'Mute'}</button>
               {activeCall.kind === 'video' ? (
-                <video autoPlay muted playsInline ref={localVideoRef} />
+                <button disabled={!answered} onClick={() => setCallVideoEnabled(callCameraOff)} type="button">{callCameraOff ? 'Camera' : 'Cam off'}</button>
               ) : (
-                <div className="call-audio-pill">Your mic is live</div>
+                <button disabled={!answered} onClick={() => {
+                  emitCallSignal(activeCall.id, 'video-upgrade', { from: currentUserId }, activeCall.peerUserId);
+                  showToast('Asked them to switch to video.');
+                }} type="button">Video</button>
               )}
-              {activeCall.kind === 'video' ? (
-                <video autoPlay playsInline ref={remoteVideoRef} />
-              ) : (
-                <div className="call-audio-pill">{remoteCallStream ? `${activeCall.peerName} connected` : 'Waiting for peer'}</div>
-              )}
-            </div>
-            <div className="call-card-actions">
-              {activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId ? (
-                <button className="status-viewer-action reply" onClick={() => void acceptIncomingCall()} type="button">Answer</button>
+              {canAnswer ? (
+                <button className="answer" onClick={() => void acceptIncomingCall()} type="button">Answer</button>
               ) : null}
-              <button className="status-viewer-action done" onClick={() => void endActiveCall()} type="button">
-                {activeCall.state === 'ongoing' ? 'End Call' : 'Cancel'}
-              </button>
+              <button className="end" onClick={() => void endActiveCall()} type="button">{answered ? 'End' : canAnswer ? 'Decline' : 'Cancel'}</button>
             </div>
           </div>
-        </div>
-      ) : null}
+        );
+      })() : null}
 
       {mediaViewer ? (
         <div className="modal-overlay" onClick={() => setMediaViewer(null)}>
