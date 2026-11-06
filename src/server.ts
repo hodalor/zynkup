@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { App, cert, getApp, getApps, initializeApp, type ServiceAccount } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getMessaging } from 'firebase-admin/messaging';
 import { v2 as cloudinary } from 'cloudinary';
 import cors from 'cors';
 import crypto from 'crypto';
@@ -17,7 +18,7 @@ import { z } from 'zod';
 import { findPhoneBlock, mountAdmin, readAppConfig } from './adminApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
-type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file';
+type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
 type MediaKind = 'image' | 'video' | 'document';
 
 type User = {
@@ -53,6 +54,7 @@ type Message = {
   deletedFor?: string[];
   anonymous?: boolean;
   anonymousDay?: string;
+  callKind?: 'audio' | 'video';
 };
 
 type Chat = {
@@ -89,6 +91,7 @@ type Call = {
   durationSeconds: number;
   answeredAt?: string;
   endedAt?: string;
+  logged?: boolean;
 };
 
 type StatusAsset = {
@@ -198,6 +201,7 @@ type DeviceSession = {
   platform: string;
   label: string;
   kind?: 'phone' | 'linked';
+  pushToken?: string;
   createdAt: string;
   lastSeenAt: string;
 };
@@ -365,7 +369,7 @@ const sendMessageSchema = z.object({
   chatId: z.string().min(1),
   senderId: z.string().min(1),
   clientRef: z.string().min(6).max(120).optional(),
-  kind: z.enum(['text', 'emoji', 'image', 'video', 'voice', 'file']).default('text'),
+  kind: z.enum(['text', 'emoji', 'image', 'video', 'voice', 'file', 'call']).default('text'),
   text: z.string().min(1).max(4000),
   mediaUrls: z.array(z.string().url()).default([]),
   durationSeconds: z.number().int().nonnegative().optional(),
@@ -991,6 +995,51 @@ const currencyForCallingCode = (value: string) => {
 
 const phoneTail = (value: string) => String(value || '').replace(/\D/g, '').replace(/^0+/, '').slice(-9);
 
+const callingCodesLongestFirst = () =>
+  CURRENCY_BY_CALLING_CODE
+    .map(([code]) => code)
+    .sort((left, right) => right.length - left.length);
+
+const phoneIdentity = (value: string, countryCode?: string) => {
+  let digits = String(value || '').replace(/\D/g, '');
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  const stripTrunk = (national: string) => national.replace(/^0+/, '');
+  const hinted = String(countryCode || '').replace(/\D/g, '');
+  const finish = (code: string, nationalDigits: string) => {
+    let national = stripTrunk(nationalDigits);
+    if (code && national.startsWith(code)) {
+      const nested = stripTrunk(national.slice(code.length));
+      if (nested.length >= 7) national = nested;
+    }
+    return { cc: code, national, key: `${code}${national}` };
+  };
+  if (hinted) {
+    if (digits.startsWith(hinted)) digits = digits.slice(hinted.length);
+    return finish(hinted, digits);
+  }
+  for (const code of callingCodesLongestFirst()) {
+    if (digits.startsWith(code) && digits.length - code.length >= 7 && digits.length - code.length <= 12) {
+      return finish(code, digits.slice(code.length));
+    }
+  }
+  const national = stripTrunk(digits);
+  return { cc: '', national, key: national };
+};
+
+const phonesMatch = (left: string, right: string, leftCountry?: string, rightCountry?: string) => {
+  const a = phoneIdentity(left, leftCountry);
+  const b = phoneIdentity(right, rightCountry);
+  if (a.national.length < 8 || b.national.length < 8) return false;
+  if (a.cc && b.cc && a.cc !== b.cc) return false;
+  return a.national === b.national || a.key === b.key;
+};
+
+const canonicalPhone = (value: string, countryCode?: string) => {
+  const identity = phoneIdentity(value, countryCode);
+  if (identity.national.length < 8) return sanitizePhone(value);
+  return identity.cc ? `+${identity.cc}${identity.national}` : `+${identity.national}`;
+};
+
 const hashPin = (pin: string) =>
   crypto.createHash('sha256').update(`zynkup:${pin}`).digest('hex');
 
@@ -1068,7 +1117,7 @@ const verifyFirebaseIdTokenWithPublicKeys = async (idToken: string, expectedPhon
   if (!verifiedPhone) {
     throw new Error('Firebase token does not include a verified phone number.');
   }
-  if (expectedPhone && sanitizePhone(verifiedPhone) !== sanitizePhone(expectedPhone)) {
+  if (expectedPhone && !phonesMatch(verifiedPhone, expectedPhone)) {
     throw new Error('Firebase token phone number does not match the submitted number.');
   }
 
@@ -1109,7 +1158,7 @@ const verifyFirebasePhoneWithRestApi = async (idToken: string, expectedPhone?: s
     throw new Error('Firebase token does not include a verified phone number.');
   }
 
-  if (expectedPhone && sanitizePhone(verifiedPhone) !== sanitizePhone(expectedPhone)) {
+  if (expectedPhone && !phonesMatch(verifiedPhone, expectedPhone)) {
     throw new Error('Firebase token phone number does not match the submitted number.');
   }
 
@@ -1173,7 +1222,7 @@ const verifyFirebasePhoneIdentity = async (idToken: string, expectedPhone?: stri
         throw new Error('Firebase token does not include a verified phone number.');
       }
 
-      if (expectedPhone && sanitizePhone(verifiedPhone) !== sanitizePhone(expectedPhone)) {
+      if (expectedPhone && !phonesMatch(verifiedPhone, expectedPhone)) {
         throw new Error('Firebase token phone number does not match the submitted number.');
       }
 
@@ -1261,10 +1310,15 @@ const readProfiles = async () => {
   return withProjection(collectionsFor(db).profiles).toArray();
 };
 
-const readUserByPhone = async (phone: string) => {
-  const normalizedPhone = phone.replace(/[^\d+]/g, '');
+const readUserByPhone = async (phone: string, countryCode?: string) => {
   const users = await readUsers();
-  return users.find((user) => user.phone.replace(/[^\d+]/g, '') === normalizedPhone) ?? null;
+  const profiles = await readProfiles();
+  const matches = users.filter((user) => {
+    const profile = profiles.find((item) => item.id === user.id);
+    return phonesMatch(user.phone, phone, profile?.countryCode, countryCode);
+  });
+  matches.sort((left, right) => left.id.localeCompare(right.id));
+  return matches[0] ?? null;
 };
 
 const readOtpChallenge = async (challengeId: string) => {
@@ -1612,7 +1666,179 @@ const readCatalogItems = async () => {
   return collectionsFor(db).catalogItems.find({}, { projection: { _id: 0 }, sort: { updatedAt: -1 } }).toArray();
 };
 
+const replaceUserId = (ids: string[], from: string, to: string) =>
+  [...new Set(ids.map((id) => (id === from ? to : id)))];
+
+const mergePhoneDuplicates = async (keeperId: string) => {
+  const users = await readUsers();
+  const profiles = await readProfiles();
+  const keeper = users.find((user) => user.id === keeperId);
+  if (!keeper?.phone) return;
+  const keeperProfile = profiles.find((profile) => profile.id === keeperId) ?? null;
+  const duplicates = users.filter((user) =>
+    user.id !== keeperId
+    && Boolean(user.phone)
+    && phonesMatch(
+      user.phone,
+      keeper.phone,
+      profiles.find((profile) => profile.id === user.id)?.countryCode,
+      keeperProfile?.countryCode,
+    ),
+  );
+  if (!duplicates.length) return;
+  const db = await getDb();
+  if (!db) return;
+  const collections = collectionsFor(db);
+  for (const duplicate of duplicates) {
+    const from = duplicate.id;
+    const chats = await collections.chats.find({ participants: from }, { projection: { _id: 0 } }).toArray();
+    for (const chat of chats) {
+      const participants = replaceUserId(chat.participants, from, keeperId);
+      const adminIds = replaceUserId(chat.adminIds ?? [], from, keeperId);
+      const unreadByUser = { ...(chat.unreadByUser ?? {}) };
+      if (unreadByUser[from] != null) {
+        unreadByUser[keeperId] = (unreadByUser[keeperId] ?? 0) + unreadByUser[from];
+        delete unreadByUser[from];
+      }
+      await collections.chats.updateOne({ id: chat.id }, { $set: { participants, adminIds, unreadByUser } });
+    }
+    await collections.messages.updateMany({ senderId: from }, { $set: { senderId: keeperId } });
+    const calls = await collections.calls.find({ participantIds: from }, { projection: { _id: 0 } }).toArray();
+    for (const call of calls) {
+      await collections.calls.updateOne({ id: call.id }, {
+        $set: {
+          participantIds: replaceUserId(call.participantIds, from, keeperId),
+          initiatorId: call.initiatorId === from ? keeperId : call.initiatorId,
+        },
+      });
+    }
+    await collections.contacts.updateMany({ ownerUserId: from }, { $set: { ownerUserId: keeperId } });
+    await collections.contacts.updateMany({ linkedUserId: from }, { $set: { linkedUserId: keeperId } });
+    await collections.statuses.updateMany({ userId: from }, { $set: { userId: keeperId } });
+    await collections.catalogItems.updateMany({ sellerId: from }, { $set: { sellerId: keeperId } });
+    await collections.sessions.updateMany({ userId: from }, { $set: { userId: keeperId } });
+    await collections.chatRequests.updateMany({ fromUserId: from }, { $set: { fromUserId: keeperId } });
+    await collections.chatRequests.updateMany({ toUserId: from }, { $set: { toUserId: keeperId } });
+    await collections.users.deleteOne({ id: from });
+    await collections.profiles.deleteOne({ id: from });
+  }
+
+  const directChats = await collections.chats.find({ kind: 'direct', participants: keeperId }, { projection: { _id: 0 } }).toArray();
+  const grouped = new Map<string, Chat[]>();
+  for (const chat of directChats) {
+    const key = [...chat.participants].sort().join(':');
+    grouped.set(key, [...(grouped.get(key) ?? []), chat]);
+  }
+  for (const list of grouped.values()) {
+    if (list.length < 2) continue;
+    const [keep, ...extras] = [...list].sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+    for (const extra of extras) {
+      await collections.messages.updateMany({ chatId: extra.id }, { $set: { chatId: keep.id } });
+      await collections.chats.deleteOne({ id: extra.id });
+    }
+  }
+};
+
+const notifyOfflineUser = async (
+  userId: string,
+  title: string,
+  body: string,
+  data: Record<string, string>,
+  channel: 'messages' | 'calls',
+) => {
+  if (!userId) return;
+  try {
+    const awake = await io.in(`user:${userId}`).fetchSockets();
+    if (awake.length) return;
+    const adminApp = getFirebaseAdminApp();
+    if (!adminApp) return;
+    const tokens = [...new Set(
+      (await readSessionsByUserId(userId))
+        .map((session) => session.pushToken)
+        .filter((token): token is string => Boolean(token)),
+    )];
+    if (!tokens.length) return;
+    await getMessaging(adminApp).sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      data,
+      android: {
+        priority: 'high',
+        ttl: channel === 'calls' ? 45_000 : 86_400_000,
+        notification: {
+          channelId: channel === 'calls' ? 'zynkup-calls-v3' : 'zynkup-messages-v3',
+          sound: channel === 'calls' ? 'zynkup_call' : 'zynkup_message',
+          priority: 'max',
+          tag: data.chatId || data.callId || userId,
+        },
+      },
+    });
+  } catch (error) {
+    console.warn('Push notification skipped:', error);
+  }
+};
+
+const recordCallMessage = async (call: Call) => {
+  if (!['missed', 'declined', 'completed'].includes(call.state)) return;
+  const participants = [...new Set(call.participantIds)].filter(Boolean);
+  if (participants.length !== 2) return;
+  const marker = `call-${call.id}`;
+  const already = (await readMessages()).find((message) => message.clientRef === marker);
+  if (already) return;
+  const chat = await createOrFindDirectChat(participants[0], participants[1]);
+  if (!chat) return;
+  const video = call.kind === 'video';
+  const noun = video ? 'video call' : 'voice call';
+  const text = call.state === 'missed'
+    ? `Missed ${noun}`
+    : call.state === 'declined'
+      ? `Declined ${noun}`
+      : `${video ? 'Video' : 'Voice'} call${call.durationSeconds > 0 ? ` · ${call.durationSeconds}s` : ''}`;
+  const message: Message = {
+    id: `m${Date.now()}-${call.id}`,
+    chatId: chat.id,
+    senderId: call.initiatorId,
+    clientRef: marker,
+    kind: 'call',
+    text,
+    mediaUrls: [],
+    sentAt: call.endedAt || new Date().toISOString(),
+    state: 'sent',
+    durationSeconds: call.durationSeconds,
+    callKind: call.kind,
+  };
+  await persistMessage(message);
+  const updatedChat = await updateChatAfterMessage(chat.id, text, message.sentAt, call.initiatorId);
+  for (const participantId of chat.participants) {
+    io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+  }
+  if (updatedChat) {
+    io.emit('chat:updated', updatedChat);
+  }
+  await updateCall(call.id, (current) => ({ ...current, logged: true }));
+};
+
+const expireStaleCalls = async () => {
+  const cutoff = Date.now() - 70_000;
+  const ringing = (await readCalls()).filter((call) => call.state === 'ringing' && new Date(call.startedAt).getTime() < cutoff);
+  for (const call of ringing) {
+    const missed = await updateCall(call.id, (current) => (
+      current.state === 'ringing'
+        ? { ...current, state: 'missed', endedAt: new Date().toISOString() }
+        : current
+    ));
+    if (missed?.state === 'missed') {
+      await recordCallMessage(missed);
+      io.emit('call:updated', missed);
+    }
+  }
+};
+
 const buildBootstrapPayload = async (session: DeviceSession | null = null): Promise<BootstrapPayload> => {
+  if (session?.userId) {
+    await mergePhoneDuplicates(session.userId);
+  }
+  await expireStaleCalls();
   const currentUserId = session?.userId ?? '';
   if (!currentUserId) {
     return {
@@ -1844,9 +2070,22 @@ const createAuthIdentity = async (
   pin?: string,
 ) => {
   const normalizedName = name.trim();
-  const normalizedPhone = phoneNumber.trim().startsWith('+')
-    ? phoneNumber.trim().replace(/\s+/g, '')
-    : normalizePhone(countryCode, phoneNumber);
+  const normalizedPhone = canonicalPhone(phoneNumber, countryCode);
+  const existingUser = await readUserByPhone(normalizedPhone, countryCode);
+  if (existingUser) {
+    const existingProfile = await readProfile(existingUser.id);
+    if (pin) {
+      await updateProfile(existingUser.id, {
+        pinHash: hashPin(pin),
+        phone: canonicalPhone(existingUser.phone, existingProfile?.countryCode || countryCode),
+        phoneVerifiedAt: new Date().toISOString(),
+      });
+    }
+    return {
+      user: { ...existingUser, phone: canonicalPhone(existingUser.phone, existingProfile?.countryCode || countryCode) },
+      profile: existingProfile ?? { ...emptyProfile, id: existingUser.id, phone: normalizedPhone },
+    };
+  }
   const nextId = `u${Date.now()}`;
   const avatar = normalizedName
     .split(/\s+/)
@@ -1923,11 +2162,7 @@ const syncDeviceContacts = async (
   const users = await readUsers();
   const syncedContacts: Contact[] = contacts.map((contact, index) => {
     const normalizedPhone = sanitizePhone(contact.phone);
-    const contactTail = phoneTail(contact.phone);
-    const linkedUser = users.find((user) => {
-      const userTail = phoneTail(user.phone);
-      return contactTail.length >= 8 && userTail === contactTail;
-    });
+    const linkedUser = users.find((user) => phonesMatch(user.phone, contact.phone));
 
     return {
       id: `contact-${ownerUserId}-${index}-${Date.now()}`,
@@ -3278,10 +3513,7 @@ app.post('/api/directory/lookup', async (req, res) => {
   }
   const users = await readUsers();
   const profiles = await readProfiles();
-  const user = users.find((item) => {
-    const tail = item.phone.replace(/\D/g, '').slice(-9);
-    return tail.length >= 8 && (digits.endsWith(tail) || tail.endsWith(digits.slice(-9)));
-  });
+  const user = users.find((item) => phonesMatch(item.phone, phone));
   if (!user) {
     return res.json({ registered: false, phone });
   }
@@ -3326,6 +3558,22 @@ app.post('/api/contacts/save', async (req, res) => {
     await collectionsFor(db).contacts.updateOne({ id: contact.id }, { $set: contact }, { upsert: true });
   }
   return res.status(201).json({ contact });
+});
+
+app.post('/api/devices/push', async (req, res) => {
+  const deviceId = String(req.body?.deviceId || '').trim();
+  const token = String(req.body?.token || '').trim();
+  if (!deviceId || !token) {
+    return res.status(400).json({ error: 'Missing device push token.' });
+  }
+  const db = await getDb();
+  if (!db) {
+    const session = seedSessions.find((item) => item.deviceId === deviceId);
+    if (session) session.pushToken = token;
+    return res.json({ ok: Boolean(session) });
+  }
+  const result = await collectionsFor(db).sessions.updateOne({ deviceId }, { $set: { pushToken: token } });
+  return res.json({ ok: result.matchedCount > 0 });
 });
 
 app.get('/api/devices', async (req, res) => {
@@ -3419,7 +3667,27 @@ app.post('/api/statuses', async (req, res) => {
       && status.audience === 'marketplace',
     );
     if (alreadyPosted) {
-      return res.status(200).json({ status: alreadyPosted, duplicate: true });
+      const items = await readCatalogItems();
+      const existingItem = items.find((item) => item.id === parseResult.data.catalogItemId);
+      let revived = existingItem;
+      if (existingItem) {
+        revived = {
+          ...existingItem,
+          takenDown: false,
+          isPublic: true,
+          createdAt: createdAt,
+          updatedAt: createdAt,
+        };
+        const db = await getDb();
+        if (!db) {
+          const index = seedCatalogItems.findIndex((item) => item.id === revived?.id);
+          if (index >= 0 && revived) seedCatalogItems[index] = revived;
+        } else if (revived) {
+          await collectionsFor(db).catalogItems.updateOne({ id: revived.id }, { $set: revived });
+        }
+        io.emit('catalog:itemUpdated', revived);
+      }
+      return res.status(200).json({ status: alreadyPosted, duplicate: true, item: revived });
     }
   }
   const status: StatusPost = {
@@ -3808,6 +4076,17 @@ app.post('/api/calls', async (req, res) => {
   };
   io.emit('call:created', deliveredCall);
   io.emit('call:incoming', deliveredCall);
+  for (const participantId of call.participantIds) {
+    if (participantId === call.initiatorId) continue;
+    const title = caller?.name || caller?.phone || 'Incoming call';
+    void notifyOfflineUser(
+      participantId,
+      title,
+      call.kind === 'video' ? 'Incoming video call' : 'Incoming voice call',
+      { type: 'call', callId: call.id, kind: call.kind },
+      'calls',
+    );
+  }
 
   return res.status(201).json({ call });
 });
@@ -3842,6 +4121,20 @@ app.patch('/api/calls/:callId', async (req, res) => {
   }
 
   io.emit('call:updated', call);
+  if (['completed', 'missed', 'declined'].includes(call.state)) {
+    await recordCallMessage(call);
+    if (call.state === 'missed' || call.state === 'declined') {
+      const caller = (await readUsers()).find((user) => user.id === call.initiatorId);
+      for (const participantId of call.participantIds) {
+        if (participantId === call.initiatorId && call.state === 'declined') continue;
+        const title = caller?.name || 'ZynkUp call';
+        const body = call.state === 'missed'
+          ? `Missed ${call.kind === 'video' ? 'video' : 'voice'} call`
+          : `${call.kind === 'video' ? 'Video' : 'Voice'} call`;
+        void notifyOfflineUser(participantId, title, body, { type: 'call', callId: call.id, kind: call.kind }, 'calls');
+      }
+    }
+  }
   return res.json({ call });
 });
 
@@ -3882,6 +4175,17 @@ app.post('/api/chats/rooms', async (req, res) => {
   }
 
   io.emit('chat:created', chat);
+  const host = (await readUsers()).find((user) => user.id === parseResult.data.userId);
+  for (const participantId of chat.participants) {
+    if (participantId === parseResult.data.userId) continue;
+    void notifyOfflineUser(
+      participantId,
+      host?.name || 'ZynkUp',
+      `Added you to ${chat.title}`,
+      { type: 'chat', chatId: chat.id },
+      'messages',
+    );
+  }
   return res.status(201).json({ chat });
 });
 
@@ -3944,9 +4248,20 @@ app.post('/api/chats/:chatId/members', async (req, res) => {
   }
   const known = new Set((await readUsers()).map((user) => user.id));
   const participants = [...new Set([...chat.participants, ...memberIds.filter((id: string) => known.has(id))])];
+  const added = participants.filter((id) => !chat.participants.includes(id));
   const updated = { ...chat, participants, adminIds: chatAdmins(chat), updatedAt: new Date().toISOString() };
   await saveChatRecord(updated);
   io.emit('chat:updated', updated);
+  const host = (await readUsers()).find((user) => user.id === userId);
+  for (const participantId of added) {
+    void notifyOfflineUser(
+      participantId,
+      host?.name || 'ZynkUp',
+      `Added you to ${updated.title}`,
+      { type: 'chat', chatId: updated.id },
+      'messages',
+    );
+  }
   return res.json({ chat: updated });
 });
 
@@ -4169,6 +4484,18 @@ app.post('/api/messages', async (req, res) => {
       });
     }
   }
+  if (!payload.anonymous && senderUser) {
+    for (const participantId of chat.participants) {
+      if (participantId === payload.senderId) continue;
+      void notifyOfflineUser(
+        participantId,
+        senderUser.name || senderUser.phone || 'New message',
+        payload.text || 'New message',
+        { type: 'message', chatId: payload.chatId, messageId: message.id },
+        'messages',
+      );
+    }
+  }
 
   return res.status(201).json({
     message: presentMessage(message, payload.senderId),
@@ -4312,8 +4639,21 @@ io.on('connection', (socket) => {
 
   socket.on('user:join', ({ userId }: { userId?: string }) => {
     if (userId) {
+      socket.data.userId = userId;
       socket.join(`user:${userId}`);
     }
+  });
+
+  socket.on('disconnect', () => {
+    const userId = typeof socket.data.userId === 'string' ? socket.data.userId : '';
+    if (!userId) return;
+    setTimeout(() => {
+      void io.in(`user:${userId}`).fetchSockets().then((sockets) => {
+        if (!sockets.length) {
+          void updatePresence(userId, 'offline');
+        }
+      });
+    }, 4000);
   });
 
   socket.on('call:invite', ({
