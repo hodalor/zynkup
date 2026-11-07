@@ -15,7 +15,7 @@ import morgan from 'morgan';
 import path from 'path';
 import { Server } from 'socket.io';
 import { z } from 'zod';
-import { findPhoneBlock, mountAdmin, readAppConfig } from './adminApi.js';
+import { findPhoneBlock, mountAdmin, readAppConfig, recordAdminEvent } from './adminApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
@@ -55,6 +55,7 @@ type Message = {
   anonymous?: boolean;
   anonymousDay?: string;
   callKind?: 'audio' | 'video';
+  callState?: 'missed' | 'declined' | 'completed';
 };
 
 type Chat = {
@@ -92,6 +93,7 @@ type Call = {
   answeredAt?: string;
   endedAt?: string;
   logged?: boolean;
+  hiddenFor?: string[];
 };
 
 type StatusAsset = {
@@ -1746,35 +1748,40 @@ const notifyOfflineUser = async (
   data: Record<string, string>,
   channel: 'messages' | 'calls',
 ) => {
-  if (!userId) return;
+  if (!userId) return false;
   try {
     const awake = await io.in(`user:${userId}`).fetchSockets();
-    if (awake.length) return;
+    if (awake.length) return false;
     const adminApp = getFirebaseAdminApp();
-    if (!adminApp) return;
+    if (!adminApp) {
+      void recordAdminEvent(getDb, { level: 'warn', area: 'push', message: 'Push skipped because Firebase admin is not configured', detail: channel });
+      return false;
+    }
     const tokens = [...new Set(
       (await readSessionsByUserId(userId))
         .map((session) => session.pushToken)
         .filter((token): token is string => Boolean(token)),
     )];
-    if (!tokens.length) return;
-    await getMessaging(adminApp).sendEachForMulticast({
+    if (!tokens.length) {
+      void recordAdminEvent(getDb, { level: 'warn', area: 'push', message: 'No push token for this account', detail: `${channel} ${userId}` });
+      return false;
+    }
+    const result = await getMessaging(adminApp).sendEachForMulticast({
       tokens,
-      notification: { title, body },
-      data,
+      data: { ...data, title, body, channel },
       android: {
         priority: 'high',
-        ttl: channel === 'calls' ? 45_000 : 86_400_000,
-        notification: {
-          channelId: channel === 'calls' ? 'zynkup-calls-v3' : 'zynkup-messages-v3',
-          sound: channel === 'calls' ? 'zynkup_call' : 'zynkup_message',
-          priority: 'max',
-          tag: data.chatId || data.callId || userId,
-        },
+        ttl: channel === 'calls' ? 60_000 : 86_400_000,
       },
     });
+    if (!result.successCount) {
+      void recordAdminEvent(getDb, { level: 'error', area: 'push', message: 'Push was not accepted', detail: `${channel} ${result.failureCount} failed` });
+      return false;
+    }
+    return true;
   } catch (error) {
-    console.warn('Push notification skipped:', error);
+    void recordAdminEvent(getDb, { level: 'error', area: 'push', message: 'Push failed', detail: error instanceof Error ? error.message : channel });
+    return false;
   }
 };
 
@@ -1806,6 +1813,7 @@ const recordCallMessage = async (call: Call) => {
     state: 'sent',
     durationSeconds: call.durationSeconds,
     callKind: call.kind,
+    callState: call.state === 'missed' || call.state === 'declined' ? call.state : 'completed',
   };
   await persistMessage(message);
   const updatedChat = await updateChatAfterMessage(chat.id, text, message.sentAt, call.initiatorId);
@@ -1940,7 +1948,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       !message.deletedForEveryone &&
       !(message.deletedFor ?? []).includes(currentUserId),
   );
-  const visibleCalls = calls.filter((call) => call.participantIds.includes(currentUserId));
+  const visibleCalls = calls.filter((call) => call.participantIds.includes(currentUserId) && !(call.hiddenFor ?? []).includes(currentUserId));
   const mergedContacts = contacts.map((contact) => {
     const linkedUser = users.find((user) => user.id === contact.linkedUserId);
     return {
@@ -4138,6 +4146,22 @@ app.patch('/api/calls/:callId', async (req, res) => {
   return res.json({ call });
 });
 
+app.delete('/api/calls/:callId', async (req, res) => {
+  const userId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+  const call = await updateCall(req.params.callId, (current) => ({
+    ...current,
+    hiddenFor: [...new Set([...(current.hiddenFor ?? []), userId])],
+  }));
+  if (!call) {
+    return res.status(404).json({ error: 'Call not found' });
+  }
+  io.to(`user:${userId}`).emit('call:hidden', { callId: call.id, userId });
+  return res.json({ ok: true });
+});
+
 app.post('/api/chats', async (req, res) => {
   const parseResult = createChatSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -4602,6 +4626,28 @@ app.patch('/api/messages/:messageId/receipt', async (req, res) => {
   return res.json({ message });
 });
 
+app.post('/api/calls/:callId/reached', async (req, res) => {
+  const call = (await readCalls()).find((item) => item.id === req.params.callId);
+  if (!call || call.state !== 'ringing') {
+    return res.json({ ok: true });
+  }
+  const calleeId = call.participantIds.find((id) => id !== call.initiatorId) || '';
+  io.to(`user:${call.initiatorId}`).emit('call:peerRinging', { callId: call.id, userId: calleeId });
+  void recordAdminEvent(getDb, { level: 'info', area: 'call', message: 'Call reached the other phone', detail: call.id });
+  return res.json({ ok: true });
+});
+
+app.post('/api/client/events', async (req, res) => {
+  const area = typeof req.body?.area === 'string' ? req.body.area : 'app';
+  const message = typeof req.body?.message === 'string' ? req.body.message : '';
+  const detail = typeof req.body?.detail === 'string' ? req.body.detail : '';
+  if (!message.trim()) {
+    return res.status(400).json({ error: 'Missing message' });
+  }
+  await recordAdminEvent(getDb, { level: 'error', area, message, detail });
+  return res.json({ ok: true });
+});
+
 io.on('connection', (socket) => {
   void (async () => {
     socket.emit('system:ready', {
@@ -4637,11 +4683,16 @@ io.on('connection', (socket) => {
     })();
   });
 
-  socket.on('user:join', ({ userId }: { userId?: string }) => {
+  socket.on('user:join', ({ userId, focused }: { userId?: string; focused?: boolean }) => {
     if (userId) {
       socket.data.userId = userId;
+      socket.data.focused = focused !== false;
       socket.join(`user:${userId}`);
     }
+  });
+
+  socket.on('user:focus', ({ focused }: { focused?: boolean }) => {
+    socket.data.focused = focused === true;
   });
 
   socket.on('disconnect', () => {

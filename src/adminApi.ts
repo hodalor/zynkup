@@ -160,6 +160,24 @@ const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
 const countryName = (code: string) => COUNTRY_NAME[code] || (code ? `+${code}` : 'Unknown');
 const param = (value: string | string[] | undefined) => (Array.isArray(value) ? value[0] : value) || '';
 
+export const recordAdminEvent = async (
+  getDb: () => Promise<Db | null>,
+  event: { level?: string; area: string; message: string; detail?: string },
+) => {
+  const entry = {
+    id: `evt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    level: event.level || 'info',
+    area: event.area.slice(0, 40),
+    message: event.message.slice(0, 300),
+    detail: (event.detail || '').slice(0, 500),
+    createdAt: new Date().toISOString(),
+  };
+  const db = await getDb();
+  if (!db) return entry;
+  await db.collection('adminEvents').insertOne(entry);
+  return entry;
+};
+
 export const mountAdmin = (app: Express, deps: AdminDeps) => {
   app.post('/api/admin/login', (req, res) => {
     const parsed = loginSchema.safeParse(req.body);
@@ -354,9 +372,13 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
   });
 
   app.get('/api/admin/activity', requireAdmin, async (_req, res) => {
-    const [messages, calls, users] = await Promise.all([deps.readMessages(), deps.readCalls(), deps.readUsers()]);
+    const [messages, calls, users, db] = await Promise.all([deps.readMessages(), deps.readCalls(), deps.readUsers(), deps.getDb()]);
+    const events = db
+      ? await db.collection('adminEvents').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(120).toArray()
+      : [];
     const nameFor = (id: string) => users.find((user) => user.id === id)?.name || id;
     return res.json({
+      events,
       messages: messages.slice(0, 80).map((message) => ({
         ...message,
         text: message.anonymous ? 'Anonymous message' : String(message.text || '').slice(0, 180),
