@@ -2,15 +2,18 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
+import LegalPage, { isLegalPath } from './LegalPage';
 import './firebase';
 import reportWebVitals from './reportWebVitals';
+
+const path = window.location.pathname.replace(/\/+$/, '') || '/';
 
 const root = ReactDOM.createRoot(
   document.getElementById('root') as HTMLElement
 );
 root.render(
   <React.StrictMode>
-    <App />
+    {isLegalPath(path) ? <LegalPage path={path} /> : <App />}
   </React.StrictMode>
 );
 
