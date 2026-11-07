@@ -2,9 +2,10 @@ import './LegalPage.css';
 
 const PRIVACY_PATHS = new Set(['/privacy', '/pryvacy']);
 const TERMS_PATH = '/tandc';
+const DELETE_PATH = '/delete';
 
 export function isLegalPath(path: string) {
-  return PRIVACY_PATHS.has(path) || path === TERMS_PATH;
+  return PRIVACY_PATHS.has(path) || path === TERMS_PATH || path === DELETE_PATH;
 }
 
 type LegalPageProps = {
@@ -12,18 +13,19 @@ type LegalPageProps = {
 };
 
 export default function LegalPage({ path }: LegalPageProps) {
-  const terms = path === TERMS_PATH;
+  const page = path === TERMS_PATH ? 'terms' : path === DELETE_PATH ? 'delete' : 'privacy';
   return (
     <main className="legal">
       <header className="legal-top">
         <a className="legal-brand" href="/">ZynkUp</a>
         <nav className="legal-nav">
-          <a href="/privacy" aria-current={terms ? undefined : 'page'}>Privacy</a>
-          <a href="/tandc" aria-current={terms ? 'page' : undefined}>Terms</a>
+          <a href="/privacy" aria-current={page === 'privacy' ? 'page' : undefined}>Privacy</a>
+          <a href="/tandc" aria-current={page === 'terms' ? 'page' : undefined}>Terms</a>
+          <a href="/delete" aria-current={page === 'delete' ? 'page' : undefined}>Delete account</a>
         </nav>
       </header>
       <article className="legal-card">
-        {terms ? <Terms /> : <Privacy />}
+        {page === 'terms' ? <Terms /> : page === 'delete' ? <DeleteAccount /> : <Privacy />}
       </article>
     </main>
   );
@@ -61,14 +63,48 @@ function Privacy() {
       </p>
       <h2>How it is sent and kept</h2>
       <p>
-        Data is sent over HTTPS. We keep it while your account is open. You can ask us to delete your
-        account and the messages stored with it. Email the support address in the app, or use Delete my
-        account in settings when that option is available on your version.
+        Data is sent over HTTPS. We keep it while your account is open. To remove your account, follow
+        the steps on the <a href="/delete">delete account</a> page.
       </p>
       <h2>Children</h2>
       <p>ZynkUp is for people 18 and older. We do not aim the app at children.</p>
       <h2>Changes</h2>
       <p>When this policy changes, the date at the top of this page changes with it.</p>
+    </>
+  );
+}
+
+function DeleteAccount() {
+  return (
+    <>
+      <h1>Delete your account</h1>
+      <p className="legal-meta">Last updated 7 November 2026</p>
+      <p>
+        You can ask ZynkUp to delete your account from the phone app. Deleting the account removes the
+        profile tied to your phone number, including your name, photo, messages, status posts, and
+        marketplace listings stored with that account.
+      </p>
+      <h2>Steps in the app</h2>
+      <ol>
+        <li>Open ZynkUp and enter your PIN if the app asks for it.</li>
+        <li>On Chats, tap the settings icon in the top corner.</li>
+        <li>Tap Account. The row says “Security, phone number, delete account”. Tapping your profile at the top opens the same screen.</li>
+        <li>Scroll to the bottom of Account.</li>
+        <li>Tap Delete my account.</li>
+        <li>In the Delete account? dialog, tap OK.</li>
+      </ol>
+      <h2>What the app does today</h2>
+      <p>
+        The dialog confirms your request and tells you that account deletion will be available once server
+        purge is enabled. Contact support for now. Your request is the start of deletion. The account stays
+        in place until that purge runs. Logging out of this phone, or tapping Log out on a linked web
+        device, only signs that device out. It does not delete the account.
+      </p>
+      <h2>If you cannot open the app</h2>
+      <p>
+        Send the phone number on the account to the support address shown in ZynkUp, and ask for the
+        account to be deleted. We use that number to find the right account.
+      </p>
     </>
   );
 }
