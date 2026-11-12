@@ -636,6 +636,9 @@ function AppContent() {
   const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
   const currentUserIdRef = useRef('');
   const pinHoldingRef = useRef(false);
+  const uiLockedRef = useRef(false);
+  const systemCallIdRef = useRef('');
+  const [lockNotice, setLockNotice] = useState(null);
   const usersByIdRef = useRef({});
   const chatScreenRef = useRef('list');
   const selectedChatIdRef = useRef('');
@@ -945,6 +948,7 @@ function AppContent() {
       replyPreview: message.replyPreview,
       deletedForEveryone: deleted,
       callKind: message.callKind,
+      callState: message.callState,
     };
   };
 
@@ -1648,16 +1652,7 @@ function AppContent() {
       setAuthPendingAction('send-code');
       await deliverPhoneOtp(countryCode, phoneNumber, normalizedPhone);
     } catch (error) {
-      const firebaseCode = error?.code ?? '';
-      showToast(
-        firebaseCode === 'auth/app-not-authorized'
-          ? 'Firebase refused this install (app-not-authorized). Add this APK’s SHA-1 and SHA-256 in Firebase, enable Play Integrity, and allow SMS for Ghana and Zambia. Phones that fail the check open the robot page and then get no SMS.'
-          : firebaseCode
-            ? `SMS was not sent (${firebaseCode}). Check Firebase Phone auth billing and the test-number list.`
-            : error?.message || 'SMS was not sent. Check Firebase Phone auth.',
-        'error',
-        5200,
-      );
+      reportOtpFailure(error);
     } finally {
       setAuthPendingAction('');
     }
@@ -2687,6 +2682,7 @@ function AppContent() {
       if (state === 'active') {
         if (userId) {
           socketRef.current?.emit('presence:update', { userId, presence: 'online' });
+          socketRef.current?.emit('user:focus', { focused: !uiLockedRef.current && !pinHoldingRef.current });
         }
         if (userId && !activeCallRef.current && !incomingCallRef.current) {
           refreshSessionRef.current();
@@ -2696,6 +2692,7 @@ function AppContent() {
       }
       if (userId) {
         socketRef.current?.emit('presence:update', { userId, presence: 'offline' });
+        socketRef.current?.emit('user:focus', { focused: false });
         void writeRememberedAccount({ lastActiveAt: Date.now() });
       }
       const liveCall = activeCallRef.current;
@@ -2716,7 +2713,9 @@ function AppContent() {
     socketRef.current = socket;
     socket.on('connect', () => {
       if (currentUserIdRef.current) {
-        socket.emit('user:join', { userId: currentUserIdRef.current });
+        const focused = AppState.currentState === 'active' && !uiLockedRef.current && !pinHoldingRef.current;
+        socket.emit('user:join', { userId: currentUserIdRef.current, focused });
+        socket.emit('user:focus', { focused });
       }
       flushOutboxRef.current();
       if (!activeCallRef.current && !incomingCallRef.current) {
@@ -2781,8 +2780,9 @@ function AppContent() {
 
       if (message.senderId !== currentUserIdRef.current) {
         const settings = appSettingsRef.current;
+        const uiLocked = uiLockedRef.current || pinHoldingRef.current;
         const appIsForeground = AppState.currentState === 'active';
-        const viewingChat = appIsForeground && chatScreenRef.current === 'detail' && selectedChatIdRef.current === message.chatId;
+        const viewingChat = appIsForeground && !uiLocked && chatScreenRef.current === 'detail' && selectedChatIdRef.current === message.chatId;
         const nextReceipt =
           viewingChat && settings.readReceiptsEnabled ? 'read' : 'delivered';
         void syncReceiptState(message.id, nextReceipt);
@@ -2791,7 +2791,7 @@ function AppContent() {
           settings.conversationTones &&
           !mutedChatIdsRef.current.includes(message.chatId)
         ) {
-          if (appIsForeground && !viewingChat) {
+          if (appIsForeground && !uiLocked && !viewingChat) {
             playCueRef.current('receive');
           }
         }
@@ -2805,12 +2805,19 @@ function AppContent() {
           const preview = settings.showNotificationPreview
             ? (message.text || (message.kind === 'image' ? 'Photo' : message.kind === 'voice' ? 'Voice message' : 'New message'))
             : 'New message';
-          if (appIsForeground) {
+          if (appIsForeground && !uiLocked) {
             showToast(`${senderName}: ${preview}`, 'info', settings.conversationTones ? 2800 : 1800);
+          }
+          if (uiLocked) {
+            setLockNotice({ title: senderName, body: preview });
           }
           CueSound?.showMessageNotification?.(senderName, preview);
         }
       }
+    });
+    socket.on('call:hidden', ({ callId, userId }) => {
+      if (!callId || userId !== currentUserIdRef.current) return;
+      setCalls((current) => current.filter((item) => item.id !== callId));
     });
     socket.on('message:deleted', ({ message, scope, userId }) => {
       if (!message?.chatId) {
@@ -3379,11 +3386,18 @@ function AppContent() {
     } else if (mapped.state === 'ongoing' || (mapped.state === 'ringing' && mapped.initiatorId === (currentUserIdRef.current || currentUserId))) {
       setIncomingCall((current) => (current?.id === mapped.id ? null : current));
       setActiveCall(mapped);
+      if (mapped.state === 'ongoing') {
+        CueSound?.hideIncomingCall?.();
+      }
     }
     if (['completed', 'missed', 'declined'].includes(mapped.state)) {
       setIncomingCall((current) => (current?.id === mapped.id ? null : current));
       setActiveCall((current) => (current?.id === mapped.id ? null : current));
       CueSound?.hideIncomingCall?.();
+      if (systemCallIdRef.current === mapped.id) {
+        CueSound?.endSystemCall?.(mapped.state === 'completed' ? 'completed' : mapped.state);
+        systemCallIdRef.current = '';
+      }
     }
   };
 
@@ -3602,6 +3616,34 @@ function AppContent() {
       initiatorId: incomingCall.initiatorId,
     });
   }, [incomingCall?.id, incomingCall?.state, currentUserId]);
+
+  useEffect(() => {
+    const locked = (authVisible && authMode === 'pin') || (appSettings.appLockEnabled && !appUnlocked && Boolean(appLockPin));
+    uiLockedRef.current = locked;
+    if (!locked) {
+      setLockNotice(null);
+    }
+    const focused = AppState.currentState === 'active' && !locked && !pinHoldingRef.current;
+    socketRef.current?.emit('user:focus', { focused });
+  }, [authVisible, authMode, appSettings.appLockEnabled, appUnlocked, appLockPin]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return undefined;
+    const live = incomingCall?.state === 'ringing'
+      ? incomingCall
+      : activeCall && (activeCall.state === 'ringing' || activeCall.state === 'ongoing')
+        ? activeCall
+        : null;
+    if (!live) return undefined;
+    if (systemCallIdRef.current !== live.id) {
+      systemCallIdRef.current = live.id;
+      CueSound?.beginSystemCall?.(live.initiatorId !== currentUserId, live.name || 'ZynkUp');
+    }
+    if (live.state === 'ongoing') {
+      CueSound?.answerSystemCall?.();
+    }
+    return undefined;
+  }, [incomingCall?.id, incomingCall?.state, incomingCall?.initiatorId, activeCall?.id, activeCall?.state, activeCall?.initiatorId, currentUserId]);
 
   useEffect(() => {
     if (!activeCall || activeCall.state !== 'ongoing') {
@@ -4678,6 +4720,17 @@ function AppContent() {
     );
   };
 
+  const reportOtpFailure = (error, phone = '') => {
+    const code = error?.code || '';
+    const detail = [code, error?.message || ''].filter(Boolean).join(' ').slice(0, 300);
+    showToast(code === 'auth/invalid-phone-number' ? 'That phone number looks invalid.' : 'Unable to send OTP.', 'error', 4200);
+    void fetch(`${API_BASE_URL}/api/client/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ area: 'otp', message: 'Unable to send OTP', detail: `${phone} ${detail}`.trim() }),
+    }).catch(() => undefined);
+  };
+
   const deliverPhoneOtp = async (countryCode, phoneNumber, normalizedPhone) => {
     const preferBackendOtp = typeof __DEV__ !== 'undefined' && __DEV__;
     if (preferBackendOtp) {
@@ -4734,19 +4787,7 @@ function AppContent() {
       const firebaseMessage = error?.message ?? '';
       console.warn('Phone auth send failed', firebaseCode, firebaseMessage, normalizedPhone);
 
-      const friendlyMessage =
-        firebaseCode === 'auth/invalid-phone-number'
-          ? `That phone number looks invalid (${normalizedPhone}). Check the country code and drop any leading 0.`
-          : firebaseCode === 'auth/too-many-requests'
-            ? 'Too many SMS attempts. Wait a bit, or use a Firebase test phone number on the emulator.'
-            : firebaseCode === 'auth/missing-client-identifier' || firebaseCode === 'auth/app-not-authorized'
-              ? 'Firebase rejected this Android app. Add the debug SHA-1/SHA-256 in the Firebase console.'
-              : firebaseCode === 'auth/quota-exceeded'
-                ? 'Firebase SMS quota exceeded for this project.'
-                : firebaseMessage || error?.message
-                  ? `Unable to send OTP: ${firebaseMessage || error.message}`
-                  : 'Unable to send the OTP right now. Check the phone number and your Firebase SMS settings.';
-      showToast(friendlyMessage, 'error', 4800);
+      reportOtpFailure(error, normalizedPhone);
     } finally {
       setAuthPendingAction('');
     }
@@ -5722,9 +5763,27 @@ function AppContent() {
     showToast('Product taken down.', 'success');
   };
 
+  const describeCallMessage = (message) => {
+    const video = message.callKind === 'video';
+    const noun = video ? 'video call' : 'voice call';
+    const state = message.callState
+      || (/missed/i.test(message.text || '') ? 'missed' : /declined/i.test(message.text || '') ? 'declined' : 'completed');
+    const outgoing = Boolean(message.mine);
+    const label = !outgoing && state === 'missed'
+      ? `Missed ${noun}`
+      : !outgoing && state === 'declined'
+        ? `Declined ${noun}`
+        : `${outgoing ? 'Outgoing' : 'Incoming'} ${noun}`;
+    const duration = state === 'completed' && message.durationSeconds > 0
+      ? ` · ${Math.floor(message.durationSeconds / 60)}:${String(message.durationSeconds % 60).padStart(2, '0')}`
+      : '';
+    return { label: `${label}${duration}`, alert: state === 'missed' || state === 'declined', arrow: outgoing ? '↗' : '↙' };
+  };
+
   const renderBubble = (message) => {
     if (message.kind === 'call') {
       const peerId = activeChat?.peerUserId;
+      const described = describeCallMessage(message);
       return (
         <Pressable
           key={message.id}
@@ -5732,10 +5791,16 @@ function AppContent() {
             if (!peerId) return;
             void startCall(message.callKind === 'video' ? 'Video' : 'Audio', peerId);
           }}
-          style={{ alignSelf: 'center', marginVertical: 8, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 14, backgroundColor: '#e7f6f1' }}
+          onLongPress={() => {
+            Alert.alert('Delete this call?', 'It disappears from this chat on this account.', [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Delete', style: 'destructive', onPress: () => void deleteMessage(message, 'me') },
+            ]);
+          }}
+          style={{ alignSelf: 'center', marginVertical: 8, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 14, backgroundColor: described.alert ? '#fdeceb' : '#e7f6f1' }}
         >
-          <Text style={{ color: '#0b6b57', fontWeight: '700' }}>{message.text || 'Call'}</Text>
-          <Text style={{ color: '#5f7a74', fontSize: 12, textAlign: 'center' }}>Tap to call again</Text>
+          <Text style={{ color: described.alert ? '#d4544c' : '#0b6b57', fontWeight: '700', textAlign: 'center' }}>{described.arrow} {described.label}</Text>
+          <Text style={{ color: '#5f7a74', fontSize: 12, textAlign: 'center' }}>Tap to call again · hold to delete</Text>
         </Pressable>
       );
     }
@@ -6493,12 +6558,15 @@ function AppContent() {
       )}
       {calls.map((call) => {
         const outgoing = call.initiatorId === currentUserId;
-        const missed = !outgoing && (call.state === 'missed' || call.state === 'declined');
-        const directionLabel = missed
+        const unanswered = call.state === 'missed' || call.state === 'declined';
+        const missed = unanswered;
+        const directionLabel = !outgoing && call.state === 'missed'
           ? 'Missed'
-          : outgoing
-            ? (call.state === 'missed' || call.state === 'declined' ? 'Canceled' : 'Outgoing')
-            : 'Incoming';
+          : !outgoing && call.state === 'declined'
+            ? 'Declined'
+            : outgoing
+              ? 'Outgoing'
+              : 'Incoming';
         const arrow = outgoing ? '↗' : '↙';
         const started = formatCallStamp(call.startedAt) || call.time;
         const ended = formatCallStamp(call.endedAt);
@@ -6508,6 +6576,22 @@ function AppContent() {
             const peerId = call.peerUserId;
             if (!peerId) return;
             void startCall(call.kind === 'Video' ? 'Video' : 'Audio', peerId);
+          }} onLongPress={() => {
+            Alert.alert('Delete this call?', 'It disappears from your call list.', [
+              { text: 'Cancel', style: 'cancel' },
+              {
+                text: 'Delete',
+                style: 'destructive',
+                onPress: () => {
+                  setCalls((current) => current.filter((item) => item.id !== call.id));
+                  void fetch(`${API_BASE_URL}/api/calls/${encodeURIComponent(call.id)}`, {
+                    method: 'DELETE',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ userId: currentUserId }),
+                  });
+                },
+              },
+            ]);
           }}>
             {renderPersonAvatar({
               userId: call.peerUserId,
@@ -7640,6 +7724,9 @@ function AppContent() {
                           ? 'Use 4–6 digits. You will use this PIN next time you sign in.'
                           : `For ${authForm.verifiedPhone || normalizeAuthPhone(authForm.countryCode || '+233', authForm.phone || '')}`}
                       </Text>
+                      {lockNotice ? (
+                        <Text style={styles.authStepBody}>{lockNotice.title}: {lockNotice.body}. Unlock to open it.</Text>
+                      ) : null}
                       <View style={styles.authOtpRow}>
                         {authPinDigits.map((digit, index) => (
                           <View
@@ -9408,6 +9495,7 @@ function AppContent() {
           <View style={styles.dialog}>
             <Text style={styles.dialogTitle}>App locked</Text>
             <Text style={styles.cardBody}>Enter your PIN to open ZynkUp.</Text>
+            {lockNotice ? <Text style={[styles.cardBody, { color: '#d4544c' }]}>{lockNotice.title}: {lockNotice.body}. Unlock to open it.</Text> : null}
             <TextInput
               value={unlockPinDraft}
               onChangeText={setUnlockPinDraft}
