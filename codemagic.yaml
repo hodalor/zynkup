@@ -1,0 +1,39 @@
+workflows:
+  ios-app-store:
+    name: ZynkUp iOS App Store
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: ZynkUp
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.prynova.zynkup
+      vars:
+        XCODE_WORKSPACE: ZynkupMobile.xcworkspace
+        XCODE_SCHEME: ZynkupMobile
+      node: 22
+      # React Native 0.81 is built with the Xcode 16 toolchain.
+      xcode: 16.4
+      cocoapods: default
+    scripts:
+      - name: Install npm dependencies
+        script: npm install
+      - name: Install CocoaPods dependencies
+        script: cd ios && pod install
+      - name: Set up code signing
+        script: xcode-project use-profiles
+      - name: Set the iOS build number
+        script: cd ios && agvtool new-version -all "$BUILD_NUMBER"
+      - name: Build the App Store ipa
+        script: |
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
