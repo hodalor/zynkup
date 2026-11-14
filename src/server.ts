@@ -149,6 +149,18 @@ type Contact = {
   presence: Presence;
 };
 
+type CallConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'closed';
+type CallQuality = 'good' | 'fair' | 'poor';
+
+type CallMetricsSample = {
+  userId: string;
+  rttMs?: number;
+  packetLoss?: number;
+  bitrateKbps?: number;
+  quality?: CallQuality;
+  at: string;
+};
+
 type Call = {
   id: string;
   participantIds: string[];
@@ -162,6 +174,14 @@ type Call = {
   endedAt?: string;
   logged?: boolean;
   hiddenFor?: string[];
+  /** Last quality sample per user (no media content). */
+  lastMetricsByUser?: Record<string, CallMetricsSample>;
+};
+
+type IceServerConfig = {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
 };
 
 type StatusAsset = {
@@ -763,6 +783,11 @@ const FIREBASE_MESSAGING_SENDER_ID = process.env.FIREBASE_MESSAGING_SENDER_ID ??
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL ?? '';
 const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY ?? '').replace(/\\n/g, '\n');
 const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? '';
+/** Public Google STUN — always returned by GET /api/calls/ice-servers. */
+const DEFAULT_STUN_URLS = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+];
 const MAX_LINKED_DEVICES = 4;
 const LINK_REQUEST_TTL_MS = 1000 * 60 * 5;
 /** Profile video clips are short (~6s); clients compress before upload. Duration is validated on PATCH. */
@@ -900,6 +925,16 @@ const createCallSchema = z.object({
 const updateCallSchema = z.object({
   state: z.enum(['ringing', 'ongoing', 'completed', 'missed', 'declined']),
   durationSeconds: z.number().int().nonnegative().optional(),
+});
+
+const callQualitySchema = z.enum(['good', 'fair', 'poor']);
+
+const callMetricsSchema = z.object({
+  userId: z.string().min(1),
+  rttMs: z.number().nonnegative().max(120_000).optional(),
+  packetLoss: z.number().min(0).max(100).optional(),
+  bitrateKbps: z.number().nonnegative().max(100_000).optional(),
+  quality: callQualitySchema.optional(),
 });
 
 const catalogVariantSchema = z.object({
@@ -4596,6 +4631,63 @@ const persistCall = async (call: Call) => {
   return call;
 };
 
+const parseIceUrlList = (value: string | undefined) =>
+  (value || '')
+    .split(/[\s,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+/**
+ * ICE servers for 1:1 WebRTC calls.
+ * Always includes public Google STUN (+ optional STUN_URLS).
+ * TURN is included only when TURN_URLS + TURN_USERNAME + TURN_CREDENTIAL
+ * (or TURN_URL / TURN_PASSWORD aliases) are set — never hardcode third-party secrets.
+ */
+const buildIceServersResponse = () => {
+  const stunUrls = Array.from(
+    new Set([...DEFAULT_STUN_URLS, ...parseIceUrlList(process.env.STUN_URLS)]),
+  );
+  const iceServers: IceServerConfig[] = [{ urls: stunUrls.length === 1 ? stunUrls[0] : stunUrls }];
+
+  const turnUrls = parseIceUrlList(process.env.TURN_URLS || process.env.TURN_URL);
+  const turnUsername = (process.env.TURN_USERNAME || '').trim();
+  const turnCredential = (process.env.TURN_CREDENTIAL || process.env.TURN_PASSWORD || '').trim();
+  const turnConfigured = turnUrls.length > 0 && Boolean(turnUsername) && Boolean(turnCredential);
+
+  if (turnConfigured) {
+    iceServers.push({
+      urls: turnUrls.length === 1 ? turnUrls[0] : turnUrls,
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return {
+    iceServers,
+    turnConfigured,
+    stunOnly: !turnConfigured,
+  };
+};
+
+const relayCallEventToPeers = async (
+  callId: string,
+  fromUserId: string,
+  eventName: string,
+  payload: unknown,
+  socket?: { to: (room: string) => { emit: (event: string, data: unknown) => void } },
+) => {
+  // Exclude the emitter from the call room fan-out (same pattern as call:signal).
+  if (socket) {
+    socket.to(callId).emit(eventName, payload);
+  }
+  const call = (await readCalls()).find((item) => item.id === callId);
+  if (!call) return;
+  for (const participantId of call.participantIds) {
+    if (participantId === fromUserId) continue;
+    io.to(`user:${participantId}`).emit(eventName, payload);
+  }
+};
+
 const updateCall = async (
   callId: string,
   updater: (call: Call) => Call,
@@ -5600,6 +5692,10 @@ app.delete('/api/devices/:deviceId', async (req, res) => {
 
 app.get('/api/calls', async (_req, res) => {
   res.json({ calls: await readCalls() });
+});
+
+app.get('/api/calls/ice-servers', (_req, res) => {
+  res.json(buildIceServersResponse());
 });
 
 app.get('/api/statuses', async (_req, res) => {
@@ -10001,6 +10097,47 @@ app.post('/api/calls/:callId/reached', async (req, res) => {
   return res.json({ ok: true });
 });
 
+/** Quality metrics only (RTT / loss / bitrate / quality label) — never media payloads. */
+app.post('/api/calls/:callId/metrics', async (req, res) => {
+  const parseResult = callMetricsSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid call metrics payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const callId = req.params.callId;
+  const call = (await readCalls()).find((item) => item.id === callId);
+  if (!call) {
+    return res.status(404).json({ error: 'Call not found' });
+  }
+  if (!call.participantIds.includes(parseResult.data.userId)) {
+    return res.status(403).json({ error: 'User is not a participant of this call' });
+  }
+
+  const sample: CallMetricsSample = {
+    userId: parseResult.data.userId,
+    rttMs: parseResult.data.rttMs,
+    packetLoss: parseResult.data.packetLoss,
+    bitrateKbps: parseResult.data.bitrateKbps,
+    quality: parseResult.data.quality,
+    at: new Date().toISOString(),
+  };
+
+  const updated = await updateCall(callId, (current) => ({
+    ...current,
+    lastMetricsByUser: {
+      ...(current.lastMetricsByUser ?? {}),
+      [sample.userId]: sample,
+    },
+  }));
+
+  const event = { callId, ...sample };
+  await relayCallEventToPeers(callId, sample.userId, 'call:metrics', event);
+  return res.json({ ok: true, metrics: sample, call: updated });
+});
+
 app.post('/api/client/events', async (req, res) => {
   const area = typeof req.body?.area === 'string' ? req.body.area : 'app';
   const message = typeof req.body?.message === 'string' ? req.body.message : '';
@@ -10139,7 +10276,8 @@ io.on('connection', (socket) => {
       callId: string;
       fromUserId: string;
       toUserId?: string;
-      signalType: 'offer' | 'answer' | 'ice-candidate';
+      /** ice-restart: peer should renegotiate (offer/answer also fine for ICE restart). */
+      signalType: 'offer' | 'answer' | 'ice-candidate' | 'ice-restart';
       payload: unknown;
     }) => {
       const event = { callId, fromUserId, toUserId, signalType, payload };
@@ -10147,6 +10285,45 @@ io.on('connection', (socket) => {
         io.to(`user:${toUserId}`).emit('call:signal', event);
       }
       socket.to(callId).emit('call:signal', event);
+    },
+  );
+
+  // Connection quality / ICE state only — never flips call.state to completed on reconnecting.
+  socket.on(
+    'call:connection',
+    ({
+      callId,
+      userId,
+      state,
+      quality,
+    }: {
+      callId?: string;
+      userId?: string;
+      state?: CallConnectionState;
+      quality?: CallQuality;
+    }) => {
+      if (!callId || !userId || !state) return;
+      if (!['connecting', 'connected', 'reconnecting', 'failed', 'closed'].includes(state)) return;
+      if (quality && !['good', 'fair', 'poor'].includes(quality)) return;
+      const event = { callId, userId, state, quality };
+      void relayCallEventToPeers(callId, userId, 'call:connection', event, socket);
+    },
+  );
+
+  socket.on(
+    'call:screen-share',
+    ({
+      callId,
+      userId,
+      active,
+    }: {
+      callId?: string;
+      userId?: string;
+      active?: boolean;
+    }) => {
+      if (!callId || !userId || typeof active !== 'boolean') return;
+      const event = { callId, userId, active };
+      void relayCallEventToPeers(callId, userId, 'call:screen-share', event, socket);
     },
   );
 });
