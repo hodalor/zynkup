@@ -16,6 +16,23 @@ import path from 'path';
 import { Server } from 'socket.io';
 import { z } from 'zod';
 import { findPhoneBlock, mountAdmin, readAppConfig, recordAdminEvent } from './adminApi.js';
+import {
+  actorCanModerateCommunity,
+  appendCommunityAudit,
+  assertCommunityRoomCanPost,
+  findCommunityRoomByChatId,
+  mountCommunities,
+  type CommunitiesDeps,
+  type CommunityChat,
+} from './communitiesApi.js';
+import {
+  mountVoiceRooms,
+  type VoiceRoomsDeps,
+} from './voiceRoomsApi.js';
+import {
+  registerGamesApi,
+  type GamesDeps,
+} from './gamesApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
@@ -83,6 +100,10 @@ type Chat = {
   updatedAt: string;
   space?: string;
   disappearAfterSeconds?: number;
+  /** When set, this group chat is a topic room inside a community. */
+  communityId?: string;
+  /** Opt-in anonymous posting; synced from community room when applicable. Default false. */
+  allowAnonymous?: boolean;
 };
 
 type Contact = {
@@ -631,7 +652,17 @@ const seedAutoReplyLogs: AutoReplyLog[] = [];
 const seedCommerceDocuments: CommerceDocument[] = [];
 const seedBroadcastCampaigns: BroadcastCampaign[] = [];
 const seedBusinessAiConfigs: BusinessAiConfig[] = [];
+const seedAiTwinConfigs: AiTwinConfig[] = [];
+const seedAiTwinActions: AiTwinAction[] = [];
 const documentCounters: Record<string, number> = {};
+const TWIN_HARD_BLOCKS = [
+  'send_money',
+  'approve_refund',
+  'invent_price',
+  'promise_discount',
+  'auto_send_without_disclosure',
+  'impersonate_owner_secretly',
+] as const;
 
 const settingsMenu = [
   'Favorites',
@@ -727,6 +758,10 @@ const clearChatUnreadSchema = z.object({
 const deleteMessageSchema = z.object({
   userId: z.string().min(1),
   scope: z.enum(['me', 'everyone']).default('me'),
+});
+
+const revealAuthorSchema = z.object({
+  userId: z.string().min(1).optional(),
 });
 
 const updateProfileSchema = z.object({
@@ -1062,6 +1097,77 @@ const businessAiAskSchema = z.object({
   chatId: z.string().min(1).max(80).optional(),
 });
 
+const twinAllowedTaskSchema = z.enum([
+  'draft_reply',
+  'organise_enquiry',
+  'create_reminder',
+  'prepare_quotation',
+  'answer_hours',
+]);
+
+const twinConfigSchema = z.object({
+  userId: z.string().min(1),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  enabled: z.boolean().optional(),
+  displayName: z.string().trim().max(80).optional(),
+  permissionTier: z.enum(['draft_only', 'auto_routine']).optional(),
+  allowedTasks: z.array(twinAllowedTaskSchema).max(10).optional(),
+  dataSources: z.array(z.enum(['catalog', 'hours', 'faq', 'policies', 'crm'])).max(10).optional(),
+  operatingHoursText: z.string().trim().max(200).optional(),
+  dailyActionLimit: z.number().int().min(1).max(200).optional(),
+});
+
+const twinRunSchema = z.object({
+  userId: z.string().min(1),
+  event: z.enum(['new_enquiry', 'manual']),
+  chatId: z.string().min(1).max(80).optional(),
+  messageId: z.string().min(1).max(80).optional(),
+  prompt: z.string().trim().max(1000).optional(),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+});
+
+const twinActionDecisionSchema = z.object({
+  userId: z.string().min(1),
+  note: z.string().trim().max(240).optional(),
+});
+
+type TwinAllowedTask = z.infer<typeof twinAllowedTaskSchema>;
+
+type AiTwinConfig = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  displayName: string;
+  permissionTier: 'draft_only' | 'auto_routine';
+  allowedTasks: TwinAllowedTask[];
+  dataSources: Array<'catalog' | 'hours' | 'faq' | 'policies' | 'crm'>;
+  operatingHoursText: string;
+  dailyActionLimit: number;
+  // Hard-blocked forever — never grantable via config
+  blockedActions: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AiTwinAction = {
+  id: string;
+  twinId: string;
+  ownerUserId: string;
+  task: TwinAllowedTask | 'blocked_attempt';
+  status: 'proposed' | 'approved' | 'rejected' | 'executed_draft' | 'blocked';
+  summary: string;
+  draftText?: string;
+  requiresApproval: boolean;
+  chatId?: string | null;
+  messageId?: string | null;
+  inputPreview?: string;
+  result?: string;
+  createdAt: string;
+  decidedAt?: string | null;
+  decidedByUserId?: string | null;
+};
+
 type BusinessAiConfig = {
   id: string;
   sellerUserId: string;
@@ -1325,6 +1431,10 @@ const ensureSessionSchema = z.object({
 
 const app = express();
 const server = http.createServer(app);
+/** Assigned before mountCommunities; used by the message pipeline for room ACL. */
+let communitiesDeps: CommunitiesDeps;
+let voiceRoomsDeps: VoiceRoomsDeps;
+let gamesDeps: GamesDeps;
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -3063,6 +3173,7 @@ const createChatRoom = async (userId: string, title: string, memberIds: string[]
     unreadByUser: {},
     lastMessagePreview: 'Chat room created',
     updatedAt: new Date().toISOString(),
+    allowAnonymous: false,
   };
 
   const db = await getDb();
@@ -7838,6 +7949,345 @@ app.post('/api/ai/business/ask', async (req, res) => {
   });
 });
 
+const defaultAiTwinConfig = (ownerUserId: string, businessId?: string | null): AiTwinConfig => {
+  const now = new Date().toISOString();
+  return {
+    id: `twin-${ownerUserId}${businessId ? `-${businessId}` : ''}`,
+    ownerUserId,
+    businessId: businessId || null,
+    enabled: false,
+    displayName: 'AI Twin',
+    permissionTier: 'draft_only',
+    allowedTasks: ['draft_reply', 'answer_hours', 'organise_enquiry', 'create_reminder', 'prepare_quotation'],
+    dataSources: ['catalog', 'hours', 'faq', 'policies'],
+    operatingHoursText: '',
+    dailyActionLimit: 40,
+    blockedActions: [...TWIN_HARD_BLOCKS],
+    createdAt: now,
+    updatedAt: now,
+  };
+};
+
+const readAiTwinConfigs = async () => {
+  const db = await getDb();
+  if (!db) return [...seedAiTwinConfigs];
+  return db.collection<AiTwinConfig>('aiTwins').find({}, { projection: { _id: 0 } }).toArray();
+};
+
+const saveAiTwinConfig = async (config: AiTwinConfig) => {
+  const db = await getDb();
+  // Always re-assert hard blocks so prompt/config injection cannot remove them
+  const safe: AiTwinConfig = {
+    ...config,
+    blockedActions: [...TWIN_HARD_BLOCKS],
+    permissionTier: config.permissionTier === 'auto_routine' ? 'auto_routine' : 'draft_only',
+  };
+  if (!db) {
+    const index = seedAiTwinConfigs.findIndex((entry) => entry.id === safe.id);
+    if (index >= 0) seedAiTwinConfigs[index] = safe;
+    else seedAiTwinConfigs.unshift(safe);
+    return safe;
+  }
+  await db.collection<AiTwinConfig>('aiTwins').updateOne({ id: safe.id }, { $set: safe }, { upsert: true });
+  return safe;
+};
+
+const getAiTwinConfig = async (ownerUserId: string, businessId?: string | null) => {
+  const configs = await readAiTwinConfigs();
+  if (businessId) {
+    const match = configs.find((entry) => entry.ownerUserId === ownerUserId && entry.businessId === businessId);
+    if (match) return { ...match, blockedActions: [...TWIN_HARD_BLOCKS] };
+  }
+  const personal = configs.find((entry) => entry.ownerUserId === ownerUserId && !entry.businessId);
+  return personal
+    ? { ...personal, blockedActions: [...TWIN_HARD_BLOCKS] }
+    : defaultAiTwinConfig(ownerUserId, businessId || null);
+};
+
+const readAiTwinActions = async (ownerUserId: string) => {
+  const db = await getDb();
+  if (!db) return seedAiTwinActions.filter((entry) => entry.ownerUserId === ownerUserId);
+  return db
+    .collection<AiTwinAction>('aiTwinActions')
+    .find({ ownerUserId }, { projection: { _id: 0 } })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray();
+};
+
+const saveAiTwinAction = async (action: AiTwinAction) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedAiTwinActions.findIndex((entry) => entry.id === action.id);
+    if (index >= 0) seedAiTwinActions[index] = action;
+    else seedAiTwinActions.unshift(action);
+    return action;
+  }
+  await db.collection<AiTwinAction>('aiTwinActions').updateOne({ id: action.id }, { $set: action }, { upsert: true });
+  return action;
+};
+
+const detectTwinInjection = (text: string) =>
+  /ignore (all )?(previous|prior) (instructions|rules)|you are now|system prompt|bypass|send money|approve refund|change your permissions/i.test(
+    text,
+  );
+
+app.get('/api/ai/twin', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : null;
+  const config = await getAiTwinConfig(userId, businessId);
+  return res.json({
+    config,
+    capabilities: {
+      may: ['draft replies', 'organise enquiries', 'create reminders', 'prepare quotation drafts', 'answer hours from approved data'],
+      mayNot: [...TWIN_HARD_BLOCKS, 'send without owner review when draft_only'],
+    },
+  });
+});
+
+app.put('/api/ai/twin', async (req, res) => {
+  const parseResult = twinConfigSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid AI Twin settings.' });
+  }
+  const existing = await getAiTwinConfig(
+    parseResult.data.userId,
+    parseResult.data.businessId || null,
+  );
+  const now = new Date().toISOString();
+  const next = await saveAiTwinConfig({
+    ...existing,
+    id: existing.id || `twin-${parseResult.data.userId}`,
+    ownerUserId: parseResult.data.userId,
+    businessId: parseResult.data.businessId === undefined ? existing.businessId : parseResult.data.businessId,
+    enabled: parseResult.data.enabled ?? existing.enabled,
+    displayName: parseResult.data.displayName ?? existing.displayName,
+    permissionTier: parseResult.data.permissionTier ?? existing.permissionTier,
+    allowedTasks: parseResult.data.allowedTasks ?? existing.allowedTasks,
+    dataSources: parseResult.data.dataSources ?? existing.dataSources,
+    operatingHoursText: parseResult.data.operatingHoursText ?? existing.operatingHoursText,
+    dailyActionLimit: parseResult.data.dailyActionLimit ?? existing.dailyActionLimit,
+    blockedActions: [...TWIN_HARD_BLOCKS],
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+  });
+  io.to(`user:${parseResult.data.userId}`).emit('twin:updated', { config: next });
+  return res.json({ config: next });
+});
+
+app.get('/api/ai/twin/actions', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const actions = await readAiTwinActions(userId);
+  return res.json({ actions });
+});
+
+app.post('/api/ai/twin/run', async (req, res) => {
+  const parseResult = twinRunSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid Twin run request.' });
+  }
+  const twin = await getAiTwinConfig(parseResult.data.userId, parseResult.data.businessId || null);
+  if (!twin.enabled) {
+    return res.status(403).json({ error: 'AI Twin is paused. Enable it in settings first.' });
+  }
+
+  const dayStart = new Date();
+  dayStart.setHours(0, 0, 0, 0);
+  const todays = (await readAiTwinActions(parseResult.data.userId)).filter(
+    (entry) => new Date(entry.createdAt).getTime() >= dayStart.getTime() && entry.status !== 'blocked',
+  );
+  if (todays.length >= twin.dailyActionLimit) {
+    return res.status(429).json({ error: 'Daily Twin action limit reached.' });
+  }
+
+  let inputPreview = (parseResult.data.prompt || '').trim();
+  let chatId = parseResult.data.chatId || null;
+  let messageId = parseResult.data.messageId || null;
+  if (messageId) {
+    const message = (await readMessages()).find((entry) => entry.id === messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    const chat = (await readChats()).find((entry) => entry.id === message.chatId);
+    if (!chat || !chat.participants.includes(parseResult.data.userId)) {
+      return res.status(403).json({ error: 'You cannot run the Twin on this message.' });
+    }
+    inputPreview = message.text || inputPreview;
+    chatId = message.chatId;
+  } else if (chatId) {
+    const chat = (await readChats()).find((entry) => entry.id === chatId);
+    if (!chat || !chat.participants.includes(parseResult.data.userId)) {
+      return res.status(403).json({ error: 'You cannot run the Twin on this chat.' });
+    }
+  }
+
+  if (inputPreview && detectTwinInjection(inputPreview)) {
+    const blocked: AiTwinAction = {
+      id: `twa${Date.now()}`,
+      twinId: twin.id,
+      ownerUserId: twin.ownerUserId,
+      task: 'blocked_attempt',
+      status: 'blocked',
+      summary: 'Blocked suspicious instruction that tried to change Twin permissions or force a high-risk action.',
+      requiresApproval: true,
+      chatId,
+      messageId,
+      inputPreview: inputPreview.slice(0, 240),
+      createdAt: new Date().toISOString(),
+      decidedAt: new Date().toISOString(),
+      decidedByUserId: 'system',
+    };
+    await saveAiTwinAction(blocked);
+    io.to(`user:${twin.ownerUserId}`).emit('twin:action', { action: blocked });
+    return res.status(400).json({
+      error: 'That request looked like a permission bypass attempt and was blocked.',
+      action: blocked,
+    });
+  }
+
+  const lower = inputPreview.toLowerCase();
+  const proposed: AiTwinAction[] = [];
+  const now = new Date().toISOString();
+  const pushAction = ( partial: Omit<AiTwinAction, 'id' | 'twinId' | 'ownerUserId' | 'createdAt'> ) => {
+    if (partial.task !== 'blocked_attempt' && !twin.allowedTasks.includes(partial.task)) return;
+    proposed.push({
+      id: `twa${Date.now()}-${proposed.length}`,
+      twinId: twin.id,
+      ownerUserId: twin.ownerUserId,
+      createdAt: now,
+      chatId,
+      messageId,
+      inputPreview: inputPreview.slice(0, 240),
+      ...partial,
+    });
+  };
+
+  // High-risk language → never execute; propose human approval note only
+  if (/refund|send money|discount|pay me|transfer/.test(lower)) {
+    pushAction({
+      task: 'organise_enquiry',
+      status: 'proposed',
+      summary: 'Flagged a sensitive money/refund/discount request for human review.',
+      draftText: 'A customer raised a payment-sensitive request. The Twin will not approve money movement or discounts.',
+      requiresApproval: true,
+      result: 'Awaiting owner review',
+    });
+  } else if (/hour|open|close|are you open/.test(lower) && twin.allowedTasks.includes('answer_hours')) {
+    const hours = twin.operatingHoursText
+      || (await businessesForUser(twin.ownerUserId)).find((entry) => entry.ownerUserId === twin.ownerUserId)?.hours
+      || '';
+    pushAction({
+      task: 'answer_hours',
+      status: 'proposed',
+      summary: 'Draft hours reply from approved business data.',
+      draftText: hours
+        ? `Automated draft (AI Twin): Our hours are ${hours}.`
+        : 'Automated draft (AI Twin): Hours are not in approved data yet — please confirm with the owner.',
+      requiresApproval: twin.permissionTier === 'draft_only',
+    });
+  } else if (/quote|quotation|price list|how much for/.test(lower) && twin.allowedTasks.includes('prepare_quotation')) {
+    pushAction({
+      task: 'prepare_quotation',
+      status: 'proposed',
+      summary: 'Prepare a quotation draft for owner review (no prices invented).',
+      draftText: 'Automated draft (AI Twin): I can prepare a quotation from catalogue items you select. No price will be invented — please confirm line items.',
+      requiresApproval: true,
+    });
+  } else if (twin.allowedTasks.includes('draft_reply')) {
+    const suggestions = buildSuggestedReplies(inputPreview || 'Hello', 'professional');
+    pushAction({
+      task: 'draft_reply',
+      status: 'proposed',
+      summary: 'Draft a reply for the owner to edit and send.',
+      draftText: `Automated draft (AI Twin — not the owner): ${suggestions[0]?.text || 'Thanks for your message. I will get back to you shortly.'}`,
+      requiresApproval: twin.permissionTier === 'draft_only',
+    });
+  }
+
+  if (twin.allowedTasks.includes('create_reminder') && /follow up|remind|later|tomorrow/.test(lower)) {
+    pushAction({
+      task: 'create_reminder',
+      status: 'proposed',
+      summary: 'Create a follow-up reminder draft.',
+      draftText: 'Reminder draft: Follow up with this customer within 24 hours.',
+      requiresApproval: true,
+    });
+  }
+
+  if (!proposed.length) {
+    pushAction({
+      task: 'organise_enquiry',
+      status: 'proposed',
+      summary: 'Logged enquiry for human handling — Twin was uncertain.',
+      draftText: 'The Twin is unsure and stopped for human review.',
+      requiresApproval: true,
+    });
+  }
+
+  for (const action of proposed) {
+    await saveAiTwinAction(action);
+    io.to(`user:${twin.ownerUserId}`).emit('twin:action', { action });
+  }
+
+  return res.status(201).json({
+    actions: proposed,
+    twin: { id: twin.id, displayName: twin.displayName, permissionTier: twin.permissionTier },
+    disclosure: 'AI Twin drafts are labelled as automated and are not the owner speaking secretly.',
+    autoSend: false,
+    notice: 'Draft-only by default. Twin cannot send money, approve refunds, or invent prices.',
+  });
+});
+
+app.post('/api/ai/twin/actions/:actionId/approve', async (req, res) => {
+  const parseResult = twinActionDecisionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const actions = await readAiTwinActions(parseResult.data.userId);
+  const existing = actions.find((entry) => entry.id === req.params.actionId);
+  if (!existing) return res.status(404).json({ error: 'Action not found' });
+  if (existing.ownerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You cannot approve this Twin action.' });
+  }
+  if (existing.status === 'blocked') {
+    return res.status(400).json({ error: 'Blocked actions cannot be approved.' });
+  }
+  const updated: AiTwinAction = {
+    ...existing,
+    status: 'executed_draft',
+    requiresApproval: false,
+    decidedAt: new Date().toISOString(),
+    decidedByUserId: parseResult.data.userId,
+    result: parseResult.data.note || 'Approved as draft for the owner to send manually.',
+  };
+  await saveAiTwinAction(updated);
+  io.to(`user:${updated.ownerUserId}`).emit('twin:action', { action: updated });
+  return res.json({
+    action: updated,
+    autoSend: false,
+    notice: 'Approved draft only. The Twin still does not send the message for you.',
+  });
+});
+
+app.post('/api/ai/twin/actions/:actionId/reject', async (req, res) => {
+  const parseResult = twinActionDecisionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const actions = await readAiTwinActions(parseResult.data.userId);
+  const existing = actions.find((entry) => entry.id === req.params.actionId);
+  if (!existing) return res.status(404).json({ error: 'Action not found' });
+  if (existing.ownerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You cannot reject this Twin action.' });
+  }
+  const updated: AiTwinAction = {
+    ...existing,
+    status: 'rejected',
+    decidedAt: new Date().toISOString(),
+    decidedByUserId: parseResult.data.userId,
+    result: parseResult.data.note || 'Rejected by owner',
+  };
+  await saveAiTwinAction(updated);
+  io.to(`user:${updated.ownerUserId}`).emit('twin:action', { action: updated });
+  return res.json({ action: updated });
+});
+
 app.post('/api/catalog/:itemId/feature', async (req, res) => {
   const items = await readCatalogItems();
   const existing = items.find((item) => item.id === req.params.itemId);
@@ -8893,6 +9343,12 @@ app.post('/api/messages', async (req, res) => {
   if (!chat || !canAccessChat) {
     return res.status(404).json({ error: 'Chat not found' });
   }
+  if (chat.communityId) {
+    const roomPost = await assertCommunityRoomCanPost(communitiesDeps, chat.id, payload.senderId);
+    if (!roomPost.ok) {
+      return res.status(roomPost.status).json({ error: roomPost.error });
+    }
+  }
   if (sendingAs !== space) {
     return res.status(409).json({
       error: space === 'personal'
@@ -8915,6 +9371,19 @@ app.post('/api/messages', async (req, res) => {
   const anonymousDay = payload.anonymous ? anonymousDayKey() : undefined;
   let anonymousUsed = 0;
   if (payload.anonymous) {
+    // Room must opt in; display identity is masked but moderators may still review reports.
+    if (chat.communityId) {
+      const room = await findCommunityRoomByChatId(communitiesDeps, chat.id);
+      if (!room || room.allowAnonymous !== true) {
+        return res.status(403).json({
+          error: 'Anonymous posting is not enabled in this room.',
+        });
+      }
+    } else if (chat.allowAnonymous !== true) {
+      return res.status(403).json({
+        error: 'Anonymous posting is not enabled in this room.',
+      });
+    }
     anonymousUsed = (await readMessages()).filter((item) =>
       item.chatId === payload.chatId
       && item.senderId === payload.senderId
@@ -9130,12 +9599,87 @@ app.delete('/api/messages/:messageId', async (req, res) => {
     await collectionsFor(db).messages.replaceOne({ id: current.id }, nextMessage);
   }
 
-  io.emit('message:deleted', {
-    message: nextMessage,
-    scope: parseResult.data.scope,
-    userId: parseResult.data.userId,
+  const chatForDelete = (await readChats()).find((item) => item.id === nextMessage.chatId);
+  if (chatForDelete && nextMessage.anonymous) {
+    for (const participantId of chatForDelete.participants) {
+      io.to(`user:${participantId}`).emit('message:deleted', {
+        message: presentMessage(nextMessage, participantId),
+        scope: parseResult.data.scope,
+        userId: parseResult.data.userId,
+      });
+    }
+  } else {
+    io.emit('message:deleted', {
+      message: nextMessage,
+      scope: parseResult.data.scope,
+      userId: parseResult.data.userId,
+    });
+  }
+  return res.json({ message: presentMessage(nextMessage, parseResult.data.userId) });
+});
+
+app.post('/api/messages/:messageId/reveal-author', async (req, res) => {
+  const parseResult = revealAuthorSchema.safeParse(req.body ?? {});
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid reveal payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const actorUserId = parseResult.data.userId?.trim() || await resolveRequestUserId(req);
+  if (!actorUserId) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+
+  const message = (await readMessages()).find((item) => item.id === req.params.messageId);
+  if (!message) {
+    return res.status(404).json({ error: 'Message not found' });
+  }
+  if (!message.anonymous) {
+    return res.status(400).json({ error: 'Only anonymous messages can be revealed this way.' });
+  }
+
+  const chat = (await readChats()).find((item) => item.id === message.chatId);
+  if (!chat) {
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+  if (!chat.participants.includes(actorUserId) && !chatAdmins(chat).includes(actorUserId)) {
+    return res.status(403).json({ error: 'You cannot access this chat.' });
+  }
+
+  if (chat.communityId) {
+    const canModerate = await actorCanModerateCommunity(communitiesDeps, chat.communityId, actorUserId);
+    if (!canModerate) {
+      return res.status(403).json({
+        error: 'Only community moderators and above can reveal anonymous authors.',
+      });
+    }
+    const room = await findCommunityRoomByChatId(communitiesDeps, chat.id);
+    await appendCommunityAudit(communitiesDeps, {
+      communityId: chat.communityId,
+      actorUserId,
+      action: 'anonymous.author_revealed',
+      detail: 'Restricted identity reveal for moderation',
+      targetUserId: message.senderId,
+      roomId: room?.id ?? null,
+      messageId: message.id,
+      chatId: chat.id,
+    });
+  } else if (!chatAdmins(chat).includes(actorUserId)) {
+    return res.status(403).json({
+      error: 'Only group admins can reveal anonymous authors in this room.',
+    });
+  }
+
+  const author = (await readUsers()).find((user) => user.id === message.senderId);
+  return res.json({
+    authorUserId: message.senderId,
+    authorName: author?.name || undefined,
+    messageId: message.id,
+    chatId: chat.id,
+    notice: 'Reveals are logged for moderation accountability.',
   });
-  return res.json({ message: nextMessage });
 });
 
 app.patch('/api/messages/:messageId/receipt', async (req, res) => {
@@ -9427,6 +9971,62 @@ mountAdmin(app, {
   countryKeyFor: (user, profile) => countryKeyFor(user as User | undefined, profile as Profile | null | undefined),
   hashPin,
 });
+
+communitiesDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  readUsers: async () => (await readUsers()).map((user) => ({ id: user.id, name: user.name, avatar: user.avatar })),
+  usersHaveBlock,
+  saveChatRecord: async (chat) => saveChatRecord(chat as Chat) as Promise<CommunityChat>,
+  readChats: async () => (await readChats()) as CommunityChat[],
+  deleteChatById: async (chatId) => {
+    const db = await getDb();
+    if (!db) {
+      const index = seedChats.findIndex((item) => item.id === chatId);
+      if (index >= 0) seedChats.splice(index, 1);
+      return;
+    }
+    await collectionsFor(db).chats.deleteOne({ id: chatId });
+  },
+};
+
+mountCommunities(app, communitiesDeps);
+
+voiceRoomsDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  readUsers: async () => (await readUsers()).map((user) => ({ id: user.id, name: user.name, avatar: user.avatar })),
+};
+mountVoiceRooms(app, voiceRoomsDeps);
+
+gamesDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  readUsers: async () => (await readUsers()).map((user) => ({ id: user.id, name: user.name, avatar: user.avatar })),
+  persistGameResultMessage: async ({ chatId, hostUserId, text, sessionId }) => {
+    const chat = (await readChats()).find((entry) => entry.id === chatId);
+    if (!chat) return;
+    const message: Message = {
+      id: `m${Date.now()}-game`,
+      chatId: chat.id,
+      senderId: hostUserId,
+      clientRef: `game-result-${sessionId}`,
+      kind: 'text',
+      text,
+      mediaUrls: [],
+      sentAt: new Date().toISOString(),
+      state: 'sent',
+      automated: true,
+      autoReplySource: 'game-result',
+    };
+    await persistMessage(message);
+    await emitMessageToChat(message, chat, null);
+  },
+};
+registerGamesApi(app, gamesDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
