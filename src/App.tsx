@@ -34,6 +34,9 @@ type Message = {
   callKind?: 'audio' | 'video';
   callState?: 'missed' | 'declined' | 'completed';
   deletedForEveryone?: boolean;
+  automated?: boolean;
+  documentId?: string;
+  documentKind?: 'quotation' | 'invoice';
 };
 
 type Chat = {
@@ -111,9 +114,76 @@ type CommerceOrder = {
   currency: string;
   state: OrderState;
   items: Array<{ title: string; quantity: number; price: number }>;
+  deliveryReference?: string | null;
+  fulfilmentNote?: string | null;
   createdAt: string;
   updatedAt: string;
 };
+
+type AiTone = 'polite' | 'concise' | 'professional' | 'friendly' | 'apologetic';
+
+type AiSuggestionChip = {
+  id: string;
+  text: string;
+  tone?: AiTone;
+  reason?: string;
+};
+
+type ScamSignal = {
+  code: string;
+  label: string;
+  severity: 'low' | 'medium' | 'high';
+};
+
+type ScamWarningInfo = {
+  risky: boolean;
+  severity: 'low' | 'medium' | 'high';
+  signals: ScamSignal[];
+  advice: string | null;
+};
+
+type SummarizeScope = 'unread' | 'recent';
+
+type ChatSummaryItem = {
+  messageId: string;
+  text: string;
+  sentAt?: string;
+  senderId?: string;
+  suggested?: boolean;
+};
+
+type ChatSummary = {
+  overview: string;
+  questions: ChatSummaryItem[];
+  decisions: ChatSummaryItem[];
+  actionSuggestions: ChatSummaryItem[];
+  highlights: ChatSummaryItem[];
+  messageCount?: number;
+  method?: string;
+  notice?: string;
+};
+
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type BrowserSpeechRecognitionEvent = {
+  resultIndex: number;
+  results: ArrayLike<{
+    isFinal: boolean;
+    0: { transcript: string };
+  }>;
+};
+
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
 
 type SaleReceipt = {
   id: string;
@@ -206,6 +276,8 @@ type CustomerOrderSummary = {
   currency: string;
   createdAt: string;
   itemTitle?: string;
+  deliveryReference?: string | null;
+  fulfilmentNote?: string | null;
 };
 
 type CustomerPreference = {
@@ -217,7 +289,121 @@ type CustomerPreference = {
   displayNameOnSellerSide?: string;
 };
 
-type BusinessHubTab = 'catalog' | 'dashboard' | 'orders' | 'receipts' | 'inventory' | 'customers';
+type AutoReplyRule = {
+  id: string;
+  keywords: string[];
+  response: string;
+  enabled: boolean;
+};
+
+type AutoReplyConfig = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  greetingEnabled: boolean;
+  greetingText: string;
+  awayEnabled: boolean;
+  awayText: string;
+  hoursText: string;
+  humanHandoverKeywords: string[];
+  rules: AutoReplyRule[];
+  cooldownSeconds: number;
+  pausedChatIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AutoReplyLog = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  chatId: string;
+  customerUserId: string;
+  triggerMessageId: string;
+  replyMessageId: string;
+  source: 'greeting' | 'away' | 'hours' | 'rule' | 'handover';
+  ruleId?: string | null;
+  createdAt: string;
+};
+
+type CommerceDocKind = 'quotation' | 'invoice';
+type CommerceDocState =
+  | 'draft'
+  | 'sent'
+  | 'accepted'
+  | 'rejected'
+  | 'expired'
+  | 'converted'
+  | 'paid'
+  | 'overdue'
+  | 'voided';
+
+type CommerceDocLine = {
+  id?: string;
+  title: string;
+  quantity: number;
+  unitPrice: number;
+  amount?: number;
+};
+
+type CommerceDocument = {
+  id: string;
+  kind: CommerceDocKind;
+  number: string;
+  sellerUserId: string;
+  customerUserId?: string | null;
+  customerName: string;
+  chatId?: string | null;
+  currency: string;
+  lines: CommerceDocLine[];
+  subtotal: number;
+  discountAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  notes?: string;
+  paymentTerms?: string;
+  expiresAt?: string | null;
+  dueAt?: string | null;
+  state: CommerceDocState;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BroadcastSegment = 'opted_in' | 'repeat_buyers' | 'all_customers' | 'tag';
+
+type BroadcastCampaign = {
+  id: string;
+  sellerUserId: string;
+  text: string;
+  segment: BroadcastSegment;
+  tag?: string | null;
+  status: 'draft' | 'sending' | 'sent' | 'cancelled' | 'failed';
+  audienceCount: number;
+  sentCount: number;
+  failedCount: number;
+  scheduledAt?: string | null;
+  sentAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BroadcastAudiencePreview = {
+  opted_in: number;
+  repeat_buyers: number;
+  all_customers: number;
+};
+
+type BusinessHubTab =
+  | 'catalog'
+  | 'dashboard'
+  | 'orders'
+  | 'receipts'
+  | 'inventory'
+  | 'customers'
+  | 'autoreplies'
+  | 'documents'
+  | 'broadcasts';
 
 type StatusItem = {
   id: string;
@@ -288,6 +474,7 @@ type UpdateGroup = {
 };
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:4000';
+const AI_TONES: AiTone[] = ['polite', 'concise', 'professional', 'friendly', 'apologetic'];
 const DEVICE_STORAGE_KEY = 'zynkup-web-device-id';
 const SETTINGS_STORAGE_KEY = 'zynkup-web-app-settings';
 const FAVORITES_STORAGE_KEY = 'zynkup-web-favorite-chats';
@@ -315,7 +502,7 @@ const DEFAULT_APP_SETTINGS = {
 
 const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top' },
-  { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, sales, orders, and inventory' },
+  { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, invoices, quotations, broadcasts, and sales' },
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations' },
   { id: 'account', title: 'Account', subtitle: 'Profile and security' },
   { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, marketing' },
@@ -445,6 +632,11 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   callKind: message.callKind,
   callState: message.callState,
   deletedForEveryone: Boolean(message.deletedForEveryone),
+  automated: Boolean(message.automated),
+  documentId: message.documentId || undefined,
+  documentKind: message.documentKind === 'quotation' || message.documentKind === 'invoice'
+    ? message.documentKind
+    : undefined,
 });
 
 const describeCallMessage = (message: Message) => {
@@ -586,6 +778,40 @@ function App() {
   });
   const [customerNoteDraft, setCustomerNoteDraft] = useState('');
   const [customerPrefs, setCustomerPrefs] = useState<CustomerPreference[]>([]);
+  const [autoReplyConfig, setAutoReplyConfig] = useState<AutoReplyConfig | null>(null);
+  const [autoReplyLogs, setAutoReplyLogs] = useState<AutoReplyLog[]>([]);
+  const [autoReplyRuleDraft, setAutoReplyRuleDraft] = useState({ keywords: '', response: '' });
+  const [commerceDocuments, setCommerceDocuments] = useState<CommerceDocument[]>([]);
+  const [documentKindFilter, setDocumentKindFilter] = useState<'' | CommerceDocKind>('');
+  const [documentForm, setDocumentForm] = useState({
+    kind: 'quotation' as CommerceDocKind,
+    customerName: '',
+    customerUserId: '',
+    chatId: '',
+    notes: '',
+    paymentTerms: '',
+    discountAmount: '',
+    taxAmount: '',
+    expiresAt: '',
+    dueAt: '',
+    sendNow: false,
+    lineTitle: '',
+    lineQuantity: '1',
+    lineUnitPrice: '',
+  });
+  const [documentExtraLines, setDocumentExtraLines] = useState<Array<{ title: string; quantity: string; unitPrice: string }>>([]);
+  const [broadcastCampaigns, setBroadcastCampaigns] = useState<BroadcastCampaign[]>([]);
+  const [broadcastAudience, setBroadcastAudience] = useState<BroadcastAudiencePreview>({
+    opted_in: 0,
+    repeat_buyers: 0,
+    all_customers: 0,
+  });
+  const [broadcastForm, setBroadcastForm] = useState({
+    text: '',
+    segment: 'opted_in' as BroadcastSegment,
+    tag: '',
+    sendNow: true,
+  });
   const [favoriteChatIds, setFavoriteChatIds] = useState<string[]>([]);
   const [mutedChatIds, setMutedChatIds] = useState<string[]>([]);
   const [archivedChatIds, setArchivedChatIds] = useState<string[]>([]);
@@ -595,6 +821,18 @@ function App() {
   const [messageActionTarget, setMessageActionTarget] = useState<Message | null>(null);
   const [peerTypingByChat, setPeerTypingByChat] = useState<Record<string, boolean>>({});
   const [toastMessage, setToastMessage] = useState('');
+  const [aiTone, setAiTone] = useState<AiTone>('polite');
+  const [aiSuggestionChips, setAiSuggestionChips] = useState<AiSuggestionChip[]>([]);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [scamWarningsByKey, setScamWarningsByKey] = useState<Record<string, ScamWarningInfo>>({});
+  const [summaryVisible, setSummaryVisible] = useState(false);
+  const [summaryScope, setSummaryScope] = useState<SummarizeScope>('unread');
+  const [chatSummary, setChatSummary] = useState<ChatSummary | null>(null);
+  const [summaryNotice, setSummaryNotice] = useState('');
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
+  const [isDictating, setIsDictating] = useState(false);
+  const [dictationNotice, setDictationNotice] = useState('');
   const [feedbackDraft, setFeedbackDraft] = useState('');
   const [catalogForm, setCatalogForm] = useState({
     title: '',
@@ -638,7 +876,20 @@ function App() {
   const statusGroupIndexRef = useRef<number | null>(null);
   const statusItemIndexRef = useRef(0);
   const activeCallRef = useRef<CallItem | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const dictateBaseDraftRef = useRef('');
+  const dictateFinalRef = useRef('');
+  const dictateStoppingRef = useRef(false);
+  const focusedMessageTimeoutRef = useRef<number | null>(null);
   const [chatItems, setChatItems] = useState<Chat[]>(initialChats);
+  const speechRecognitionSupported = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const host = window as Window & {
+      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    };
+    return Boolean(host.SpeechRecognition || host.webkitSpeechRecognition);
+  }, []);
   const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? null;
   const messages = activeChat ? messagesByChat[activeChat.id] ?? [] : [];
   const activeStatusGroup = activeStatusGroupIndex === null ? null : updatesFeed[activeStatusGroupIndex] ?? null;
@@ -1485,6 +1736,20 @@ function App() {
         }
       }
     });
+    socket.on('message:scamWarning', (payload: {
+      chatId?: string;
+      messageId?: string;
+      warning?: ScamWarningInfo;
+    }) => {
+      if (!payload?.chatId || !payload?.messageId || !payload.warning?.risky) {
+        return;
+      }
+      const key = `${payload.chatId}:${payload.messageId}`;
+      setScamWarningsByKey((current) => ({ ...current, [key]: payload.warning! }));
+      const advice = payload.warning.advice || 'Possible scam signals detected. Do not share PINs or OTPs.';
+      showToast(advice, 5000);
+    });
+
     socket.on('message:deleted', ({ message, scope, userId }) => {
       if (!message?.chatId) {
         return;
@@ -1611,6 +1876,33 @@ function App() {
       }
       setBusinessCustomers((current) => [customer, ...current.filter((entry) => entry.id !== customer.id)]);
       setSelectedCustomer((current) => (current?.id === customer.id ? customer : current));
+    });
+    socket.on('autoReply:updated', ({ config }: { config: AutoReplyConfig }) => {
+      if (config) setAutoReplyConfig(config);
+    });
+    socket.on('autoReply:sent', ({ log, message: autoMessage }: { log?: AutoReplyLog; message?: any }) => {
+      if (log?.id) {
+        setAutoReplyLogs((current) => [log, ...current.filter((entry) => entry.id !== log.id)].slice(0, 100));
+      }
+      if (autoMessage?.chatId && autoMessage?.id) {
+        reconcileIncomingMessage(autoMessage.chatId, autoMessage);
+      }
+    });
+    socket.on('document:updated', ({ document }: { document: CommerceDocument }) => {
+      if (!document?.id) return;
+      setCommerceDocuments((current) => {
+        const exists = current.some((entry) => entry.id === document.id);
+        if (!exists) return [document, ...current];
+        return current.map((entry) => (entry.id === document.id ? document : entry));
+      });
+    });
+    socket.on('broadcast:updated', ({ campaign }: { campaign: BroadcastCampaign }) => {
+      if (!campaign?.id) return;
+      setBroadcastCampaigns((current) => {
+        const exists = current.some((entry) => entry.id === campaign.id);
+        if (!exists) return [campaign, ...current];
+        return current.map((entry) => (entry.id === campaign.id ? campaign : entry));
+      });
     });
     socket.on('call:created', (call) => {
       if ((call.participantIds ?? []).includes(currentUserId)) {
@@ -1821,6 +2113,34 @@ function App() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, selectedChatId]);
+
+  useEffect(() => {
+    setAiSuggestionChips([]);
+    setSummaryVisible(false);
+    setChatSummary(null);
+    setSummaryNotice('');
+    setFocusedMessageId(null);
+    setDictationNotice('');
+  }, [selectedChatId]);
+
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onend = null;
+        try {
+          recognitionRef.current.abort();
+        } catch {
+          // ignore
+        }
+        recognitionRef.current = null;
+      }
+      if (focusedMessageTimeoutRef.current) {
+        window.clearTimeout(focusedMessageTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (document.visibilityState !== 'visible' || activeView !== 'chats' || !appSettings.readReceiptsEnabled) {
@@ -2290,11 +2610,32 @@ function App() {
 
   const updateOrderState = async (orderId: string, state: OrderState) => {
     if (!currentUserId) return;
+    let deliveryReference: string | undefined;
+    let fulfilmentNote: string | undefined;
+    if (state === 'dispatched') {
+      const referenceInput = window.prompt('Delivery reference (tracking / courier ref)');
+      if (referenceInput === null) return;
+      const trimmedRef = referenceInput.trim();
+      if (!trimmedRef) {
+        showToast('Delivery reference is required when marking dispatched');
+        return;
+      }
+      deliveryReference = trimmedRef;
+      const noteInput = window.prompt('Fulfilment note (optional)');
+      if (noteInput !== null && noteInput.trim()) {
+        fulfilmentNote = noteInput.trim();
+      }
+    }
     try {
       const response = await fetch(`${API_BASE_URL}/api/orders/${encodeURIComponent(orderId)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUserId, state }),
+        body: JSON.stringify({
+          userId: currentUserId,
+          state,
+          ...(deliveryReference ? { deliveryReference } : {}),
+          ...(fulfilmentNote !== undefined ? { fulfilmentNote } : {}),
+        }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -2313,6 +2654,260 @@ function App() {
     } catch {
       showToast('Could not update order');
     }
+  };
+
+  const requestSuggestedReplies = async () => {
+    if (!currentUserId || !activeChat || aiBusy) return;
+    setAiBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/suggest-replies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          chatId: activeChat.id,
+          tone: aiTone,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not suggest replies');
+        return;
+      }
+      const suggestions = (payload.suggestions ?? []) as AiSuggestionChip[];
+      setAiSuggestionChips(suggestions);
+      if (!suggestions.length) {
+        showToast('No suggestions available');
+      } else if (payload.notice) {
+        showToast(payload.notice, 3500);
+      }
+    } catch {
+      showToast('Could not suggest replies');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const requestRewrite = async () => {
+    const text = messageDraft.trim();
+    if (!currentUserId || !text || aiBusy) return;
+    setAiBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/rewrite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          tone: aiTone,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not rewrite');
+        return;
+      }
+      const variants = ((payload.variants ?? []) as Array<{ id: string; text: string; tone?: AiTone }>).map(
+        (entry) => ({ id: entry.id, text: entry.text, tone: entry.tone }),
+      );
+      setAiSuggestionChips(variants);
+      if (!variants.length) {
+        showToast('No rewrite variants returned');
+      } else if (payload.notice) {
+        showToast(payload.notice, 3500);
+      }
+    } catch {
+      showToast('Could not rewrite');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const focusSummaryMessage = (messageId: string) => {
+    if (!messageId) return;
+    const node = document.getElementById(`message-${messageId}`);
+    if (!node) {
+      showToast('Message is not loaded in this view');
+      return;
+    }
+    setFocusedMessageId(messageId);
+    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (focusedMessageTimeoutRef.current) {
+      window.clearTimeout(focusedMessageTimeoutRef.current);
+    }
+    focusedMessageTimeoutRef.current = window.setTimeout(() => setFocusedMessageId(null), 2400);
+  };
+
+  const requestChatSummary = async (scope: SummarizeScope = summaryScope) => {
+    if (!currentUserId || !activeChat || summaryBusy) return;
+    setSummaryScope(scope);
+    setSummaryVisible(true);
+    setSummaryBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          chatId: activeChat.id,
+          scope,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not summarise chat');
+        return;
+      }
+      const summary = (payload.summary ?? null) as ChatSummary | null;
+      setChatSummary(summary);
+      const notice = summary?.notice || payload.notice || '';
+      setSummaryNotice(notice);
+      if (notice) {
+        showToast(notice, 4000);
+      }
+    } catch {
+      showToast('Could not summarise chat');
+    } finally {
+      setSummaryBusy(false);
+    }
+  };
+
+  const composeDictationDraft = (base: string, finalText: string, interimText = '') => {
+    const parts = [base.trim(), finalText.trim(), interimText.trim()].filter(Boolean);
+    return parts.join(parts.length > 1 ? ' ' : '');
+  };
+
+  const finishDictation = async (rawText: string) => {
+    const text = rawText.trim();
+    if (!text) {
+      setDictationNotice('Review before send');
+      showToast('No speech captured — review before send');
+      return;
+    }
+    if (!currentUserId) {
+      setMessageDraft(text);
+      setDictationNotice('Review before send');
+      showToast('Review before send', 3500);
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/dictate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, text }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && typeof payload.text === 'string' && payload.text.trim()) {
+        setMessageDraft(payload.text.trim());
+        setDictationNotice(payload.notice || 'Review before send');
+        showToast(payload.notice || 'Review before send', 4000);
+        return;
+      }
+    } catch {
+      // fall through to local draft
+    }
+    setMessageDraft(text);
+    setDictationNotice('Review before send');
+    showToast('Review before send', 3500);
+  };
+
+  const stopDictation = () => {
+    dictateStoppingRef.current = true;
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      try {
+        recognition.stop();
+      } catch {
+        // ignore
+      }
+    }
+    setIsDictating(false);
+  };
+
+  const startDictation = () => {
+    if (!speechRecognitionSupported) {
+      showToast('Speech recognition unavailable in this browser');
+      return;
+    }
+    if (isDictating) {
+      stopDictation();
+      return;
+    }
+
+    const host = window as Window & {
+      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    };
+    const RecognitionCtor = host.SpeechRecognition || host.webkitSpeechRecognition;
+    if (!RecognitionCtor) {
+      showToast('Speech recognition unavailable in this browser');
+      return;
+    }
+
+    const recognition = new RecognitionCtor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = navigator.language || 'en-US';
+    dictateBaseDraftRef.current = messageDraft;
+    dictateFinalRef.current = '';
+    dictateStoppingRef.current = false;
+    recognitionRef.current = recognition;
+
+    recognition.onresult = (event) => {
+      let interim = '';
+      let finalChunk = '';
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result[0]?.transcript || '';
+        if (result.isFinal) {
+          finalChunk += `${transcript} `;
+        } else {
+          interim += transcript;
+        }
+      }
+      if (finalChunk.trim()) {
+        dictateFinalRef.current = [dictateFinalRef.current, finalChunk.trim()].filter(Boolean).join(' ');
+      }
+      setMessageDraft(
+        composeDictationDraft(dictateBaseDraftRef.current, dictateFinalRef.current, interim),
+      );
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === 'aborted' || event.error === 'no-speech') {
+        return;
+      }
+      showToast(event.error ? `Dictation error: ${event.error}` : 'Dictation failed');
+      setIsDictating(false);
+    };
+
+    recognition.onend = () => {
+      recognitionRef.current = null;
+      setIsDictating(false);
+      const composed = composeDictationDraft(dictateBaseDraftRef.current, dictateFinalRef.current);
+      if (dictateStoppingRef.current || composed.trim()) {
+        void finishDictation(composed);
+      }
+      dictateStoppingRef.current = false;
+    };
+
+    try {
+      recognition.start();
+      setIsDictating(true);
+      setDictationNotice('Listening… Review before send');
+    } catch {
+      showToast('Could not start dictation');
+      recognitionRef.current = null;
+      setIsDictating(false);
+    }
+  };
+
+  const toggleDictation = () => {
+    if (isDictating) {
+      stopDictation();
+      return;
+    }
+    startDictation();
   };
 
   const loadSaleReceipts = async () => {
@@ -2402,6 +2997,325 @@ function App() {
     } catch {
       showToast('Could not load customers');
     }
+  };
+
+  const loadAutoReplyConfig = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/auto-replies?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutoReplyConfig(payload.config || null);
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadAutoReplyLogs = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/auto-replies/logs?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutoReplyLogs(payload.logs || []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const saveAutoReplyConfig = async (
+    patch: Partial<{
+      enabled: boolean;
+      greetingEnabled: boolean;
+      greetingText: string;
+      awayEnabled: boolean;
+      awayText: string;
+      hoursText: string;
+      humanHandoverKeywords: string[];
+      rules: AutoReplyRule[];
+      cooldownSeconds: number;
+      pausedChatIds: string[];
+    }> = {},
+  ) => {
+    if (!currentUserId) return;
+    const base = autoReplyConfig;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auto-replies`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          enabled: base?.enabled,
+          greetingEnabled: base?.greetingEnabled,
+          greetingText: base?.greetingText,
+          awayEnabled: base?.awayEnabled,
+          awayText: base?.awayText,
+          hoursText: base?.hoursText,
+          humanHandoverKeywords: base?.humanHandoverKeywords,
+          rules: base?.rules || [],
+          cooldownSeconds: base?.cooldownSeconds,
+          ...patch,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save auto-replies');
+        return;
+      }
+      setAutoReplyConfig(payload.config || null);
+      showToast('Auto-replies saved');
+    } catch {
+      showToast('Could not save auto-replies');
+    }
+  };
+
+  const upsertCommerceDocument = (document: CommerceDocument) => {
+    setCommerceDocuments((current) => {
+      const exists = current.some((entry) => entry.id === document.id);
+      if (!exists) return [document, ...current];
+      return current.map((entry) => (entry.id === document.id ? document : entry));
+    });
+  };
+
+  const loadCommerceDocuments = async (kind: '' | CommerceDocKind = documentKindFilter) => {
+    if (!currentUserId) return;
+    try {
+      const query = new URLSearchParams({ userId: currentUserId });
+      if (kind) query.set('kind', kind);
+      const response = await fetch(`${API_BASE_URL}/api/documents?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load documents');
+        return;
+      }
+      setCommerceDocuments(payload.documents ?? []);
+    } catch {
+      showToast('Could not load documents');
+    }
+  };
+
+  const createCommerceDocument = async () => {
+    if (!currentUserId) return;
+    const primaryLine = {
+      title: documentForm.lineTitle.trim(),
+      quantity: Number(documentForm.lineQuantity) || 0,
+      unitPrice: Number(documentForm.lineUnitPrice) || 0,
+    };
+    const extraLines = documentExtraLines
+      .map((line) => ({
+        title: line.title.trim(),
+        quantity: Number(line.quantity) || 0,
+        unitPrice: Number(line.unitPrice) || 0,
+      }))
+      .filter((line) => line.title && line.quantity > 0);
+    const lines = [primaryLine, ...extraLines].filter((line) => line.title && line.quantity > 0);
+    if (!documentForm.customerName.trim() || !lines.length) {
+      showToast('Add a customer name and at least one line item');
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/documents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          kind: documentForm.kind,
+          customerName: documentForm.customerName.trim(),
+          customerUserId: documentForm.customerUserId || undefined,
+          chatId: documentForm.chatId || undefined,
+          lines,
+          discountAmount: documentForm.discountAmount ? Number(documentForm.discountAmount) : undefined,
+          taxAmount: documentForm.taxAmount ? Number(documentForm.taxAmount) : undefined,
+          notes: documentForm.notes.trim() || undefined,
+          paymentTerms: documentForm.paymentTerms.trim() || undefined,
+          expiresAt: documentForm.kind === 'quotation' && documentForm.expiresAt
+            ? documentForm.expiresAt
+            : undefined,
+          dueAt: documentForm.kind === 'invoice' && documentForm.dueAt ? documentForm.dueAt : undefined,
+          sendNow: documentForm.sendNow,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create document');
+        return;
+      }
+      if (payload.document) upsertCommerceDocument(payload.document);
+      setDocumentForm({
+        kind: documentForm.kind,
+        customerName: '',
+        customerUserId: '',
+        chatId: '',
+        notes: '',
+        paymentTerms: '',
+        discountAmount: '',
+        taxAmount: '',
+        expiresAt: '',
+        dueAt: '',
+        sendNow: false,
+        lineTitle: '',
+        lineQuantity: '1',
+        lineUnitPrice: '',
+      });
+      setDocumentExtraLines([]);
+      showToast(documentForm.sendNow ? 'Document sent' : 'Document saved as draft');
+    } catch {
+      showToast('Could not create document');
+    }
+  };
+
+  const runDocumentAction = async (
+    documentId: string,
+    action: 'send' | 'accept' | 'reject' | 'convert' | 'mark-paid',
+    extra: Record<string, unknown> = {},
+  ) => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, ...extra }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || `Could not ${action} document`);
+        return;
+      }
+      if (payload.document) upsertCommerceDocument(payload.document);
+      if (payload.quotation) upsertCommerceDocument(payload.quotation);
+      if (payload.invoice) upsertCommerceDocument(payload.invoice);
+      if (payload.message?.chatId && payload.message?.id) {
+        reconcileIncomingMessage(payload.message.chatId, payload.message);
+      }
+      const actionToasts: Record<typeof action, string> = {
+        send: 'Document sent',
+        accept: 'Document accepted',
+        reject: 'Document rejected',
+        convert: 'Converted to invoice',
+        'mark-paid': 'Marked paid',
+      };
+      showToast(actionToasts[action]);
+    } catch {
+      showToast(`Could not ${action} document`);
+    }
+  };
+
+  const loadBroadcasts = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/broadcasts?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load broadcasts');
+        return;
+      }
+      setBroadcastCampaigns(payload.campaigns ?? []);
+      setBroadcastAudience({
+        opted_in: Number(payload.audiencePreview?.opted_in) || 0,
+        repeat_buyers: Number(payload.audiencePreview?.repeat_buyers) || 0,
+        all_customers: Number(payload.audiencePreview?.all_customers) || 0,
+      });
+    } catch {
+      showToast('Could not load broadcasts');
+    }
+  };
+
+  const createBroadcast = async () => {
+    if (!currentUserId) return;
+    const text = broadcastForm.text.trim();
+    if (!text) {
+      showToast('Write a broadcast message');
+      return;
+    }
+    if (broadcastForm.segment === 'tag' && !broadcastForm.tag.trim()) {
+      showToast('Choose a tag for this segment');
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/broadcasts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          segment: broadcastForm.segment,
+          tag: broadcastForm.segment === 'tag' ? broadcastForm.tag.trim() : undefined,
+          sendNow: broadcastForm.sendNow,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not send broadcast');
+        return;
+      }
+      if (payload.campaign) {
+        setBroadcastCampaigns((current) => [
+          payload.campaign,
+          ...current.filter((entry) => entry.id !== payload.campaign.id),
+        ]);
+      }
+      setBroadcastForm((current) => ({ ...current, text: '', tag: current.segment === 'tag' ? current.tag : '' }));
+      void loadBroadcasts();
+      showToast(broadcastForm.sendNow ? 'Broadcast sent' : 'Broadcast saved');
+    } catch {
+      showToast('Could not send broadcast');
+    }
+  };
+
+  const cancelBroadcast = async (campaignId: string) => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/broadcasts/${encodeURIComponent(campaignId)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not cancel broadcast');
+        return;
+      }
+      if (payload.campaign) {
+        setBroadcastCampaigns((current) =>
+          current.map((entry) => (entry.id === payload.campaign.id ? payload.campaign : entry)),
+        );
+      }
+      showToast('Broadcast cancelled');
+    } catch {
+      showToast('Could not cancel broadcast');
+    }
+  };
+
+  const addAutoReplyRule = async () => {
+    const keywords = autoReplyRuleDraft.keywords
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const response = autoReplyRuleDraft.response.trim();
+    if (!keywords.length || !response) {
+      showToast('Add keywords and a response');
+      return;
+    }
+    const rules: AutoReplyRule[] = [
+      ...(autoReplyConfig?.rules || []),
+      { id: `rule-${Date.now()}`, keywords, response, enabled: true },
+    ];
+    setAutoReplyRuleDraft({ keywords: '', response: '' });
+    await saveAutoReplyConfig({ rules });
+  };
+
+  const removeAutoReplyRule = async (ruleId: string) => {
+    const rules = (autoReplyConfig?.rules || []).filter((rule) => rule.id !== ruleId);
+    await saveAutoReplyConfig({ rules });
   };
 
   const loadCustomerDetail = async (customerId: string) => {
@@ -2800,12 +3714,33 @@ function App() {
     setIsRecording(false);
   };
 
+  const renderDictateButton = () => (
+    <button
+      className={`composer-icon dictate-button ${isDictating ? 'listening' : ''}`}
+      disabled={!speechRecognitionSupported}
+      onClick={() => toggleDictation()}
+      title={
+        speechRecognitionSupported
+          ? isDictating
+            ? 'Stop dictation'
+            : 'Dictate'
+          : 'Speech recognition unavailable in this browser'
+      }
+      type="button"
+    >
+      {isDictating ? 'Stop' : 'Dictate'}
+    </button>
+  );
+
   const renderComposerControls = () => {
     if (messageDraft.trim()) {
       return (
-        <button className="send-button" onClick={sendMessage} type="button">
-          Send
-        </button>
+        <div className="composer-actions">
+          {renderDictateButton()}
+          <button className="send-button" onClick={sendMessage} type="button">
+            Send
+          </button>
+        </div>
       );
     }
 
@@ -2817,6 +3752,7 @@ function App() {
         <button className="composer-icon" onClick={openAttachmentChooser} type="button">
           ＋
         </button>
+        {renderDictateButton()}
         <button
           className={`mic-button ${isRecording ? 'recording' : ''}`}
           onMouseDown={startRecording}
@@ -2828,6 +3764,31 @@ function App() {
         >
           {isRecording ? formatDurationLabel(recordingSeconds) : 'Mic'}
         </button>
+      </div>
+    );
+  };
+
+  const renderSummarySection = (
+    title: string,
+    items: ChatSummaryItem[],
+  ) => {
+    if (!items.length) return null;
+    return (
+      <div className="summary-section">
+        <h4>{title}</h4>
+        <ul>
+          {items.map((item) => (
+            <li key={`${title}-${item.messageId}-${item.text.slice(0, 24)}`}>
+              <button
+                onClick={() => focusSummaryMessage(item.messageId)}
+                title="Jump to message"
+                type="button"
+              >
+                {item.text}
+              </button>
+            </li>
+          ))}
+        </ul>
       </div>
     );
   };
@@ -3076,6 +4037,21 @@ function App() {
           </div>
           <div className="desktop-chat-actions">
             <button
+              className={`summarise-header-button ${summaryVisible ? 'active-header-action' : ''}`}
+              disabled={!currentUserId || summaryBusy}
+              onClick={() => {
+                if (summaryVisible) {
+                  setSummaryVisible(false);
+                  return;
+                }
+                void requestChatSummary(summaryScope);
+              }}
+              title="Summarise chat"
+              type="button"
+            >
+              Summarise
+            </button>
+            <button
               onClick={() => {
                 const action = window.prompt('1 Mute  2 Archive  3 Pin', '1');
                 if (action === '1') {
@@ -3095,11 +4071,55 @@ function App() {
           </div>
         </header>
 
+        {summaryVisible ? (
+          <aside className="chat-summary-panel" aria-label="Chat summary">
+            <div className="chat-summary-toolbar">
+              <div className="chat-summary-scopes">
+                <button
+                  className={summaryScope === 'unread' ? 'active' : ''}
+                  disabled={summaryBusy || !currentUserId}
+                  onClick={() => void requestChatSummary('unread')}
+                  type="button"
+                >
+                  Unread
+                </button>
+                <button
+                  className={summaryScope === 'recent' ? 'active' : ''}
+                  disabled={summaryBusy || !currentUserId}
+                  onClick={() => void requestChatSummary('recent')}
+                  type="button"
+                >
+                  Recent
+                </button>
+              </div>
+              <button onClick={() => setSummaryVisible(false)} type="button">
+                Close
+              </button>
+            </div>
+            {summaryBusy && !chatSummary ? <p className="chat-summary-status">Summarising…</p> : null}
+            {chatSummary ? (
+              <>
+                <p className="chat-summary-overview">{chatSummary.overview}</p>
+                {summaryNotice || chatSummary.notice ? (
+                  <p className="chat-summary-notice" role="note">
+                    {summaryNotice || chatSummary.notice}
+                  </p>
+                ) : null}
+                {renderSummarySection('Questions', chatSummary.questions)}
+                {renderSummarySection('Decisions', chatSummary.decisions)}
+                {renderSummarySection('Action suggestions', chatSummary.actionSuggestions)}
+                {renderSummarySection('Highlights', chatSummary.highlights)}
+              </>
+            ) : null}
+          </aside>
+        ) : null}
+
         <section className="desktop-canvas">
           {messages.map((message) => (
             message.kind === 'call' ? (
               <button
                 className={`call-thread ${describeCallMessage(message).alert ? 'missed' : ''}`}
+                id={`message-${message.id}`}
                 key={message.id}
                 onClick={() => void startCall(message.callKind === 'video' ? 'video' : 'audio', activeChat.peerUserId)}
                 onContextMenu={(event) => {
@@ -3115,7 +4135,8 @@ function App() {
               </button>
             ) : (
             <article
-              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''}`}
+              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''} ${message.automated ? 'automated' : ''} ${focusedMessageId === message.id ? 'summary-focus' : ''}`}
+              id={`message-${message.id}`}
               key={message.id}
               onContextMenu={(event) => {
                 event.preventDefault();
@@ -3124,6 +4145,12 @@ function App() {
                 }
               }}
             >
+              {message.automated ? <span className="automated-badge">Automated reply</span> : null}
+              {message.documentId ? (
+                <span className="document-badge">
+                  {message.documentKind === 'invoice' ? 'Invoice' : message.documentKind === 'quotation' ? 'Quotation' : 'Document'}
+                </span>
+              ) : null}
               {message.replyPreview ? <div className="reply-quote">{message.replyPreview}</div> : null}
               {message.kind === 'image' && message.imageUrl ? (
                 <button className="message-image-button" onClick={() => setMediaViewer(message.imageUrl ?? null)} type="button">
@@ -3138,6 +4165,19 @@ function App() {
               ) : null}
 
               {message.kind !== 'voice' ? <p>{message.text}</p> : null}
+              {(() => {
+                const warning = scamWarningsByKey[`${activeChat.id}:${message.id}`];
+                if (!warning) return null;
+                return (
+                  <div className={`scam-warning severity-${warning.severity}`} role="alert">
+                    <strong>Scam warning</strong>
+                    <span>{warning.advice || 'Be careful with this message.'}</span>
+                    {(warning.signals || []).length ? (
+                      <small>{warning.signals.map((signal) => signal.label).join(' · ')}</small>
+                    ) : null}
+                  </div>
+                );
+              })()}
               <div className="message-meta">
                 <span>{message.time}</span>
                 {appSettings.readReceiptsEnabled ? renderReceipt(message) : null}
@@ -3157,11 +4197,61 @@ function App() {
           </div>
         ) : null}
 
+        <div className="ai-composer-bar">
+          <button
+            disabled={aiBusy || !currentUserId}
+            onClick={() => void requestSuggestedReplies()}
+            type="button"
+          >
+            Suggest reply
+          </button>
+          <label className="ai-tone-select">
+            <span>Tone</span>
+            <select
+              aria-label="Rewrite tone"
+              onChange={(event) => setAiTone(event.target.value as AiTone)}
+              value={aiTone}
+            >
+              {AI_TONES.map((tone) => (
+                <option key={tone} value={tone}>
+                  {tone}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            disabled={aiBusy || !messageDraft.trim() || !currentUserId}
+            onClick={() => void requestRewrite()}
+            type="button"
+          >
+            Rewrite
+          </button>
+        </div>
+
+        {aiSuggestionChips.length ? (
+          <div className="ai-suggestion-chips" aria-label="AI draft suggestions">
+            {aiSuggestionChips.map((chip) => (
+              <button
+                key={chip.id}
+                className="ai-chip"
+                onClick={() => {
+                  setMessageDraft(chip.text);
+                }}
+                title={chip.reason || chip.tone || 'Fill draft'}
+                type="button"
+              >
+                {chip.text}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         <footer className="composer desktop-composer">
           <textarea
             aria-label="Message composer"
             onChange={(event) => {
               setMessageDraft(event.target.value);
+              setDictationNotice('');
               emitTyping(true);
               if (typingTimeoutRef.current) {
                 window.clearTimeout(typingTimeoutRef.current);
@@ -3188,6 +4278,11 @@ function App() {
             type="file"
           />
         </footer>
+        {!speechRecognitionSupported ? (
+          <p className="dictation-notice muted">Dictation unavailable in this browser</p>
+        ) : dictationNotice ? (
+          <p className="dictation-notice" role="status">{dictationNotice}</p>
+        ) : null}
 
         <div className="emoji-quick-row">
           {emojiChoices.map((emoji) => (
@@ -3406,11 +4501,31 @@ function App() {
         { id: 'receipts', label: 'Receipts' },
         { id: 'inventory', label: 'Inventory' },
         { id: 'customers', label: 'Customers' },
+        { id: 'documents', label: 'Documents' },
+        { id: 'broadcasts', label: 'Broadcasts' },
+        { id: 'autoreplies', label: 'Auto-replies' },
       ];
       const consentLabel = (consent: MarketingConsent) =>
         consent === 'opted_in' ? 'Opted in' : consent === 'opted_out' ? 'Opted out' : 'Unknown';
       const isFollowUpDue = (followUpAt?: string | null) =>
         Boolean(followUpAt && new Date(followUpAt).getTime() <= Date.now());
+      const formatMoney = (amount: number, currency = profile.currency || 'GHS') =>
+        `${currency} ${Number(amount || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+      const broadcastAudienceCount =
+        broadcastForm.segment === 'opted_in'
+          ? broadcastAudience.opted_in
+          : broadcastForm.segment === 'repeat_buyers'
+            ? broadcastAudience.repeat_buyers
+            : broadcastForm.segment === 'all_customers'
+              ? broadcastAudience.all_customers
+              : businessCustomers.filter(
+                  (customer) =>
+                    customer.marketingConsent === 'opted_in' &&
+                    customer.tags.some((tag) => tag.toLowerCase() === broadcastForm.tag.trim().toLowerCase()),
+                ).length;
+      const customerTagOptions = Array.from(
+        new Set(businessCustomers.flatMap((customer) => customer.tags || [])),
+      ).filter(Boolean);
       return (
         <>
           <button className="settings-list-row" onClick={() => setActiveView('catalog')} type="button">
@@ -3428,6 +4543,18 @@ function App() {
                   if (tab.id === 'receipts') void loadSaleReceipts();
                   if (tab.id === 'inventory') void loadInventoryAlerts();
                   if (tab.id === 'customers') void loadBusinessCustomers();
+                  if (tab.id === 'documents') {
+                    void loadCommerceDocuments(documentKindFilter);
+                    void loadBusinessCustomers();
+                  }
+                  if (tab.id === 'broadcasts') {
+                    void loadBroadcasts();
+                    void loadBusinessCustomers();
+                  }
+                  if (tab.id === 'autoreplies') {
+                    void loadAutoReplyConfig();
+                    void loadAutoReplyLogs();
+                  }
                 }}
                 type="button"
               >
@@ -3692,6 +4819,12 @@ function App() {
                     <small>
                       {(order.items || []).map((entry) => `${entry.title} ×${entry.quantity}`).join(', ')}
                     </small>
+                    {order.deliveryReference ? (
+                      <small>Delivery ref: {order.deliveryReference}</small>
+                    ) : null}
+                    {order.fulfilmentNote ? (
+                      <small>Fulfilment: {order.fulfilmentNote}</small>
+                    ) : null}
                   </div>
                   <div className="business-product-actions">
                     {sellerOrderActions(order).map(([state, label]) => (
@@ -3918,6 +5051,8 @@ function App() {
                       {order.itemTitle || order.id} · {order.state.replace(/_/g, ' ')} ·{' '}
                       {moneyLabel(order.totalAmount, order.currency)} ·{' '}
                       {new Date(order.createdAt).toLocaleDateString()}
+                      {order.deliveryReference ? ` · Ref ${order.deliveryReference}` : ''}
+                      {order.fulfilmentNote ? ` · ${order.fulfilmentNote}` : ''}
                     </p>
                   ))}
 
@@ -3988,6 +5123,590 @@ function App() {
                   </div>
                 </div>
               ) : null}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'documents' ? (
+            <div className="business-panel">
+              <h3>Invoices & quotations</h3>
+              <p>Create drafts, send to chat, convert quotations, and mark invoices paid.</p>
+              <div className="doc-filter-row">
+                <button
+                  className={documentKindFilter === '' ? 'active' : ''}
+                  onClick={() => {
+                    setDocumentKindFilter('');
+                    void loadCommerceDocuments('');
+                  }}
+                  type="button"
+                >
+                  All
+                </button>
+                <button
+                  className={documentKindFilter === 'quotation' ? 'active' : ''}
+                  onClick={() => {
+                    setDocumentKindFilter('quotation');
+                    void loadCommerceDocuments('quotation');
+                  }}
+                  type="button"
+                >
+                  Quotations
+                </button>
+                <button
+                  className={documentKindFilter === 'invoice' ? 'active' : ''}
+                  onClick={() => {
+                    setDocumentKindFilter('invoice');
+                    void loadCommerceDocuments('invoice');
+                  }}
+                  type="button"
+                >
+                  Invoices
+                </button>
+                <button onClick={() => void loadCommerceDocuments(documentKindFilter)} type="button">
+                  Refresh
+                </button>
+              </div>
+
+              <h3>Create</h3>
+              <select
+                onChange={(event) =>
+                  setDocumentForm((current) => ({
+                    ...current,
+                    kind: event.target.value as CommerceDocKind,
+                  }))
+                }
+                value={documentForm.kind}
+              >
+                <option value="quotation">Quotation</option>
+                <option value="invoice">Invoice</option>
+              </select>
+              <input
+                onChange={(event) =>
+                  setDocumentForm((current) => ({ ...current, customerName: event.target.value }))
+                }
+                placeholder="Customer name"
+                value={documentForm.customerName}
+              />
+              <select
+                onChange={(event) => {
+                  const customerUserId = event.target.value;
+                  const customer = businessCustomers.find((entry) => entry.customerUserId === customerUserId);
+                  const chat = chatItems.find((entry) => entry.peerUserId === customerUserId);
+                  setDocumentForm((current) => ({
+                    ...current,
+                    customerUserId,
+                    customerName: customer?.displayName || current.customerName,
+                    chatId: chat?.id || customer?.chatId || current.chatId,
+                  }));
+                }}
+                value={documentForm.customerUserId}
+              >
+                <option value="">Link customer (optional)</option>
+                {businessCustomers
+                  .filter((customer) => customer.customerUserId)
+                  .map((customer) => (
+                    <option key={customer.id} value={customer.customerUserId || ''}>
+                      {customer.displayName}
+                    </option>
+                  ))}
+              </select>
+              <select
+                onChange={(event) =>
+                  setDocumentForm((current) => ({ ...current, chatId: event.target.value }))
+                }
+                value={documentForm.chatId}
+              >
+                <option value="">Chat to share (optional)</option>
+                {chatItems.map((chat) => (
+                  <option key={chat.id} value={chat.id}>
+                    {chat.name}
+                  </option>
+                ))}
+              </select>
+              <div className="doc-line-row">
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({ ...current, lineTitle: event.target.value }))
+                  }
+                  placeholder="Line item title"
+                  value={documentForm.lineTitle}
+                />
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({
+                      ...current,
+                      lineQuantity: event.target.value.replace(/[^\d.]/g, ''),
+                    }))
+                  }
+                  placeholder="Qty"
+                  value={documentForm.lineQuantity}
+                />
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({
+                      ...current,
+                      lineUnitPrice: event.target.value.replace(/[^\d.]/g, ''),
+                    }))
+                  }
+                  placeholder="Unit price"
+                  value={documentForm.lineUnitPrice}
+                />
+              </div>
+              {documentExtraLines.map((line, index) => (
+                <div className="doc-line-row" key={`extra-line-${index}`}>
+                  <input
+                    onChange={(event) =>
+                      setDocumentExtraLines((current) =>
+                        current.map((entry, entryIndex) =>
+                          entryIndex === index ? { ...entry, title: event.target.value } : entry,
+                        ),
+                      )
+                    }
+                    placeholder="Line item title"
+                    value={line.title}
+                  />
+                  <input
+                    onChange={(event) =>
+                      setDocumentExtraLines((current) =>
+                        current.map((entry, entryIndex) =>
+                          entryIndex === index
+                            ? { ...entry, quantity: event.target.value.replace(/[^\d.]/g, '') }
+                            : entry,
+                        ),
+                      )
+                    }
+                    placeholder="Qty"
+                    value={line.quantity}
+                  />
+                  <input
+                    onChange={(event) =>
+                      setDocumentExtraLines((current) =>
+                        current.map((entry, entryIndex) =>
+                          entryIndex === index
+                            ? { ...entry, unitPrice: event.target.value.replace(/[^\d.]/g, '') }
+                            : entry,
+                        ),
+                      )
+                    }
+                    placeholder="Unit price"
+                    value={line.unitPrice}
+                  />
+                  <button
+                    onClick={() =>
+                      setDocumentExtraLines((current) => current.filter((_, entryIndex) => entryIndex !== index))
+                    }
+                    type="button"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <button
+                onClick={() =>
+                  setDocumentExtraLines((current) => [...current, { title: '', quantity: '1', unitPrice: '' }])
+                }
+                type="button"
+              >
+                Add line
+              </button>
+              <div className="doc-line-row">
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({
+                      ...current,
+                      discountAmount: event.target.value.replace(/[^\d.]/g, ''),
+                    }))
+                  }
+                  placeholder="Discount"
+                  value={documentForm.discountAmount}
+                />
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({
+                      ...current,
+                      taxAmount: event.target.value.replace(/[^\d.]/g, ''),
+                    }))
+                  }
+                  placeholder="Tax"
+                  value={documentForm.taxAmount}
+                />
+              </div>
+              <input
+                onChange={(event) =>
+                  setDocumentForm((current) => ({ ...current, paymentTerms: event.target.value }))
+                }
+                placeholder="Payment terms"
+                value={documentForm.paymentTerms}
+              />
+              {documentForm.kind === 'quotation' ? (
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({ ...current, expiresAt: event.target.value }))
+                  }
+                  placeholder="Expires at (ISO or date)"
+                  type="datetime-local"
+                  value={documentForm.expiresAt}
+                />
+              ) : (
+                <input
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({ ...current, dueAt: event.target.value }))
+                  }
+                  placeholder="Due at"
+                  type="datetime-local"
+                  value={documentForm.dueAt}
+                />
+              )}
+              <textarea
+                onChange={(event) =>
+                  setDocumentForm((current) => ({ ...current, notes: event.target.value }))
+                }
+                placeholder="Notes"
+                value={documentForm.notes}
+              />
+              <label className="settings-toggle-row">
+                <span>
+                  <strong>Send now</strong>
+                  <small>Share into the selected chat immediately.</small>
+                </span>
+                <input
+                  checked={documentForm.sendNow}
+                  onChange={(event) =>
+                    setDocumentForm((current) => ({ ...current, sendNow: event.target.checked }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              <button onClick={() => void createCommerceDocument()} type="button">
+                {documentForm.sendNow ? 'Create & send' : 'Save draft'}
+              </button>
+
+              <h3>Documents</h3>
+              {commerceDocuments.length ? null : <p>No documents yet.</p>}
+              {commerceDocuments.map((doc) => {
+                const isSeller = doc.sellerUserId === currentUserId;
+                const isCustomer = doc.customerUserId === currentUserId;
+                return (
+                  <div className="business-product-row" key={doc.id}>
+                    <div>
+                      <strong>
+                        {doc.kind === 'invoice' ? 'Invoice' : 'Quotation'} {doc.number}
+                      </strong>
+                      <small>
+                        {doc.customerName} · {doc.state} · {formatMoney(doc.totalAmount, doc.currency)}
+                      </small>
+                      <small>{new Date(doc.updatedAt || doc.createdAt).toLocaleString()}</small>
+                    </div>
+                    <div className="business-product-actions">
+                      {isSeller && doc.state === 'draft' ? (
+                        <button onClick={() => void runDocumentAction(doc.id, 'send', { chatId: doc.chatId })} type="button">
+                          Send
+                        </button>
+                      ) : null}
+                      {isSeller &&
+                      doc.kind === 'quotation' &&
+                      (doc.state === 'sent' || doc.state === 'accepted') ? (
+                        <button onClick={() => void runDocumentAction(doc.id, 'convert')} type="button">
+                          Convert
+                        </button>
+                      ) : null}
+                      {isSeller &&
+                      doc.kind === 'invoice' &&
+                      doc.state !== 'paid' &&
+                      doc.state !== 'voided' ? (
+                        <button
+                          onClick={() => void runDocumentAction(doc.id, 'mark-paid', { markCashReceived: true })}
+                          type="button"
+                        >
+                          Mark paid
+                        </button>
+                      ) : null}
+                      {isCustomer && doc.state === 'sent' ? (
+                        <>
+                          <button onClick={() => void runDocumentAction(doc.id, 'accept')} type="button">
+                            Accept
+                          </button>
+                          <button onClick={() => void runDocumentAction(doc.id, 'reject')} type="button">
+                            Reject
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'broadcasts' ? (
+            <div className="business-panel">
+              <h3>Broadcasts</h3>
+              <p>Only opted-in customers receive marketing broadcasts. Rate limit applies.</p>
+              <div className="metric-grid">
+                <div className="metric-card">
+                  <strong>{broadcastAudience.opted_in}</strong>
+                  <span>Opted in</span>
+                </div>
+                <div className="metric-card">
+                  <strong>{broadcastAudience.repeat_buyers}</strong>
+                  <span>Repeat buyers</span>
+                </div>
+                <div className="metric-card">
+                  <strong>{broadcastAudience.all_customers}</strong>
+                  <span>All customers</span>
+                </div>
+              </div>
+              <textarea
+                onChange={(event) =>
+                  setBroadcastForm((current) => ({ ...current, text: event.target.value }))
+                }
+                placeholder="Broadcast message"
+                value={broadcastForm.text}
+              />
+              <select
+                onChange={(event) =>
+                  setBroadcastForm((current) => ({
+                    ...current,
+                    segment: event.target.value as BroadcastSegment,
+                  }))
+                }
+                value={broadcastForm.segment}
+              >
+                <option value="opted_in">Opted in</option>
+                <option value="repeat_buyers">Repeat buyers</option>
+                <option value="all_customers">All customers (opted in)</option>
+                <option value="tag">By tag</option>
+              </select>
+              {broadcastForm.segment === 'tag' ? (
+                <select
+                  onChange={(event) =>
+                    setBroadcastForm((current) => ({ ...current, tag: event.target.value }))
+                  }
+                  value={broadcastForm.tag}
+                >
+                  <option value="">Select tag</option>
+                  {customerTagOptions.map((tag) => (
+                    <option key={tag} value={tag}>
+                      {tag}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+              <small>
+                Audience preview: {broadcastAudienceCount} recipient
+                {broadcastAudienceCount === 1 ? '' : 's'}
+              </small>
+              <label className="settings-toggle-row">
+                <span>
+                  <strong>Send now</strong>
+                  <small>Deliver immediately to the selected segment.</small>
+                </span>
+                <input
+                  checked={broadcastForm.sendNow}
+                  onChange={(event) =>
+                    setBroadcastForm((current) => ({ ...current, sendNow: event.target.checked }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              <button onClick={() => void createBroadcast()} type="button">
+                {broadcastForm.sendNow ? 'Send broadcast' : 'Save draft'}
+              </button>
+              <button onClick={() => void loadBroadcasts()} type="button">
+                Refresh history
+              </button>
+
+              <h3>Campaign history</h3>
+              {broadcastCampaigns.length ? null : <p>No campaigns yet.</p>}
+              {broadcastCampaigns.map((campaign) => (
+                <div className="business-product-row" key={campaign.id}>
+                  <div>
+                    <strong>{campaign.text}</strong>
+                    <small>
+                      {campaign.segment}
+                      {campaign.tag ? ` · ${campaign.tag}` : ''} · {campaign.status} ·{' '}
+                      {campaign.sentCount}/{campaign.audienceCount} sent
+                    </small>
+                    <small>{new Date(campaign.createdAt).toLocaleString()}</small>
+                  </div>
+                  <div className="business-product-actions">
+                    {campaign.status !== 'sent' && campaign.status !== 'cancelled' ? (
+                      <button onClick={() => void cancelBroadcast(campaign.id)} type="button">
+                        Cancel
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'autoreplies' ? (
+            <div className="business-panel">
+              <h3>Auto-replies</h3>
+              <p>
+                Rule-based replies only. No invented prices or stock. Customers can type “human” to
+                pause automation for that chat.
+              </p>
+              {renderSettingsToggle(
+                'Master switch',
+                Boolean(autoReplyConfig?.enabled),
+                (value) => void saveAutoReplyConfig({ enabled: value }),
+                autoReplyConfig?.enabled ? 'Auto-replies are on' : 'Turn on to reply automatically',
+              )}
+
+              <h3>Greeting</h3>
+              {renderSettingsToggle(
+                'First-message greeting',
+                autoReplyConfig?.greetingEnabled !== false,
+                (value) => void saveAutoReplyConfig({ greetingEnabled: value }),
+              )}
+              <textarea
+                onBlur={() =>
+                  void saveAutoReplyConfig({ greetingText: autoReplyConfig?.greetingText || '' })
+                }
+                onChange={(event) =>
+                  setAutoReplyConfig((current) =>
+                    current
+                      ? { ...current, greetingText: event.target.value }
+                      : ({ greetingText: event.target.value } as AutoReplyConfig),
+                  )
+                }
+                placeholder="Thanks for messaging us..."
+                value={autoReplyConfig?.greetingText || ''}
+              />
+
+              <h3>Away message</h3>
+              {renderSettingsToggle(
+                'Away fallback',
+                autoReplyConfig?.awayEnabled !== false,
+                (value) => void saveAutoReplyConfig({ awayEnabled: value }),
+              )}
+              <textarea
+                onBlur={() => void saveAutoReplyConfig({ awayText: autoReplyConfig?.awayText || '' })}
+                onChange={(event) =>
+                  setAutoReplyConfig((current) =>
+                    current
+                      ? { ...current, awayText: event.target.value }
+                      : ({ awayText: event.target.value } as AutoReplyConfig),
+                  )
+                }
+                placeholder="We are away right now..."
+                value={autoReplyConfig?.awayText || ''}
+              />
+
+              <h3>Opening hours</h3>
+              <input
+                onBlur={() => void saveAutoReplyConfig({ hoursText: autoReplyConfig?.hoursText || '' })}
+                onChange={(event) =>
+                  setAutoReplyConfig((current) =>
+                    current
+                      ? { ...current, hoursText: event.target.value }
+                      : ({ hoursText: event.target.value } as AutoReplyConfig),
+                  )
+                }
+                placeholder="Mon–Sat 9am–6pm"
+                value={autoReplyConfig?.hoursText || ''}
+              />
+
+              <h3>Human handover</h3>
+              <input
+                onBlur={() =>
+                  void saveAutoReplyConfig({
+                    humanHandoverKeywords: (autoReplyConfig?.humanHandoverKeywords || [])
+                      .map((keyword) => keyword.trim())
+                      .filter(Boolean),
+                  })
+                }
+                onChange={(event) => {
+                  const keywords = event.target.value
+                    .split(',')
+                    .map((keyword) => keyword.trim())
+                    .filter((keyword, index, list) => keyword || index < list.length - 1);
+                  setAutoReplyConfig((current) =>
+                    current
+                      ? { ...current, humanHandoverKeywords: keywords }
+                      : ({ humanHandoverKeywords: keywords } as AutoReplyConfig),
+                  );
+                }}
+                placeholder="human, agent, real person"
+                value={(autoReplyConfig?.humanHandoverKeywords || []).join(', ')}
+              />
+              <small>Comma-separated. Customers matching these pause auto-replies for that chat.</small>
+
+              <h3>Cooldown</h3>
+              <input
+                onBlur={() =>
+                  void saveAutoReplyConfig({
+                    cooldownSeconds: Number(autoReplyConfig?.cooldownSeconds) || 90,
+                  })
+                }
+                onChange={(event) => {
+                  const cooldownSeconds = Number(event.target.value.replace(/[^\d]/g, '')) || 0;
+                  setAutoReplyConfig((current) =>
+                    current
+                      ? { ...current, cooldownSeconds }
+                      : ({ cooldownSeconds } as AutoReplyConfig),
+                  );
+                }}
+                placeholder="Cooldown seconds (e.g. 90)"
+                value={autoReplyConfig?.cooldownSeconds ?? ''}
+              />
+
+              <h3>FAQ rules</h3>
+              {(autoReplyConfig?.rules || []).length ? null : <p>No FAQ rules yet.</p>}
+              {(autoReplyConfig?.rules || []).map((rule) => (
+                <div className="business-product-row" key={rule.id}>
+                  <div>
+                    <strong>{(rule.keywords || []).join(', ')}</strong>
+                    <small>{rule.response}</small>
+                    {rule.enabled === false ? <span className="consent-badge consent-opted_out">Off</span> : null}
+                  </div>
+                  <div className="business-product-actions">
+                    <button onClick={() => void removeAutoReplyRule(rule.id)} type="button">
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <input
+                onChange={(event) =>
+                  setAutoReplyRuleDraft((current) => ({ ...current, keywords: event.target.value }))
+                }
+                placeholder="Keywords, comma-separated"
+                value={autoReplyRuleDraft.keywords}
+              />
+              <textarea
+                onChange={(event) =>
+                  setAutoReplyRuleDraft((current) => ({ ...current, response: event.target.value }))
+                }
+                placeholder="Fixed reply text"
+                value={autoReplyRuleDraft.response}
+              />
+              <button onClick={() => void addAutoReplyRule()} type="button">
+                Add rule
+              </button>
+
+              <h3>Recent activity</h3>
+              <button
+                onClick={() => {
+                  void loadAutoReplyConfig();
+                  void loadAutoReplyLogs();
+                }}
+                type="button"
+              >
+                Refresh
+              </button>
+              {autoReplyLogs.length ? null : <p>No automated replies logged yet.</p>}
+              {autoReplyLogs.slice(0, 12).map((log) => (
+                <div className="business-product-row" key={log.id}>
+                  <div>
+                    <strong>{log.source}</strong>
+                    <small>
+                      {new Date(log.createdAt).toLocaleString()} · chat {log.chatId}
+                    </small>
+                  </div>
+                </div>
+              ))}
             </div>
           ) : null}
         </>
