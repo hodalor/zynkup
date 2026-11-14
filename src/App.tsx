@@ -3,7 +3,7 @@ import QRCode from 'qrcode';
 import { io, Socket } from 'socket.io-client';
 import './App.css';
 
-type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates';
+type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games';
 type ReceiptState = 'sent' | 'delivered' | 'read';
 type SettingsPanelId =
   | 'favorites'
@@ -21,6 +21,7 @@ type Message = {
   id: string;
   clientRef?: string;
   sender: 'me' | 'other';
+  senderId?: string;
   kind: 'text' | 'image' | 'voice' | 'file' | 'video' | 'call';
   text: string;
   time: string;
@@ -35,6 +36,7 @@ type Message = {
   callState?: 'missed' | 'declined' | 'completed';
   deletedForEveryone?: boolean;
   automated?: boolean;
+  anonymous?: boolean;
   documentId?: string;
   documentKind?: 'quotation' | 'invoice';
   transcript?: string;
@@ -64,6 +66,269 @@ type Chat = {
   presence: string;
   lastSeenAt?: string;
   peerUserId?: string;
+  kind?: 'direct' | 'group';
+  communityId?: string;
+  allowAnonymous?: boolean;
+  adminIds?: string[];
+};
+
+type CommunityPrivacy = 'public' | 'private' | 'invite-only';
+type CommunityRole = 'owner' | 'admin' | 'moderator' | 'member';
+type MembershipState = 'active' | 'pending' | 'banned' | 'left';
+type ModerationState = 'pending' | 'reviewed' | 'dismissed' | 'actioned';
+
+type VoiceRoomPrivacy = 'public' | 'private' | 'invite-only';
+type VoiceRoomStatus = 'live' | 'ended';
+type VoiceRoomRole = 'host' | 'moderator' | 'speaker' | 'listener';
+type VoiceParticipantState = 'active' | 'left' | 'removed' | 'blocked';
+
+type VoiceRoomPreview = {
+  id: string;
+  title: string;
+  description: string;
+  privacy: VoiceRoomPrivacy;
+  communityId?: string | null;
+  hostUserId: string;
+  status: VoiceRoomStatus;
+  capacityListeners: number;
+  capacitySpeakers: number;
+  recordingEnabled: false;
+  createdAt: string;
+  endedAt?: string | null;
+  updatedAt: string;
+  myRole: VoiceRoomRole | null;
+  myState: VoiceParticipantState | null;
+  muted: boolean;
+  handRaised: boolean;
+  private?: boolean;
+  rules?: string;
+};
+
+type VoiceRoomParticipant = {
+  id: string;
+  roomId: string;
+  userId: string;
+  role: VoiceRoomRole;
+  handRaised: boolean;
+  handRaisedAt?: string | null;
+  muted: boolean;
+  forceMuted: boolean;
+  blocked: boolean;
+  joinedAt: string;
+  leftAt?: string | null;
+  state: VoiceParticipantState;
+  name?: string;
+  avatar?: string;
+};
+
+type GameKind =
+  | 'quiz-battle'
+  | 'would-you-rather'
+  | 'memory-match'
+  | 'word-builder'
+  | 'emoji-guess'
+  | 'trivia'
+  | 'meme-vote';
+
+type GamePlayerStatus = 'invited' | 'joined' | 'left' | 'finished';
+type GameSessionStatus = 'lobby' | 'active' | 'finished' | 'cancelled';
+type GameScreen = 'list' | 'invite' | 'lobby' | 'play' | 'finished';
+
+type GameCatalogEntry = {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  minPlayers: number;
+  maxPlayers: number;
+  comingSoon: boolean;
+  kind: GameKind;
+};
+
+type GamePlayerPublic = {
+  userId: string;
+  status: GamePlayerStatus;
+  score: number;
+  answers: Record<string, number>;
+};
+
+type GameRoundPublic = {
+  index: number;
+  kind: 'quiz' | 'wyr';
+  prompt: string;
+  options: string[];
+  correctAnswerIndex?: number;
+};
+
+type GameResultsSummary = {
+  kind: GameKind;
+  winnerUserIds: string[];
+  scores: Array<{ userId: string; score: number }>;
+  agreementPercent?: number;
+  funSummary?: string;
+  pointsNote: string;
+};
+
+type GameSessionPublic = {
+  id: string;
+  gameId: string;
+  gameSlug: string;
+  kind: GameKind;
+  status: GameSessionStatus;
+  hostUserId: string;
+  chatId?: string | null;
+  players: GamePlayerPublic[];
+  roundIndex: number;
+  roundStartedAt?: string | null;
+  roundTimeoutMs: number;
+  rounds: Array<GameRoundPublic | null>;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string | null;
+  results?: GameResultsSummary | null;
+  pointsNote?: string;
+};
+
+type GameLeaderboardRow = {
+  rank: number;
+  userId: string;
+  name: string;
+  avatar: string;
+  points: number;
+  gamesPlayed: number;
+  wins: number;
+  pointsLabel?: string;
+};
+
+type GamePendingInvite = {
+  sessionId: string;
+  session: GameSessionPublic;
+  fromUserId: string;
+  gameSlug: string;
+  title: string;
+};
+
+type GameRoundResultPayload = {
+  roundIndex: number;
+  round?: GameRoundPublic | null;
+  picks: Array<{ userId: string; answerIndex: number | null }>;
+  players: Array<{ userId: string; status: GamePlayerStatus; score: number }>;
+};
+
+const VOICE_PUBLISHER_ROLES: VoiceRoomRole[] = ['host', 'moderator', 'speaker'];
+const isVoicePublisherRole = (role: VoiceRoomRole | null | undefined) =>
+  Boolean(role && VOICE_PUBLISHER_ROLES.includes(role));
+const voiceRoleAtLeast = (role: VoiceRoomRole | null | undefined, minimum: VoiceRoomRole) => {
+  const rank: Record<VoiceRoomRole, number> = { host: 4, moderator: 3, speaker: 2, listener: 1 };
+  if (!role) return false;
+  return rank[role] >= rank[minimum];
+};
+
+type CommunityPreview = {
+  id: string;
+  name: string;
+  description: string;
+  privacy: CommunityPrivacy;
+  avatarUrl: string;
+  memberCount: number;
+  pinnedRules?: boolean;
+  myRole: CommunityRole | null;
+  myState: MembershipState | null;
+  muted: boolean;
+  rules?: string;
+  private?: boolean;
+  limited?: boolean;
+  ownerUserId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type CommunityMembership = {
+  id: string;
+  communityId: string;
+  userId: string;
+  role: CommunityRole;
+  state: MembershipState;
+  muted: boolean;
+  mutedAt?: string | null;
+  joinedAt?: string | null;
+  leftAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  name?: string;
+  avatar?: string;
+};
+
+type CommunityRoomPermissions = {
+  viewRoles: CommunityRole[];
+  postRoles: CommunityRole[];
+};
+
+type CommunityRoom = {
+  id: string;
+  communityId: string;
+  chatId: string;
+  title: string;
+  topic: string;
+  permissions: CommunityRoomPermissions;
+  pinnedRules: string;
+  isAnnouncement: boolean;
+  allowAnonymous?: boolean;
+  createdByUserId: string;
+  createdAt: string;
+  updatedAt: string;
+  canPost?: boolean;
+  chat?: any;
+};
+
+type CommunityInvite = {
+  id: string;
+  communityId: string;
+  token: string;
+  createdByUserId: string;
+  role: CommunityRole;
+  maxUses: number | null;
+  uses: number;
+  expiresAt: string | null;
+  createdAt: string;
+};
+
+type CommunityJoinRequest = {
+  id: string;
+  communityId: string;
+  userId: string;
+  note: string;
+  state: 'pending' | 'approved' | 'rejected';
+  reviewedByUserId?: string | null;
+  reviewedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CommunityReport = {
+  id: string;
+  communityId: string;
+  roomId?: string | null;
+  reporterUserId: string;
+  reason: string;
+  targetUserId?: string | null;
+  state: ModerationState;
+  reviewedByUserId?: string | null;
+  reviewedAt?: string | null;
+  reviewNote?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CommunityAuditEvent = {
+  id: string;
+  communityId: string;
+  actorUserId: string;
+  action: string;
+  detail: string;
+  targetUserId?: string | null;
+  roomId?: string | null;
+  createdAt: string;
 };
 
 type CallState = 'ringing' | 'ongoing' | 'completed' | 'missed' | 'declined';
@@ -169,6 +434,56 @@ type BusinessAiAskResult = {
   disclosure?: string;
   notice?: string;
   autoSend?: boolean;
+};
+
+type TwinAllowedTask =
+  | 'draft_reply'
+  | 'organise_enquiry'
+  | 'create_reminder'
+  | 'prepare_quotation'
+  | 'answer_hours';
+
+type TwinPermissionTier = 'draft_only' | 'auto_routine';
+
+type TwinDataSource = 'catalog' | 'hours' | 'faq' | 'policies' | 'crm';
+
+type AiTwinConfig = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  displayName: string;
+  permissionTier: TwinPermissionTier;
+  allowedTasks: TwinAllowedTask[];
+  dataSources: TwinDataSource[];
+  operatingHoursText: string;
+  dailyActionLimit: number;
+  blockedActions: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AiTwinAction = {
+  id: string;
+  twinId: string;
+  ownerUserId: string;
+  task: TwinAllowedTask | 'blocked_attempt';
+  status: 'proposed' | 'approved' | 'rejected' | 'executed_draft' | 'blocked';
+  summary: string;
+  draftText?: string;
+  requiresApproval: boolean;
+  chatId?: string | null;
+  messageId?: string | null;
+  inputPreview?: string;
+  result?: string;
+  createdAt: string;
+  decidedAt?: string | null;
+  decidedByUserId?: string | null;
+};
+
+type AiTwinCapabilities = {
+  may: string[];
+  mayNot: string[];
 };
 
 type ScamSignal = {
@@ -446,7 +761,8 @@ type BusinessHubTab =
   | 'autoreplies'
   | 'documents'
   | 'broadcasts'
-  | 'ai';
+  | 'ai'
+  | 'twin';
 
 type StatusItem = {
   id: string;
@@ -526,6 +842,28 @@ const AI_ASSISTANT_TASKS: Array<{ id: AiAssistantTask; label: string }> = [
   { id: 'translate', label: 'Translate' },
   { id: 'explain', label: 'Explain' },
 ];
+const TWIN_ALLOWED_TASKS: Array<{ id: TwinAllowedTask; label: string }> = [
+  { id: 'draft_reply', label: 'Draft replies' },
+  { id: 'organise_enquiry', label: 'Organise enquiries' },
+  { id: 'create_reminder', label: 'Create reminders' },
+  { id: 'prepare_quotation', label: 'Prepare quotation drafts' },
+  { id: 'answer_hours', label: 'Answer hours' },
+];
+const TWIN_DATA_SOURCES: Array<{ id: TwinDataSource; label: string }> = [
+  { id: 'catalog', label: 'Catalog' },
+  { id: 'hours', label: 'Hours' },
+  { id: 'faq', label: 'FAQ' },
+  { id: 'policies', label: 'Policies' },
+  { id: 'crm', label: 'CRM' },
+];
+const TWIN_HARD_BLOCK_LABELS: Record<string, string> = {
+  send_money: 'Send money',
+  approve_refund: 'Approve refunds',
+  invent_price: 'Invent prices',
+  promise_discount: 'Promise discounts',
+  auto_send_without_disclosure: 'Auto-send without disclosure',
+  impersonate_owner_secretly: 'Impersonate the owner secretly',
+};
 const TRANSLATE_LANGUAGES: Array<{ id: TranslateLanguage; label: string }> = [
   { id: 'en', label: 'English' },
   { id: 'tw', label: 'Twi' },
@@ -660,6 +998,12 @@ const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => {
     presence: peer?.presence ?? 'offline',
     lastSeenAt: peer?.lastSeenAt,
     peerUserId,
+    kind: chat.kind === 'group' || chat.kind === 'direct' ? chat.kind : undefined,
+    communityId: typeof chat.communityId === 'string' ? chat.communityId : undefined,
+    allowAnonymous: Boolean(chat.allowAnonymous),
+    adminIds: Array.isArray(chat.adminIds)
+      ? chat.adminIds.filter((id: unknown): id is string => typeof id === 'string')
+      : undefined,
   };
 };
 
@@ -667,6 +1011,7 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   id: message.id,
   clientRef: message.clientRef,
   sender: message.senderId === userId ? 'me' : 'other',
+  senderId: typeof message.senderId === 'string' ? message.senderId : undefined,
   kind: message.deletedForEveryone
     ? 'text'
     : message.kind === 'emoji'
@@ -691,6 +1036,7 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   callState: message.callState,
   deletedForEveryone: Boolean(message.deletedForEveryone),
   automated: Boolean(message.automated),
+  anonymous: Boolean(message.anonymous) || message.senderId === 'anonymous',
   documentId: message.documentId || undefined,
   documentKind: message.documentKind === 'quotation' || message.documentKind === 'invoice'
     ? message.documentKind
@@ -767,6 +1113,104 @@ function App() {
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory, setCatalogCategory] = useState('All');
   const [catalogItems, setCatalogItems] = useState<CatalogItem[]>(initialCatalogItems);
+  const [communitiesMine, setCommunitiesMine] = useState<CommunityPreview[]>([]);
+  const [communitiesDiscover, setCommunitiesDiscover] = useState<CommunityPreview[]>([]);
+  const [communitiesSearchQuery, setCommunitiesSearchQuery] = useState('');
+  const [communitiesSearchResults, setCommunitiesSearchResults] = useState<CommunityPreview[]>([]);
+  const [selectedCommunityId, setSelectedCommunityId] = useState('');
+  const [communityDetail, setCommunityDetail] = useState<CommunityPreview | null>(null);
+  const [communityMembership, setCommunityMembership] = useState<CommunityMembership | null>(null);
+  const [communityRooms, setCommunityRooms] = useState<CommunityRoom[]>([]);
+  const [communityMembers, setCommunityMembers] = useState<CommunityMembership[]>([]);
+  const [communityJoinRequests, setCommunityJoinRequests] = useState<CommunityJoinRequest[]>([]);
+  const [communityAudit, setCommunityAudit] = useState<CommunityAuditEvent[]>([]);
+  const [communityModReports, setCommunityModReports] = useState<CommunityReport[]>([]);
+  const [communityBusy, setCommunityBusy] = useState(false);
+  const [communityNotice, setCommunityNotice] = useState('');
+  const [communityInviteTokenDraft, setCommunityInviteTokenDraft] = useState('');
+  const [communityCreatedInviteToken, setCommunityCreatedInviteToken] = useState('');
+  const [communityReportReason, setCommunityReportReason] = useState('');
+  const [communityJoinNote, setCommunityJoinNote] = useState('');
+  const [communityCreateForm, setCommunityCreateForm] = useState({
+    name: '',
+    description: '',
+    rules: '',
+    privacy: 'public' as CommunityPrivacy,
+    avatarUrl: '',
+  });
+  const [communityEditForm, setCommunityEditForm] = useState({
+    name: '',
+    description: '',
+    rules: '',
+    privacy: 'public' as CommunityPrivacy,
+    avatarUrl: '',
+    pinnedRules: false,
+  });
+  const [communityRoomForm, setCommunityRoomForm] = useState({
+    title: '',
+    topic: '',
+    isAnnouncement: false,
+    allowAnonymous: false,
+  });
+  const [anonymousCompose, setAnonymousCompose] = useState(false);
+  const [anonymousDisclosureAccepted, setAnonymousDisclosureAccepted] = useState(false);
+  const [anonymousDisclosureOpen, setAnonymousDisclosureOpen] = useState(false);
+  const [anonymousRemaining, setAnonymousRemaining] = useState<number | null>(null);
+  const [anonymousRevealResult, setAnonymousRevealResult] = useState<{
+    authorName?: string;
+    authorUserId: string;
+    notice?: string;
+  } | null>(null);
+  const [anonymousRevealBusy, setAnonymousRevealBusy] = useState(false);
+  const [communityDetailTab, setCommunityDetailTab] = useState<'overview' | 'members' | 'requests' | 'moderation' | 'settings'>('overview');
+  const selectedCommunityIdRef = useRef('');
+  const [voiceRoomsMine, setVoiceRoomsMine] = useState<VoiceRoomPreview[]>([]);
+  const [voiceRoomsLivePublic, setVoiceRoomsLivePublic] = useState<VoiceRoomPreview[]>([]);
+  const [activeVoiceRoom, setActiveVoiceRoom] = useState<VoiceRoomPreview | null>(null);
+  const [voiceParticipants, setVoiceParticipants] = useState<VoiceRoomParticipant[]>([]);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceReconnecting, setVoiceReconnecting] = useState(false);
+  const [voiceMicMuted, setVoiceMicMuted] = useState(false);
+  const [voiceInviteTokenDraft, setVoiceInviteTokenDraft] = useState('');
+  const [voiceCreatedInviteToken, setVoiceCreatedInviteToken] = useState('');
+  const [voiceCreateForm, setVoiceCreateForm] = useState({
+    title: '',
+    description: '',
+    rules: '',
+    privacy: 'public' as VoiceRoomPrivacy,
+  });
+  const [gameCatalog, setGameCatalog] = useState<GameCatalogEntry[]>([]);
+  const [gameLeaderboard, setGameLeaderboard] = useState<GameLeaderboardRow[]>([]);
+  const [gameLeaderboardMine, setGameLeaderboardMine] = useState<{
+    userId: string;
+    points: number;
+    gamesPlayed: number;
+    wins: number;
+    pointsLabel?: string;
+    name?: string;
+    avatar?: string;
+  } | null>(null);
+  const [gamePointsNote, setGamePointsNote] = useState(
+    'Cosmetic points only — no cash, gambling, or pay-to-win.',
+  );
+  const [gameSessionsMine, setGameSessionsMine] = useState<GameSessionPublic[]>([]);
+  const [gameScreen, setGameScreen] = useState<GameScreen>('list');
+  const [gameSelectedSlug, setGameSelectedSlug] = useState('');
+  const [gameInviteSelectedIds, setGameInviteSelectedIds] = useState<string[]>([]);
+  const [gameActiveSession, setGameActiveSession] = useState<GameSessionPublic | null>(null);
+  const [gameRoundPhase, setGameRoundPhase] = useState<'prompt' | 'result' | null>(null);
+  const [gameCurrentRound, setGameCurrentRound] = useState<GameRoundPublic | null>(null);
+  const [gameRoundResult, setGameRoundResult] = useState<GameRoundResultPayload | null>(null);
+  const [gameRoundMeta, setGameRoundMeta] = useState({
+    roundIndex: 0,
+    roundStartedAt: null as string | null,
+    roundTimeoutMs: 30000,
+  });
+  const [gameMyAnswerIndex, setGameMyAnswerIndex] = useState<number | null>(null);
+  const [gameBusy, setGameBusy] = useState(false);
+  const [gameChatId, setGameChatId] = useState<string | null>(null);
+  const [gamePendingInvite, setGamePendingInvite] = useState<GamePendingInvite | null>(null);
+  const [gameRoundSecondsLeft, setGameRoundSecondsLeft] = useState<number | null>(null);
   const [callSheetVisible, setCallSheetVisible] = useState(false);
   const [calls, setCalls] = useState<CallItem[]>([]);
   const [incomingCall, setIncomingCall] = useState<CallItem | null>(null);
@@ -903,6 +1347,11 @@ function App() {
   const [businessAiTestQuestion, setBusinessAiTestQuestion] = useState('');
   const [businessAiAskResult, setBusinessAiAskResult] = useState<BusinessAiAskResult | null>(null);
   const [businessAiBusy, setBusinessAiBusy] = useState(false);
+  const [aiTwinConfig, setAiTwinConfig] = useState<AiTwinConfig | null>(null);
+  const [aiTwinCapabilities, setAiTwinCapabilities] = useState<AiTwinCapabilities | null>(null);
+  const [aiTwinActions, setAiTwinActions] = useState<AiTwinAction[]>([]);
+  const [aiTwinBusy, setAiTwinBusy] = useState(false);
+  const [aiTwinNotice, setAiTwinNotice] = useState('');
   const [scamWarningsByKey, setScamWarningsByKey] = useState<Record<string, ScamWarningInfo>>({});
   const [summaryVisible, setSummaryVisible] = useState(false);
   const [summaryScope, setSummaryScope] = useState<SummarizeScope>('unread');
@@ -949,7 +1398,16 @@ function App() {
   currentUserIdRef.current = currentUserId;
   selectedChatIdRef.current = selectedChatId;
   activeViewRef.current = activeView;
+  selectedCommunityIdRef.current = selectedCommunityId;
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const voicePeerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const voiceLocalStreamRef = useRef<MediaStream | null>(null);
+  const voiceRemoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const voiceActiveRoomIdRef = useRef('');
+  const voiceMyRoleRef = useRef<VoiceRoomRole | null>(null);
+  const voiceParticipantsRef = useRef<VoiceRoomParticipant[]>([]);
+  const voiceMakingOfferRef = useRef<Set<string>>(new Set());
+  const gameActiveSessionIdRef = useRef('');
   const callMediaStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -1893,6 +2351,14 @@ function App() {
                 preview: chat.lastMessagePreview,
                 unread: chat.unreadCount ?? item.unread,
                 time: formatClock(chat.updatedAt),
+                kind: chat.kind === 'group' || chat.kind === 'direct' ? chat.kind : item.kind,
+                communityId: typeof chat.communityId === 'string' ? chat.communityId : item.communityId,
+                allowAnonymous: typeof chat.allowAnonymous === 'boolean'
+                  ? chat.allowAnonymous
+                  : item.allowAnonymous,
+                adminIds: Array.isArray(chat.adminIds)
+                  ? chat.adminIds.filter((id: unknown): id is string => typeof id === 'string')
+                  : item.adminIds,
               }
             : item,
         ),
@@ -1971,6 +2437,18 @@ function App() {
     });
     socket.on('businessAi:updated', ({ config }: { config: BusinessAiConfig }) => {
       if (config) setBusinessAiConfig(config);
+    });
+    socket.on('twin:updated', ({ config }: { config: AiTwinConfig }) => {
+      if (config) setAiTwinConfig(config);
+    });
+    socket.on('twin:action', ({ action }: { action: AiTwinAction }) => {
+      if (!action?.id) return;
+      setAiTwinActions((current) => [action, ...current.filter((entry) => entry.id !== action.id)].slice(0, 100));
+      if (action.status === 'blocked') {
+        showToast(action.summary || 'Twin blocked a risky request', 4000);
+      } else if (action.status === 'proposed') {
+        showToast(`Twin proposed: ${action.summary}`, 3500);
+      }
     });
     socket.on('autoReply:updated', ({ config }: { config: AutoReplyConfig }) => {
       if (config) setAutoReplyConfig(config);
@@ -2216,7 +2694,16 @@ function App() {
     setSummaryNotice('');
     setFocusedMessageId(null);
     setDictationNotice('');
+    setAnonymousCompose(false);
+    setAnonymousRemaining(null);
   }, [selectedChatId]);
+
+  useEffect(() => {
+    const allowed = Boolean(activeChat?.kind === 'group' && activeChat.allowAnonymous);
+    if (!allowed) {
+      setAnonymousCompose(false);
+    }
+  }, [activeChat?.id, activeChat?.kind, activeChat?.allowAnonymous]);
 
   useEffect(() => {
     return () => {
@@ -2501,21 +2988,43 @@ function App() {
     closePeerConnection();
   };
 
+  const canComposeAnonymous = Boolean(
+    activeChat?.kind === 'group' && activeChat.allowAnonymous,
+  );
+
+  const requestAnonymousCompose = (enabled: boolean) => {
+    if (!enabled) {
+      setAnonymousCompose(false);
+      return;
+    }
+    if (!canComposeAnonymous) {
+      return;
+    }
+    if (anonymousDisclosureAccepted) {
+      setAnonymousCompose(true);
+      return;
+    }
+    setAnonymousDisclosureOpen(true);
+  };
+
   const sendMessage = () => {
     if (!messageDraft.trim() || !activeChat) {
       return;
     }
 
+    const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
     const optimistic: Message = {
       id: `local-${Date.now()}`,
       clientRef: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       sender: 'me',
+      senderId: currentUserId,
       kind: 'text',
       text: messageDraft.trim(),
       time: 'Now',
       receiptState: 'sent',
       replyToMessageId: replyTarget?.id,
       replyPreview: replyTarget?.text?.slice(0, 140),
+      anonymous: sendAnonymous,
     };
 
     setMessagesByChat((current) => ({
@@ -2523,11 +3032,12 @@ function App() {
       [activeChat.id]: [...(current[activeChat.id] ?? []), optimistic],
     }));
     emitTyping(false);
+    const chatId = activeChat.id;
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chatId: activeChat.id,
+        chatId,
         senderId: currentUserId,
         clientRef: optimistic.clientRef,
         kind: 'text',
@@ -2535,8 +3045,27 @@ function App() {
         mediaUrls: [],
         replyToMessageId: replyTarget?.id,
         replyPreview: replyTarget?.text?.slice(0, 140),
+        anonymous: sendAnonymous,
       }),
-    }).catch(() => undefined);
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          showToast(payload.error || 'Could not send message');
+          return;
+        }
+        if (typeof payload.anonymousRemaining === 'number') {
+          setAnonymousRemaining(payload.anonymousRemaining);
+          showToast(
+            `${payload.anonymousRemaining} anonymous message${payload.anonymousRemaining === 1 ? '' : 's'} left today in this room`,
+            2800,
+          );
+        }
+        if (payload.message) {
+          reconcileIncomingMessage(chatId, payload.message);
+        }
+      })
+      .catch(() => undefined);
     setMessageDraft('');
     setReplyTarget(null);
   };
@@ -2969,6 +3498,195 @@ function App() {
       showToast('Could not ask business AI');
     } finally {
       setBusinessAiBusy(false);
+    }
+  };
+
+  const upsertTwinAction = (action: AiTwinAction) => {
+    if (!action?.id) return;
+    setAiTwinActions((current) => [action, ...current.filter((entry) => entry.id !== action.id)].slice(0, 100));
+  };
+
+  const fillComposerFromTwinDraft = (draftText?: string, notice?: string) => {
+    const text = (draftText || '').trim();
+    if (!text) {
+      showToast(notice || 'No draft to fill');
+      return;
+    }
+    setMessageDraft(text);
+    showToast(notice || 'Filled draft — Twin never auto-sends. Review before sending.', 4000);
+  };
+
+  const loadAiTwin = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/ai/twin?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load AI Twin');
+        return;
+      }
+      setAiTwinConfig(payload.config || null);
+      setAiTwinCapabilities(payload.capabilities || null);
+    } catch {
+      showToast('Could not load AI Twin');
+    }
+  };
+
+  const loadAiTwinActions = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/ai/twin/actions?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load Twin actions');
+        return;
+      }
+      setAiTwinActions(Array.isArray(payload.actions) ? payload.actions : []);
+    } catch {
+      showToast('Could not load Twin actions');
+    }
+  };
+
+  const saveAiTwinConfig = async (
+    patch: Partial<{
+      enabled: boolean;
+      displayName: string;
+      permissionTier: TwinPermissionTier;
+      allowedTasks: TwinAllowedTask[];
+      dataSources: TwinDataSource[];
+      operatingHoursText: string;
+      dailyActionLimit: number;
+    }> = {},
+  ) => {
+    if (!currentUserId) return;
+    const base = aiTwinConfig;
+    setAiTwinBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/twin`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          businessId: base?.businessId ?? null,
+          enabled: base?.enabled,
+          displayName: base?.displayName,
+          permissionTier: base?.permissionTier,
+          allowedTasks: base?.allowedTasks,
+          dataSources: base?.dataSources,
+          operatingHoursText: base?.operatingHoursText,
+          dailyActionLimit: base?.dailyActionLimit,
+          ...patch,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save AI Twin');
+        return;
+      }
+      setAiTwinConfig(payload.config || null);
+      if (typeof patch.enabled === 'boolean') {
+        showToast(patch.enabled ? 'AI Twin enabled' : 'AI Twin paused');
+      } else {
+        showToast('AI Twin settings saved');
+      }
+    } catch {
+      showToast('Could not save AI Twin');
+    } finally {
+      setAiTwinBusy(false);
+    }
+  };
+
+  const runAiTwin = async (options: { prompt?: string; messageId?: string } = {}) => {
+    if (!currentUserId || aiTwinBusy) return;
+    if (!activeChat) {
+      showToast('Open a chat to run the Twin');
+      return;
+    }
+    if (aiTwinConfig && !aiTwinConfig.enabled) {
+      showToast('AI Twin is paused. Enable it in Business tools → AI Twin.');
+      return;
+    }
+    setAiTwinBusy(true);
+    setAiTwinNotice('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/twin/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          event: 'manual',
+          chatId: activeChat.id,
+          messageId: options.messageId,
+          prompt: options.prompt || messageDraft.trim() || undefined,
+          businessId: aiTwinConfig?.businessId ?? null,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (payload.action) upsertTwinAction(payload.action as AiTwinAction);
+        showToast(payload.error || 'Twin run failed');
+        return;
+      }
+      const actions = (Array.isArray(payload.actions) ? payload.actions : []) as AiTwinAction[];
+      actions.forEach(upsertTwinAction);
+      const notice =
+        typeof payload.notice === 'string'
+          ? payload.notice
+          : 'Draft-only by default. Twin cannot send money, approve refunds, or invent prices.';
+      const disclosure =
+        typeof payload.disclosure === 'string'
+          ? payload.disclosure
+          : 'AI Twin drafts are labelled as automated and are not the owner speaking secretly.';
+      setAiTwinNotice(`${disclosure} ${notice}`);
+      showToast(notice, 4000);
+      // Never auto-send — only surface drafts for review / inbox approval
+      const draftCandidate = actions.find((entry) => entry.draftText && entry.status === 'proposed');
+      if (draftCandidate?.draftText && !draftCandidate.requiresApproval) {
+        fillComposerFromTwinDraft(draftCandidate.draftText, notice);
+      }
+    } catch {
+      showToast('Twin run failed');
+    } finally {
+      setAiTwinBusy(false);
+    }
+  };
+
+  const decideTwinAction = async (actionId: string, decision: 'approve' | 'reject') => {
+    if (!currentUserId || !actionId) return;
+    setAiTwinBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/ai/twin/actions/${encodeURIComponent(actionId)}/${decision}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || `Could not ${decision} Twin action`);
+        return;
+      }
+      const updated = payload.action as AiTwinAction | undefined;
+      if (updated) upsertTwinAction(updated);
+      if (decision === 'approve') {
+        const notice =
+          typeof payload.notice === 'string'
+            ? payload.notice
+            : 'Approved draft only. The Twin still does not send the message for you.';
+        fillComposerFromTwinDraft(updated?.draftText, notice);
+      } else {
+        showToast('Twin action rejected');
+      }
+    } catch {
+      showToast(`Could not ${decision} Twin action`);
+    } finally {
+      setAiTwinBusy(false);
     }
   };
 
@@ -3937,15 +4655,18 @@ function App() {
 
     const objectUrl = URL.createObjectURL(file);
     const clientRef = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
     const message: Message = {
       id: `m${Date.now()}`,
       clientRef,
       sender: 'me',
+      senderId: currentUserId,
       kind: file.type.startsWith('image/') ? 'image' : 'file',
       text: file.name,
       time: 'Now',
       imageUrl: file.type.startsWith('image/') ? objectUrl : undefined,
       receiptState: 'sent',
+      anonymous: sendAnonymous,
     };
 
     setMessagesByChat((current) => ({
@@ -3954,19 +4675,35 @@ function App() {
     }));
     event.target.value = '';
     const uploadedUrls = await uploadFiles([file]).catch(() => []);
+    const chatId = activeChat.id;
 
     fetch(`${API_BASE_URL}/api/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chatId: activeChat.id,
+        chatId,
         senderId: currentUserId,
         clientRef,
         kind: file.type.startsWith('image/') ? 'image' : 'file',
         text: file.name,
         mediaUrls: uploadedUrls.length ? uploadedUrls : [objectUrl],
+        anonymous: sendAnonymous,
       }),
-    }).catch(() => undefined);
+    })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          showToast(payload.error || 'Could not send attachment');
+          return;
+        }
+        if (typeof payload.anonymousRemaining === 'number') {
+          setAnonymousRemaining(payload.anonymousRemaining);
+        }
+        if (payload.message) {
+          reconcileIncomingMessage(chatId, payload.message);
+        }
+      })
+      .catch(() => undefined);
   };
 
   const insertEmoji = (emoji: string) => {
@@ -4001,20 +4738,24 @@ function App() {
         const blob = new Blob(recordingChunksRef.current, { type: 'audio/webm' });
         const audioUrl = URL.createObjectURL(blob);
         const clientRef = `web-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
+        const chatId = activeChat.id;
         setMessagesByChat((current) => ({
           ...current,
-          [activeChat.id]: [
-            ...(current[activeChat.id] ?? []),
+          [chatId]: [
+            ...(current[chatId] ?? []),
             {
               id: `m${Date.now()}`,
               clientRef,
-              sender: 'me',
-              kind: 'voice',
+              sender: 'me' as const,
+              senderId: currentUserId,
+              kind: 'voice' as const,
               text: 'Voice note',
               time: 'Now',
               audioUrl,
               durationLabel: formatDurationLabel(durationSeconds),
-              receiptState: 'sent',
+              receiptState: 'sent' as const,
+              anonymous: sendAnonymous,
             },
           ],
         }));
@@ -4025,14 +4766,27 @@ function App() {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                chatId: activeChat.id,
+                chatId,
                 senderId: currentUserId,
                 clientRef,
                 kind: 'voice',
                 text: 'Voice note',
                 mediaUrls: uploadedUrls.length ? uploadedUrls : [audioUrl],
                 durationSeconds,
+                anonymous: sendAnonymous,
               }),
+            }).then(async (response) => {
+              const payload = await response.json().catch(() => ({}));
+              if (!response.ok) {
+                showToast(payload.error || 'Could not send voice note');
+                return;
+              }
+              if (typeof payload.anonymousRemaining === 'number') {
+                setAnonymousRemaining(payload.anonymousRemaining);
+              }
+              if (payload.message) {
+                reconcileIncomingMessage(chatId, payload.message);
+              }
             }),
           )
           .catch(() => undefined);
@@ -4290,6 +5044,2602 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeStatusItem, activeStatusItem?.reactions?.length, statusReactorsVisible]);
 
+  const communityRoleAtLeast = (role: CommunityRole | null | undefined, minimum: CommunityRole) => {
+    const rank: Record<CommunityRole, number> = { owner: 4, admin: 3, moderator: 2, member: 1 };
+    if (!role) return false;
+    return rank[role] >= rank[minimum];
+  };
+
+  const canRevealAnonymousAuthor = (chat: Chat | null) => {
+    if (!chat || chat.kind !== 'group' || !currentUserId) {
+      return false;
+    }
+    if (chat.communityId) {
+      const community =
+        (communityDetail?.id === chat.communityId ? communityDetail : null)
+        || communitiesMine.find((item) => item.id === chat.communityId)
+        || null;
+      if (communityRoleAtLeast(community?.myRole ?? null, 'moderator')) {
+        return true;
+      }
+      return Array.isArray(chat.adminIds) && chat.adminIds.includes(currentUserId);
+    }
+    return Array.isArray(chat.adminIds) && chat.adminIds.includes(currentUserId);
+  };
+
+  const revealAnonymousAuthor = async (message: Message) => {
+    if (!currentUserId || !message.anonymous || !canRevealAnonymousAuthor(activeChat)) {
+      return;
+    }
+    setAnonymousRevealBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}/reveal-author`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not reveal author');
+        return;
+      }
+      setAnonymousRevealResult({
+        authorUserId: payload.authorUserId || '',
+        authorName: payload.authorName || undefined,
+        notice: payload.notice || 'Reveals are logged for moderation accountability.',
+      });
+      setMessageActionTarget(null);
+      showToast(
+        `Author: ${payload.authorName || payload.authorUserId || 'Unknown'} · audited`,
+        3600,
+      );
+    } finally {
+      setAnonymousRevealBusy(false);
+    }
+  };
+
+  const communityJson = async (response: Response) => {
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
+  };
+
+  const upsertCommunityPreview = (community: CommunityPreview) => {
+    const isMine = community.myState === 'active' || community.myState === 'pending';
+    setCommunitiesMine((current) => {
+      const without = current.filter((item) => item.id !== community.id);
+      return isMine ? [community, ...without] : without;
+    });
+    setCommunitiesDiscover((current) => {
+      if (community.privacy !== 'public') {
+        return current.filter((item) => item.id !== community.id);
+      }
+      return [community, ...current.filter((item) => item.id !== community.id)];
+    });
+    setCommunitiesSearchResults((current) =>
+      current.map((item) => (item.id === community.id ? { ...item, ...community } : item)),
+    );
+    setCommunityDetail((current) => (current?.id === community.id ? { ...current, ...community } : current));
+  };
+
+  const ensureChatFromCommunityRoom = (room: CommunityRoom, chatPayload?: any) => {
+    const chatId = room.chatId || chatPayload?.id;
+    if (!chatId) return;
+    const allowAnonymous = Boolean(
+      chatPayload?.allowAnonymous ?? room.allowAnonymous,
+    );
+    setChatItems((current) => {
+      const existing = current.find((item) => item.id === chatId);
+      if (existing) {
+        return current.map((item) =>
+          item.id === chatId
+            ? {
+                ...item,
+                kind: 'group' as const,
+                name: room.title || item.name,
+                communityId: room.communityId || chatPayload?.communityId || item.communityId,
+                allowAnonymous,
+                adminIds: Array.isArray(chatPayload?.adminIds)
+                  ? chatPayload.adminIds.filter((id: unknown): id is string => typeof id === 'string')
+                  : item.adminIds,
+              }
+            : item,
+        );
+      }
+      if (chatPayload) {
+        return [mapChatFromServer(chatPayload, currentUserId, users), ...current];
+      }
+      return [
+        {
+          id: chatId,
+          name: room.title || 'Community room',
+          preview: room.topic || 'Community room',
+          time: formatClock(room.updatedAt || new Date().toISOString()),
+          unread: 0,
+          presence: 'offline',
+          kind: 'group' as const,
+          communityId: room.communityId,
+          allowAnonymous,
+        },
+        ...current,
+      ];
+    });
+  };
+
+  const openCommunityRoomChat = (room: CommunityRoom, chatPayload?: any) => {
+    ensureChatFromCommunityRoom(room, chatPayload || room.chat);
+    setSelectedChatId(room.chatId);
+    setActiveView('chats');
+  };
+
+  const loadCommunitiesList = useCallback(async () => {
+    if (!currentUserId) return;
+    const response = await fetch(`${API_BASE_URL}/api/communities?userId=${encodeURIComponent(currentUserId)}`);
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      setCommunityNotice(payload.error || 'Could not load communities.');
+      return;
+    }
+    setCommunitiesMine(payload.mine ?? []);
+    setCommunitiesDiscover(payload.discoverable ?? []);
+  }, [currentUserId]);
+
+  const loadCommunityDetail = useCallback(async (communityId: string) => {
+    if (!currentUserId || !communityId) return;
+    setCommunityBusy(true);
+    setCommunityNotice('');
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        setCommunityNotice(payload.error || 'Could not load community.');
+        return;
+      }
+      const community = payload.community as CommunityPreview;
+      setSelectedCommunityId(communityId);
+      setCommunityDetail(community);
+      setCommunityMembership(payload.membership ?? null);
+      setCommunityRooms(payload.rooms ?? []);
+      setCommunityEditForm({
+        name: community.name || '',
+        description: community.description || '',
+        rules: community.rules || '',
+        privacy: community.privacy || 'public',
+        avatarUrl: community.avatarUrl || '',
+        pinnedRules: Boolean(community.pinnedRules),
+      });
+      setCommunityDetailTab('overview');
+      setCommunityCreatedInviteToken('');
+
+      const role = community.myRole;
+      const isActive = community.myState === 'active';
+      if (isActive) {
+        const membersRes = await fetch(
+          `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/members?userId=${encodeURIComponent(currentUserId)}`,
+        );
+        if (membersRes.ok) {
+          const membersPayload = await communityJson(membersRes);
+          setCommunityMembers(membersPayload.members ?? []);
+        } else {
+          setCommunityMembers([]);
+        }
+      } else {
+        setCommunityMembers([]);
+      }
+
+      if (isActive && communityRoleAtLeast(role, 'moderator')) {
+        const [requestsRes, auditRes, modRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/join-requests?userId=${encodeURIComponent(currentUserId)}`),
+          fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/audit?userId=${encodeURIComponent(currentUserId)}`),
+          fetch(`${API_BASE_URL}/api/communities/moderation/queue?userId=${encodeURIComponent(currentUserId)}`),
+        ]);
+        if (requestsRes.ok) {
+          const requestsPayload = await communityJson(requestsRes);
+          setCommunityJoinRequests(requestsPayload.requests ?? []);
+        } else {
+          setCommunityJoinRequests([]);
+        }
+        if (auditRes.ok) {
+          const auditPayload = await communityJson(auditRes);
+          setCommunityAudit(auditPayload.audit ?? []);
+        } else {
+          setCommunityAudit([]);
+        }
+        if (modRes.ok) {
+          const modPayload = await communityJson(modRes);
+          setCommunityModReports((modPayload.reports ?? []).filter((item: CommunityReport) => item.communityId === communityId));
+        } else {
+          setCommunityModReports([]);
+        }
+      } else {
+        setCommunityJoinRequests([]);
+        setCommunityAudit([]);
+        setCommunityModReports([]);
+      }
+    } finally {
+      setCommunityBusy(false);
+    }
+  }, [currentUserId]);
+
+  const searchCommunities = async () => {
+    if (!currentUserId) return;
+    const q = communitiesSearchQuery.trim();
+    if (q.length < 2) {
+      setCommunityNotice('Enter at least 2 characters to search.');
+      return;
+    }
+    const response = await fetch(
+      `${API_BASE_URL}/api/communities/search?q=${encodeURIComponent(q)}&userId=${encodeURIComponent(currentUserId)}`,
+    );
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      setCommunityNotice(payload.error || 'Search failed.');
+      return;
+    }
+    setCommunitiesSearchResults(payload.communities ?? []);
+    setCommunityNotice('');
+  };
+
+  const createCommunity = async () => {
+    if (!currentUserId) return;
+    if (communityCreateForm.name.trim().length < 2) {
+      setCommunityNotice('Enter a community name (at least 2 characters).');
+      return;
+    }
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          name: communityCreateForm.name.trim(),
+          description: communityCreateForm.description.trim(),
+          rules: communityCreateForm.rules.trim(),
+          privacy: communityCreateForm.privacy,
+          avatarUrl: communityCreateForm.avatarUrl.trim(),
+        }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        setCommunityNotice(payload.error || 'Could not create community.');
+        return;
+      }
+      setCommunityCreateForm({ name: '', description: '', rules: '', privacy: 'public', avatarUrl: '' });
+      await loadCommunitiesList();
+      if (payload.community?.id) {
+        await loadCommunityDetail(payload.community.id);
+      }
+      (payload.rooms as CommunityRoom[] | undefined)?.forEach((room) => ensureChatFromCommunityRoom(room));
+      showToast('Community created');
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const joinCommunity = async (communityId: string) => {
+    if (!currentUserId) return;
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, note: communityJoinNote.trim() }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        setCommunityNotice(payload.error || 'Could not join.');
+        showToast(payload.error || 'Could not join');
+        return;
+      }
+      setCommunityJoinNote('');
+      showToast(payload.membership?.state === 'pending' ? 'Join request sent' : 'Joined community');
+      await loadCommunitiesList();
+      await loadCommunityDetail(communityId);
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const leaveCommunity = async (communityId: string) => {
+    if (!currentUserId) return;
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/leave`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        setCommunityNotice(payload.error || 'Could not leave.');
+        showToast(payload.error || 'Could not leave');
+        return;
+      }
+      showToast('Left community');
+      await loadCommunitiesList();
+      await loadCommunityDetail(communityId);
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const muteCommunity = async (communityId: string, muted: boolean) => {
+    if (!currentUserId) return;
+    const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/mute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, muted }),
+    });
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not update mute');
+      return;
+    }
+    if (payload.membership) {
+      setCommunityMembership(payload.membership);
+      setCommunityDetail((current) => (current ? { ...current, muted: Boolean(payload.membership.muted) } : current));
+    }
+    showToast(muted ? 'Community muted' : 'Community unmuted');
+  };
+
+  const reportCommunity = async (communityId: string) => {
+    if (!currentUserId) return;
+    if (communityReportReason.trim().length < 4) {
+      setCommunityNotice('Enter a short reason (at least 4 characters).');
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, reason: communityReportReason.trim() }),
+    });
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not report');
+      return;
+    }
+    setCommunityReportReason('');
+    showToast(payload.message || 'Community reported');
+  };
+
+  const acceptCommunityInvite = async () => {
+    if (!currentUserId) return;
+    const token = communityInviteTokenDraft.trim();
+    if (!token) {
+      setCommunityNotice('Paste an invite token first.');
+      return;
+    }
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities/invites/${encodeURIComponent(token)}/accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        setCommunityNotice(payload.error || 'Invite could not be accepted.');
+        showToast(payload.error || 'Invite failed');
+        return;
+      }
+      setCommunityInviteTokenDraft('');
+      showToast(payload.alreadyMember ? 'Already a member' : 'Invite accepted');
+      await loadCommunitiesList();
+      if (payload.community?.id) {
+        await loadCommunityDetail(payload.community.id);
+      }
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const createCommunityInvite = async (communityId: string) => {
+    if (!currentUserId) return;
+    const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/invites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, role: 'member' }),
+    });
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not create invite');
+      return;
+    }
+    setCommunityCreatedInviteToken(payload.invite?.token || '');
+    showToast('Invite token created');
+  };
+
+  const saveCommunitySettings = async (communityId: string) => {
+    if (!currentUserId) return;
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          name: communityEditForm.name.trim(),
+          description: communityEditForm.description.trim(),
+          rules: communityEditForm.rules.trim(),
+          privacy: communityEditForm.privacy,
+          avatarUrl: communityEditForm.avatarUrl.trim(),
+          pinnedRules: communityEditForm.pinnedRules,
+        }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save settings');
+        return;
+      }
+      showToast('Settings saved');
+      await loadCommunitiesList();
+      await loadCommunityDetail(communityId);
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const createCommunityRoom = async (communityId: string) => {
+    if (!currentUserId) return;
+    if (!communityRoomForm.title.trim()) {
+      setCommunityNotice('Enter a room title.');
+      return;
+    }
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/rooms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          title: communityRoomForm.title.trim(),
+          topic: communityRoomForm.topic.trim(),
+          isAnnouncement: communityRoomForm.isAnnouncement,
+          allowAnonymous: communityRoomForm.allowAnonymous,
+        }),
+      });
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create room');
+        return;
+      }
+      setCommunityRoomForm({ title: '', topic: '', isAnnouncement: false, allowAnonymous: false });
+      if (payload.room) {
+        setCommunityRooms((current) => [payload.room, ...current.filter((item) => item.id !== payload.room.id)]);
+        ensureChatFromCommunityRoom(payload.room, payload.chat);
+      }
+      showToast('Room created');
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const updateCommunityRoomAllowAnonymous = async (
+    communityId: string,
+    room: CommunityRoom,
+    allowAnonymous: boolean,
+  ) => {
+    if (!currentUserId) return;
+    setCommunityBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/rooms/${encodeURIComponent(room.id)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            allowAnonymous,
+          }),
+        },
+      );
+      const payload = await communityJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update room');
+        return;
+      }
+      if (payload.room) {
+        setCommunityRooms((current) =>
+          current.map((item) => (item.id === payload.room.id ? payload.room : item)),
+        );
+        ensureChatFromCommunityRoom(payload.room);
+      }
+      showToast(allowAnonymous ? 'Anonymous posting enabled' : 'Anonymous posting disabled');
+    } finally {
+      setCommunityBusy(false);
+    }
+  };
+
+  const setCommunityMemberRole = async (communityId: string, targetUserId: string, role: CommunityRole) => {
+    if (!currentUserId) return;
+    const response = await fetch(
+      `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/members/${encodeURIComponent(targetUserId)}/role`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, role }),
+      },
+    );
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not change role');
+      return;
+    }
+    showToast('Role updated');
+    await loadCommunityDetail(communityId);
+  };
+
+  const removeCommunityMember = async (communityId: string, targetUserId: string) => {
+    if (!currentUserId) return;
+    const response = await fetch(
+      `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/members/${encodeURIComponent(targetUserId)}/remove`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      },
+    );
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not remove member');
+      return;
+    }
+    showToast('Member removed');
+    await loadCommunityDetail(communityId);
+  };
+
+  const reviewCommunityJoinRequest = async (communityId: string, requestId: string, decision: 'approve' | 'reject') => {
+    if (!currentUserId) return;
+    const response = await fetch(
+      `${API_BASE_URL}/api/communities/${encodeURIComponent(communityId)}/join-requests/${encodeURIComponent(requestId)}/${decision}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      },
+    );
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || `Could not ${decision}`);
+      return;
+    }
+    showToast(decision === 'approve' ? 'Request approved' : 'Request rejected');
+    await loadCommunityDetail(communityId);
+  };
+
+  const reviewCommunityReport = async (reportId: string, state: 'reviewed' | 'dismissed' | 'actioned') => {
+    if (!currentUserId) return;
+    const response = await fetch(`${API_BASE_URL}/api/communities/moderation/${encodeURIComponent(reportId)}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, state }),
+    });
+    const payload = await communityJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not review report');
+      return;
+    }
+    showToast('Report reviewed');
+    if (selectedCommunityId) {
+      await loadCommunityDetail(selectedCommunityId);
+    }
+  };
+
+  useEffect(() => {
+    if (activeView === 'communities' && currentUserId) {
+      void loadCommunitiesList();
+    }
+  }, [activeView, currentUserId, loadCommunitiesList]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) return undefined;
+
+    const onCommunityUpdated = (payload: {
+      community?: CommunityPreview;
+      communityId?: string;
+      action?: string;
+      report?: CommunityReport;
+    }) => {
+      if (payload.community?.id) {
+        upsertCommunityPreview(payload.community);
+        if (selectedCommunityIdRef.current === payload.community.id) {
+          void loadCommunityDetail(payload.community.id);
+        }
+      } else if (payload.communityId && selectedCommunityIdRef.current === payload.communityId) {
+        void loadCommunityDetail(payload.communityId);
+      }
+      if (payload.action === 'report_created') {
+        showToast('New community report');
+      }
+      void loadCommunitiesList();
+    };
+
+    const onCommunityMembership = (payload: {
+      communityId?: string;
+      membership?: CommunityMembership;
+    }) => {
+      if (!payload.communityId) return;
+      if (payload.membership?.userId === currentUserIdRef.current) {
+        void loadCommunitiesList();
+      }
+      if (selectedCommunityIdRef.current === payload.communityId) {
+        void loadCommunityDetail(payload.communityId);
+      }
+    };
+
+    const onCommunityRoom = (payload: {
+      communityId?: string;
+      room?: CommunityRoom;
+      action?: string;
+    }) => {
+      if (!payload.room) return;
+      if (selectedCommunityIdRef.current === payload.communityId) {
+        setCommunityRooms((current) => {
+          const without = current.filter((item) => item.id !== payload.room!.id);
+          if (payload.action === 'deleted') return without;
+          return [payload.room!, ...without];
+        });
+      }
+      if (payload.action === 'created' || payload.action === 'updated') {
+        ensureChatFromCommunityRoom(payload.room);
+      }
+    };
+
+    socket.on('community:updated', onCommunityUpdated);
+    socket.on('community:membership', onCommunityMembership);
+    socket.on('community:room', onCommunityRoom);
+    return () => {
+      socket.off('community:updated', onCommunityUpdated);
+      socket.off('community:membership', onCommunityMembership);
+      socket.off('community:room', onCommunityRoom);
+    };
+  }, [currentUserId, loadCommunitiesList, loadCommunityDetail]);
+
+  const voiceJson = async (response: Response) => {
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
+  };
+
+  const closeVoicePeer = (peerUserId: string) => {
+    const connection = voicePeerConnectionsRef.current.get(peerUserId);
+    if (connection) {
+      connection.onicecandidate = null;
+      connection.ontrack = null;
+      connection.close();
+      voicePeerConnectionsRef.current.delete(peerUserId);
+    }
+    const audio = voiceRemoteAudioRef.current.get(peerUserId);
+    if (audio) {
+      audio.pause();
+      audio.srcObject = null;
+      voiceRemoteAudioRef.current.delete(peerUserId);
+    }
+    voiceMakingOfferRef.current.delete(peerUserId);
+  };
+
+  const cleanupVoiceMesh = (stopLocal = true) => {
+    Array.from(voicePeerConnectionsRef.current.keys()).forEach((peerUserId) => closeVoicePeer(peerUserId));
+    if (stopLocal) {
+      voiceLocalStreamRef.current?.getTracks().forEach((track) => track.stop());
+      voiceLocalStreamRef.current = null;
+    }
+  };
+
+  const emitVoiceSignal = (
+    roomId: string,
+    signalType: 'offer' | 'answer' | 'ice-candidate',
+    payload: unknown,
+    toUserId: string,
+  ) => {
+    socketRef.current?.emit('voice:signal', {
+      roomId,
+      fromUserId: currentUserIdRef.current,
+      toUserId,
+      signalType,
+      payload,
+    });
+  };
+
+  const ensureVoiceLocalStream = async () => {
+    if (voiceLocalStreamRef.current?.getAudioTracks().some((track) => track.readyState === 'live')) {
+      return voiceLocalStreamRef.current;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    voiceLocalStreamRef.current = stream;
+    return stream;
+  };
+
+  const applyVoiceLocalMute = (muted: boolean) => {
+    voiceLocalStreamRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = !muted;
+    });
+    setVoiceMicMuted(muted);
+  };
+
+  const ensureVoicePeerConnection = async (peerUserId: string, canPublish: boolean) => {
+    const existing = voicePeerConnectionsRef.current.get(peerUserId);
+    if (existing) {
+      if (canPublish && voiceLocalStreamRef.current) {
+        const senders = existing.getSenders();
+        const hasAudio = senders.some((sender) => sender.track?.kind === 'audio');
+        if (!hasAudio) {
+          voiceLocalStreamRef.current.getAudioTracks().forEach((track) => {
+            existing.addTrack(track, voiceLocalStreamRef.current!);
+          });
+        }
+      }
+      if (!canPublish) {
+        existing.getSenders().forEach((sender) => {
+          if (sender.track) {
+            try {
+              existing.removeTrack(sender);
+            } catch {
+              // ignore
+            }
+          }
+        });
+      }
+      return existing;
+    }
+
+    const roomId = voiceActiveRoomIdRef.current;
+    const connection = new RTCPeerConnection(WEBRTC_CONFIGURATION);
+    connection.onicecandidate = (event) => {
+      if (event.candidate && roomId) {
+        emitVoiceSignal(roomId, 'ice-candidate', event.candidate.toJSON(), peerUserId);
+      }
+    };
+    connection.ontrack = (event) => {
+      let audio = voiceRemoteAudioRef.current.get(peerUserId);
+      if (!audio) {
+        audio = new Audio();
+        audio.autoplay = true;
+        voiceRemoteAudioRef.current.set(peerUserId, audio);
+      }
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+      audio.srcObject = stream;
+      void audio.play().catch(() => undefined);
+    };
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === 'failed' || connection.connectionState === 'closed') {
+        closeVoicePeer(peerUserId);
+      }
+    };
+
+    if (canPublish) {
+      try {
+        const localStream = await ensureVoiceLocalStream();
+        localStream.getAudioTracks().forEach((track) => connection.addTrack(track, localStream));
+      } catch {
+        showToast('Microphone unavailable — controls still work');
+      }
+    } else {
+      connection.addTransceiver('audio', { direction: 'recvonly' });
+    }
+
+    voicePeerConnectionsRef.current.set(peerUserId, connection);
+    return connection;
+  };
+
+  const offerVoicePeer = async (peerUserId: string, canPublish: boolean) => {
+    if (voiceMakingOfferRef.current.has(peerUserId)) return;
+    voiceMakingOfferRef.current.add(peerUserId);
+    try {
+      const roomId = voiceActiveRoomIdRef.current;
+      if (!roomId) return;
+      const connection = await ensureVoicePeerConnection(peerUserId, canPublish);
+      const offer = await connection.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: false,
+      });
+      await connection.setLocalDescription(offer);
+      emitVoiceSignal(roomId, 'offer', offer, peerUserId);
+    } catch {
+      showToast('Voice mesh offer failed');
+    } finally {
+      voiceMakingOfferRef.current.delete(peerUserId);
+    }
+  };
+
+  const syncVoiceMesh = async (participants: VoiceRoomParticipant[]) => {
+    const me = currentUserIdRef.current;
+    const roomId = voiceActiveRoomIdRef.current;
+    if (!me || !roomId) return;
+
+    const myPart = participants.find((item) => item.userId === me && item.state === 'active');
+    const others = participants.filter((item) => item.state === 'active' && item.userId !== me);
+    voiceMyRoleRef.current = myPart?.role ?? null;
+
+    for (const peerUserId of Array.from(voicePeerConnectionsRef.current.keys())) {
+      if (!others.some((item) => item.userId === peerUserId)) {
+        closeVoicePeer(peerUserId);
+      }
+    }
+
+    if (!myPart) {
+      cleanupVoiceMesh(true);
+      return;
+    }
+
+    const iPublish = isVoicePublisherRole(myPart.role) && !myPart.forceMuted;
+    const iAmPublisherRole = isVoicePublisherRole(myPart.role);
+
+    if (iAmPublisherRole) {
+      try {
+        await ensureVoiceLocalStream();
+        applyVoiceLocalMute(myPart.muted || myPart.forceMuted);
+      } catch {
+        showToast('Microphone unavailable — controls still work');
+      }
+    } else {
+      voiceLocalStreamRef.current?.getTracks().forEach((track) => track.stop());
+      voiceLocalStreamRef.current = null;
+      setVoiceMicMuted(true);
+      // Tear down publish legs so demote stops sending immediately.
+      for (const peerUserId of Array.from(voicePeerConnectionsRef.current.keys())) {
+        closeVoicePeer(peerUserId);
+      }
+    }
+
+    for (const peer of others) {
+      const peerPublishes = isVoicePublisherRole(peer.role);
+      if (!iAmPublisherRole && !peerPublishes) continue;
+
+      const shouldOffer =
+        iAmPublisherRole &&
+        (iPublish || peerPublishes) &&
+        (!peerPublishes || me < peer.userId);
+
+      if (shouldOffer) {
+        await offerVoicePeer(peer.userId, iPublish);
+      } else if (iAmPublisherRole && peerPublishes && me > peer.userId) {
+        await ensureVoicePeerConnection(peer.userId, iPublish);
+      }
+    }
+  };
+
+  const exitVoiceRoomLocal = (opts?: { emitLeave?: boolean; toast?: string }) => {
+    const roomId = voiceActiveRoomIdRef.current;
+    const userId = currentUserIdRef.current;
+    if (opts?.emitLeave && roomId && userId) {
+      socketRef.current?.emit('voice:leave', { roomId, userId });
+    }
+    cleanupVoiceMesh(true);
+    voiceActiveRoomIdRef.current = '';
+    voiceMyRoleRef.current = null;
+    voiceParticipantsRef.current = [];
+    setActiveVoiceRoom(null);
+    setVoiceParticipants([]);
+    setVoiceReconnecting(false);
+    setVoiceCreatedInviteToken('');
+    setVoiceMicMuted(false);
+    if (opts?.toast) showToast(opts.toast);
+  };
+
+  const loadVoiceRoomsList = useCallback(async () => {
+    if (!currentUserId) return;
+    const response = await fetch(
+      `${API_BASE_URL}/api/voice-rooms?userId=${encodeURIComponent(currentUserId)}`,
+    );
+    const payload = await voiceJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Could not load voice rooms');
+      return;
+    }
+    setVoiceRoomsMine(payload.mine ?? []);
+    setVoiceRoomsLivePublic(payload.livePublic ?? []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId]);
+
+  const enterVoiceRoomSession = async (room: VoiceRoomPreview, participant?: VoiceRoomParticipant | null) => {
+    const userId = currentUserIdRef.current;
+    if (!userId || !room.id) return;
+    const previousRoomId = voiceActiveRoomIdRef.current;
+    if (previousRoomId && previousRoomId !== room.id) {
+      socketRef.current?.emit('voice:leave', { roomId: previousRoomId, userId });
+      cleanupVoiceMesh(true);
+    }
+    voiceActiveRoomIdRef.current = room.id;
+    voiceMyRoleRef.current = participant?.role ?? room.myRole;
+    setActiveVoiceRoom({
+      ...room,
+      myRole: participant?.role ?? room.myRole,
+      myState: participant?.state ?? room.myState ?? 'active',
+      muted: participant?.muted ?? room.muted,
+      handRaised: participant?.handRaised ?? room.handRaised,
+    });
+    setVoiceMicMuted(Boolean(participant?.muted ?? room.muted));
+    socketRef.current?.emit('voice:join', { roomId: room.id, userId });
+    setActiveView('voiceRooms');
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/voice-rooms/${encodeURIComponent(room.id)}/participants?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await voiceJson(response);
+      if (response.ok && Array.isArray(payload.participants)) {
+        const next = payload.participants as VoiceRoomParticipant[];
+        voiceParticipantsRef.current = next;
+        setVoiceParticipants(next);
+        await syncVoiceMesh(next);
+      }
+    } catch {
+      // socket voice:participants will fill in
+    }
+  };
+
+  const createVoiceRoom = async () => {
+    if (!currentUserId) return;
+    const title = voiceCreateForm.title.trim();
+    if (title.length < 2) {
+      showToast('Enter a room title');
+      return;
+    }
+    setVoiceBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/voice-rooms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          title,
+          description: voiceCreateForm.description.trim(),
+          rules: voiceCreateForm.rules.trim(),
+          privacy: voiceCreateForm.privacy,
+        }),
+      });
+      const payload = await voiceJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create voice room');
+        return;
+      }
+      setVoiceCreateForm({ title: '', description: '', rules: '', privacy: 'public' });
+      showToast('Voice room live');
+      await loadVoiceRoomsList();
+      if (payload.room) {
+        await enterVoiceRoomSession(payload.room, payload.participant);
+      }
+    } catch {
+      showToast('Could not create voice room');
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  const joinVoiceRoom = async (roomId: string, inviteToken?: string) => {
+    if (!currentUserId) return;
+    setVoiceBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/voice-rooms/${encodeURIComponent(roomId)}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          ...(inviteToken ? { inviteToken } : {}),
+        }),
+      });
+      const payload = await voiceJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not join voice room');
+        return;
+      }
+      showToast(payload.alreadyJoined ? 'Already in room' : 'Joined voice room');
+      await loadVoiceRoomsList();
+      if (payload.room) {
+        await enterVoiceRoomSession(payload.room, payload.participant);
+      }
+    } catch {
+      showToast('Could not join voice room');
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  const leaveVoiceRoom = async () => {
+    const roomId = voiceActiveRoomIdRef.current || activeVoiceRoom?.id;
+    if (!currentUserId || !roomId) return;
+    setVoiceBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/voice-rooms/${encodeURIComponent(roomId)}/leave`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await voiceJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not leave');
+        return;
+      }
+      exitVoiceRoomLocal({ emitLeave: true, toast: payload.ended ? 'Room ended' : 'Left voice room' });
+      await loadVoiceRoomsList();
+    } catch {
+      showToast('Could not leave');
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  const endVoiceRoom = async () => {
+    const roomId = voiceActiveRoomIdRef.current || activeVoiceRoom?.id;
+    if (!currentUserId || !roomId) return;
+    setVoiceBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/voice-rooms/${encodeURIComponent(roomId)}/end`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await voiceJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not end room');
+        return;
+      }
+      exitVoiceRoomLocal({ emitLeave: true, toast: 'Room ended' });
+      await loadVoiceRoomsList();
+    } catch {
+      showToast('Could not end room');
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  const voiceRoomAction = async (
+    path: string,
+    body: Record<string, unknown> = {},
+    okToast?: string,
+  ) => {
+    if (!currentUserId) return null;
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, ...body }),
+    });
+    const payload = await voiceJson(response);
+    if (!response.ok) {
+      showToast(payload.error || 'Action failed');
+      return null;
+    }
+    if (okToast) showToast(okToast);
+    return payload;
+  };
+
+  const raiseVoiceHand = async () => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(`/api/voice-rooms/${encodeURIComponent(roomId)}/raise-hand`, {}, 'Hand raised');
+  };
+
+  const lowerVoiceHand = async () => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(`/api/voice-rooms/${encodeURIComponent(roomId)}/lower-hand`, {}, 'Hand lowered');
+  };
+
+  const toggleVoiceMic = async () => {
+    const room = activeVoiceRoom;
+    const me = voiceParticipants.find((item) => item.userId === currentUserId && item.state === 'active');
+    if (!room || !me || !isVoicePublisherRole(me.role)) return;
+    if (me.forceMuted && me.muted) {
+      showToast('You were muted by the host');
+      return;
+    }
+    const nextMuted = !me.muted;
+    const payload = await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(room.id)}/participants/${encodeURIComponent(currentUserId)}/mute`,
+      { muted: nextMuted },
+    );
+    if (!payload?.participant) return;
+    applyVoiceLocalMute(Boolean(payload.participant.muted));
+  };
+
+  const approveVoiceSpeaker = async (targetUserId: string) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/speakers/${encodeURIComponent(targetUserId)}/approve`,
+      {},
+      'Speaker approved',
+    );
+  };
+
+  const rejectVoiceHand = async (targetUserId: string) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/speakers/${encodeURIComponent(targetUserId)}/reject`,
+      {},
+      'Hand rejected',
+    );
+  };
+
+  const demoteVoiceSpeaker = async (targetUserId: string) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/speakers/${encodeURIComponent(targetUserId)}/demote`,
+      {},
+      'Demoted to listener',
+    );
+  };
+
+  const muteVoiceParticipant = async (targetUserId: string, muted: boolean) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(targetUserId)}/mute`,
+      { muted },
+      muted ? 'Muted' : 'Unmuted',
+    );
+  };
+
+  const removeVoiceParticipant = async (targetUserId: string) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/participants/${encodeURIComponent(targetUserId)}/remove`,
+      { block: false },
+      'Removed',
+    );
+  };
+
+  const promoteVoiceModerator = async (targetUserId: string) => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/moderators/${encodeURIComponent(targetUserId)}`,
+      {},
+      'Moderator added',
+    );
+  };
+
+  const createVoiceInvite = async () => {
+    const roomId = activeVoiceRoom?.id;
+    if (!roomId) return;
+    const payload = await voiceRoomAction(
+      `/api/voice-rooms/${encodeURIComponent(roomId)}/invites`,
+      { role: 'listener' },
+      'Invite created',
+    );
+    if (payload?.invite?.token) {
+      setVoiceCreatedInviteToken(payload.invite.token);
+    }
+  };
+
+  const acceptVoiceInvite = async () => {
+    const token = voiceInviteTokenDraft.trim();
+    if (!currentUserId || !token) {
+      showToast('Paste an invite token');
+      return;
+    }
+    setVoiceBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/voice-rooms/invites/${encodeURIComponent(token)}/accept`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await voiceJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Invite failed');
+        return;
+      }
+      setVoiceInviteTokenDraft('');
+      showToast('Invite accepted');
+      await loadVoiceRoomsList();
+      if (payload.room) {
+        await enterVoiceRoomSession(payload.room, payload.participant);
+      }
+    } catch {
+      showToast('Invite failed');
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    voiceParticipantsRef.current = voiceParticipants;
+  }, [voiceParticipants]);
+
+  useEffect(() => {
+    if (activeView === 'voiceRooms' && currentUserId) {
+      void loadVoiceRoomsList();
+    }
+  }, [activeView, currentUserId, loadVoiceRoomsList]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) return undefined;
+
+    const onVoiceRoom = (payload: {
+      room?: VoiceRoomPreview;
+      action?: string;
+      error?: string;
+    }) => {
+      if (payload.error) {
+        showToast(payload.error);
+      }
+      if (!payload.room) return;
+      const room = payload.room;
+      if (voiceActiveRoomIdRef.current === room.id || activeVoiceRoom?.id === room.id) {
+        if (payload.action === 'removed' || payload.action === 'blocked') {
+          exitVoiceRoomLocal({ emitLeave: true, toast: payload.action === 'blocked' ? 'Blocked from room' : 'Removed from room' });
+          void loadVoiceRoomsList();
+          return;
+        }
+        if (payload.action === 'speaker_demoted') {
+          cleanupVoiceMesh(true);
+        }
+        setActiveVoiceRoom((current) => (current?.id === room.id ? { ...current, ...room } : room));
+        voiceMyRoleRef.current = room.myRole;
+        if (room.myRole && isVoicePublisherRole(room.myRole)) {
+          void syncVoiceMesh(voiceParticipantsRef.current);
+        } else if (payload.action === 'speaker_demoted' || payload.action === 'speaker_approved') {
+          void syncVoiceMesh(voiceParticipantsRef.current);
+        }
+      }
+      void loadVoiceRoomsList();
+    };
+
+    const onVoiceParticipants = (payload: {
+      roomId?: string;
+      participants?: VoiceRoomParticipant[];
+    }) => {
+      if (!payload.roomId || payload.roomId !== voiceActiveRoomIdRef.current) return;
+      const next = payload.participants ?? [];
+      voiceParticipantsRef.current = next;
+      setVoiceParticipants(next);
+      const me = next.find((item) => item.userId === currentUserIdRef.current && item.state === 'active');
+      if (me) {
+        setActiveVoiceRoom((current) =>
+          current
+            ? {
+                ...current,
+                myRole: me.role,
+                myState: me.state,
+                muted: me.muted,
+                handRaised: me.handRaised,
+              }
+            : current,
+        );
+        voiceMyRoleRef.current = me.role;
+        if (isVoicePublisherRole(me.role)) {
+          applyVoiceLocalMute(me.muted || me.forceMuted);
+        }
+      } else if (voiceActiveRoomIdRef.current) {
+        exitVoiceRoomLocal({ toast: 'Left voice room' });
+        void loadVoiceRoomsList();
+        return;
+      }
+      void syncVoiceMesh(next);
+    };
+
+    const onVoiceSignal = (payload: {
+      roomId?: string;
+      fromUserId?: string;
+      toUserId?: string;
+      signalType?: 'offer' | 'answer' | 'ice-candidate';
+      payload?: any;
+    }) => {
+      const roomId = payload.roomId;
+      const fromUserId = payload.fromUserId;
+      const signalType = payload.signalType;
+      if (!roomId || !fromUserId || !signalType) return;
+      if (roomId !== voiceActiveRoomIdRef.current) return;
+      if (payload.toUserId && payload.toUserId !== currentUserIdRef.current) return;
+      if (fromUserId === currentUserIdRef.current) return;
+
+      void (async () => {
+        try {
+          const myRole = voiceMyRoleRef.current;
+          const iAmPublisher = isVoicePublisherRole(myRole);
+          if (signalType === 'offer') {
+            const connection = await ensureVoicePeerConnection(fromUserId, iAmPublisher);
+            await connection.setRemoteDescription(new RTCSessionDescription(payload.payload));
+            const answer = await connection.createAnswer();
+            await connection.setLocalDescription(answer);
+            emitVoiceSignal(roomId, 'answer', answer, fromUserId);
+            return;
+          }
+          if (signalType === 'answer') {
+            const connection = voicePeerConnectionsRef.current.get(fromUserId)
+              ?? (await ensureVoicePeerConnection(fromUserId, iAmPublisher));
+            await connection.setRemoteDescription(new RTCSessionDescription(payload.payload));
+            return;
+          }
+          if (signalType === 'ice-candidate' && payload.payload) {
+            const connection = voicePeerConnectionsRef.current.get(fromUserId)
+              ?? (await ensureVoicePeerConnection(fromUserId, iAmPublisher));
+            await connection.addIceCandidate(new RTCIceCandidate(payload.payload));
+          }
+        } catch {
+          // keep UI; mesh may recover on next participant sync
+        }
+      })();
+    };
+
+    const onVoiceEnded = (payload: { roomId?: string }) => {
+      if (payload.roomId && payload.roomId === voiceActiveRoomIdRef.current) {
+        exitVoiceRoomLocal({ toast: 'Room ended' });
+        void loadVoiceRoomsList();
+      }
+    };
+
+    const onVoiceReconnecting = (payload: { roomId?: string; userId?: string }) => {
+      if (payload.roomId === voiceActiveRoomIdRef.current && payload.userId === currentUserIdRef.current) {
+        setVoiceReconnecting(true);
+      }
+    };
+
+    const onDisconnect = () => {
+      if (voiceActiveRoomIdRef.current) {
+        setVoiceReconnecting(true);
+      }
+    };
+
+    const onConnect = () => {
+      const roomId = voiceActiveRoomIdRef.current;
+      const userId = currentUserIdRef.current;
+      if (roomId && userId) {
+        socket.emit('voice:join', { roomId, userId });
+        setVoiceReconnecting(false);
+      }
+    };
+
+    socket.on('voice:room', onVoiceRoom);
+    socket.on('voice:participants', onVoiceParticipants);
+    socket.on('voice:signal', onVoiceSignal);
+    socket.on('voice:ended', onVoiceEnded);
+    socket.on('voice:reconnecting', onVoiceReconnecting);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect', onConnect);
+    return () => {
+      socket.off('voice:room', onVoiceRoom);
+      socket.off('voice:participants', onVoiceParticipants);
+      socket.off('voice:signal', onVoiceSignal);
+      socket.off('voice:ended', onVoiceEnded);
+      socket.off('voice:reconnecting', onVoiceReconnecting);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect', onConnect);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId, loadVoiceRoomsList, activeVoiceRoom?.id]);
+
+  const emitGameSocketJoin = useCallback((sessionId: string, userId: string) => {
+    const socket = socketRef.current;
+    if (!socket || !sessionId || !userId) return;
+    socket.emit('game:join', { sessionId, userId });
+  }, []);
+
+  const emitGameSocketLeave = useCallback((sessionId: string) => {
+    const socket = socketRef.current;
+    if (!socket || !sessionId) return;
+    socket.emit('game:leave', { sessionId });
+  }, []);
+
+  const upsertGameSessionMine = useCallback((session: GameSessionPublic) => {
+    setGameSessionsMine((current) => {
+      const index = current.findIndex((item) => item.id === session.id);
+      if (index < 0) {
+        if (session.status === 'cancelled') return current;
+        return [session, ...current];
+      }
+      const next = [...current];
+      next[index] = session;
+      return next.filter((item) => item.status !== 'cancelled');
+    });
+  }, []);
+
+  const loadGamesCatalog = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/games`);
+      const payload = await response.json();
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load games.');
+        return;
+      }
+      setGameCatalog(Array.isArray(payload.games) ? payload.games : []);
+      if (typeof payload.pointsNote === 'string' && payload.pointsNote.trim()) {
+        setGamePointsNote(payload.pointsNote);
+      }
+    } catch {
+      showToast('Could not load games.');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const loadGamesLeaderboard = useCallback(async (userId: string) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/leaderboard?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok) return;
+      setGameLeaderboard(Array.isArray(payload.leaderboard) ? payload.leaderboard : []);
+      setGameLeaderboardMine(payload.mine ?? null);
+      if (typeof payload.pointsNote === 'string' && payload.pointsNote.trim()) {
+        setGamePointsNote(payload.pointsNote);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const refreshMyGameSessions = useCallback(async (userId: string) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/mine?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok) return;
+      setGameSessionsMine(Array.isArray(payload.sessions) ? payload.sessions : []);
+      if (typeof payload.pointsNote === 'string' && payload.pointsNote.trim()) {
+        setGamePointsNote(payload.pointsNote);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const loadGamesHome = useCallback(async (userId: string) => {
+    await Promise.all([
+      loadGamesCatalog(),
+      loadGamesLeaderboard(userId),
+      refreshMyGameSessions(userId),
+    ]);
+  }, [loadGamesCatalog, loadGamesLeaderboard, refreshMyGameSessions]);
+
+  const resetGamePlayState = useCallback(() => {
+    setGameRoundPhase(null);
+    setGameCurrentRound(null);
+    setGameRoundResult(null);
+    setGameRoundMeta({ roundIndex: 0, roundStartedAt: null, roundTimeoutMs: 30000 });
+    setGameMyAnswerIndex(null);
+    setGameRoundSecondsLeft(null);
+  }, []);
+
+  const exitGameUi = useCallback(async (options?: {
+    leaveServer?: boolean;
+    skipSocketLeave?: boolean;
+  }) => {
+    const sessionId = gameActiveSessionIdRef.current;
+    const userId = currentUserIdRef.current;
+    const leaveServer = options?.leaveServer ?? false;
+    const skipSocketLeave = options?.skipSocketLeave ?? false;
+
+    if (leaveServer && sessionId && userId) {
+      try {
+        await fetch(`${API_BASE_URL}/api/games/sessions/${encodeURIComponent(sessionId)}/leave`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId }),
+        });
+      } catch {
+        // ignore
+      }
+    }
+    if (!skipSocketLeave && sessionId) {
+      emitGameSocketLeave(sessionId);
+    }
+
+    gameActiveSessionIdRef.current = '';
+    setGameActiveSession(null);
+    setGameScreen('list');
+    setGameSelectedSlug('');
+    setGameInviteSelectedIds([]);
+    resetGamePlayState();
+    if (userId) void refreshMyGameSessions(userId);
+  }, [emitGameSocketLeave, refreshMyGameSessions, resetGamePlayState]);
+
+  const enterGameSession = useCallback((session: GameSessionPublic, screen?: GameScreen) => {
+    gameActiveSessionIdRef.current = session.id;
+    setGameActiveSession(session);
+    upsertGameSessionMine(session);
+    emitGameSocketJoin(session.id, currentUserIdRef.current);
+    if (session.chatId) setGameChatId(session.chatId);
+    if (screen) {
+      setGameScreen(screen);
+      return;
+    }
+    if (session.status === 'lobby') setGameScreen('lobby');
+    else if (session.status === 'active') setGameScreen('play');
+    else if (session.status === 'finished') setGameScreen('finished');
+    else setGameScreen('list');
+  }, [emitGameSocketJoin, upsertGameSessionMine]);
+
+  const beginGameInviteFlow = useCallback((slug: string, chatId?: string | null) => {
+    const entry = gameCatalog.find((item) => item.slug === slug);
+    if (!entry || entry.comingSoon) {
+      showToast(entry?.comingSoon ? 'This game is coming soon.' : 'Game not found.');
+      return;
+    }
+    setGameSelectedSlug(slug);
+    setGameChatId(chatId || null);
+    const preselect: string[] = [];
+    if (chatId) {
+      const chat = chatItems.find((item) => item.id === chatId);
+      if (chat?.peerUserId && chat.peerUserId !== currentUserIdRef.current) {
+        preselect.push(chat.peerUserId);
+      }
+    }
+    setGameInviteSelectedIds(preselect);
+    setGameScreen('invite');
+    setActiveView('games');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatItems, gameCatalog]);
+
+  const openPlayGameFromChat = useCallback(() => {
+    if (!selectedChatId) {
+      showToast('Open a chat first.');
+      return;
+    }
+    setGameChatId(selectedChatId);
+    setGameScreen('list');
+    setGameSelectedSlug('');
+    setGameInviteSelectedIds([]);
+    setActiveView('games');
+    showToast('Pick a game to play with this chat.');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedChatId]);
+
+  const createGameSession = async () => {
+    if (!currentUserId || !gameSelectedSlug || gameBusy) return;
+    const entry = gameCatalog.find((item) => item.slug === gameSelectedSlug);
+    if (!entry || entry.comingSoon) {
+      showToast('Pick a playable game.');
+      return;
+    }
+    if (gameInviteSelectedIds.length + 1 > entry.maxPlayers) {
+      showToast(`Max ${entry.maxPlayers} players for this game.`);
+      return;
+    }
+    setGameBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/games/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          gameSlug: gameSelectedSlug,
+          chatId: gameChatId || undefined,
+          inviteUserIds: gameInviteSelectedIds,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.session) {
+        showToast(payload.error || 'Could not create session.');
+        return;
+      }
+      enterGameSession(payload.session as GameSessionPublic, 'lobby');
+      showToast('Lobby ready — waiting for players.');
+    } catch {
+      showToast('Could not create session.');
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const acceptGameInvite = async (sessionId: string) => {
+    if (!currentUserId || !sessionId || gameBusy) return;
+    setGameBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(sessionId)}/join`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok || !payload.session) {
+        showToast(payload.error || 'Could not join game.');
+        return;
+      }
+      setGamePendingInvite(null);
+      setActiveView('games');
+      enterGameSession(payload.session as GameSessionPublic, 'lobby');
+      showToast('Joined lobby.');
+    } catch {
+      showToast('Could not join game.');
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const declineGameInvite = async (sessionId: string) => {
+    if (!currentUserId || !sessionId) return;
+    setGamePendingInvite(null);
+    try {
+      await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(sessionId)}/decline`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      showToast('Invite declined.');
+      void refreshMyGameSessions(currentUserId);
+    } catch {
+      showToast('Could not decline invite.');
+    }
+  };
+
+  const startGameSession = async () => {
+    if (!currentUserId || !gameActiveSession || gameBusy) return;
+    setGameBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(gameActiveSession.id)}/start`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok || !payload.session) {
+        showToast(payload.error || 'Could not start game.');
+        return;
+      }
+      enterGameSession(payload.session as GameSessionPublic, 'play');
+    } catch {
+      showToast('Could not start game.');
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const submitGameAnswer = async (answerIndex: number) => {
+    if (!currentUserId || !gameActiveSession || gameBusy) return;
+    if (gameRoundPhase !== 'prompt' || gameMyAnswerIndex !== null) return;
+    setGameMyAnswerIndex(answerIndex);
+    setGameBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(gameActiveSession.id)}/answer`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            roundIndex: gameRoundMeta.roundIndex,
+            answerIndex,
+          }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        showToast(payload.error || 'Answer rejected.');
+        if (payload.session) {
+          setGameActiveSession(payload.session as GameSessionPublic);
+        }
+        if (payload.error !== 'Already answered this round.') {
+          setGameMyAnswerIndex(null);
+        }
+        return;
+      }
+      if (payload.session) {
+        setGameActiveSession(payload.session as GameSessionPublic);
+      }
+    } catch {
+      showToast('Could not submit answer.');
+      setGameMyAnswerIndex(null);
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const cancelGameSession = async () => {
+    if (!currentUserId || !gameActiveSession || gameBusy) return;
+    setGameBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(gameActiveSession.id)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        showToast(payload.error || 'Could not cancel.');
+        return;
+      }
+      showToast('Session cancelled.');
+      await exitGameUi({ leaveServer: false, skipSocketLeave: false });
+    } catch {
+      showToast('Could not cancel.');
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const resumeGameSession = async (sessionId: string) => {
+    if (!currentUserId || !sessionId || gameBusy) return;
+    setGameBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/games/sessions/${encodeURIComponent(sessionId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json();
+      if (!response.ok || !payload.session) {
+        showToast(payload.error || 'Could not resume session.');
+        return;
+      }
+      const session = payload.session as GameSessionPublic;
+      resetGamePlayState();
+      enterGameSession(session);
+      if (session.status === 'active') {
+        const round = session.rounds[session.roundIndex];
+        if (round) setGameCurrentRound(round);
+        setGameRoundMeta({
+          roundIndex: session.roundIndex,
+          roundStartedAt: session.roundStartedAt || null,
+          roundTimeoutMs: session.roundTimeoutMs || 30000,
+        });
+        setGameRoundPhase('prompt');
+        const myAnswers = session.players.find((player) => player.userId === currentUserId)?.answers;
+        const answered = myAnswers?.[String(session.roundIndex)];
+        setGameMyAnswerIndex(typeof answered === 'number' ? answered : null);
+      }
+    } catch {
+      showToast('Could not resume session.');
+    } finally {
+      setGameBusy(false);
+    }
+  };
+
+  const gameInviteCandidates = useMemo(() => {
+    const byId = new Map<string, AppUser>();
+    users.forEach((user) => {
+      if (user.id !== currentUserId) byId.set(user.id, user);
+    });
+    chatItems.forEach((chat) => {
+      if (chat.peerUserId && chat.peerUserId !== currentUserId && !byId.has(chat.peerUserId)) {
+        byId.set(chat.peerUserId, {
+          id: chat.peerUserId,
+          name: chat.name,
+          avatar: chat.name.slice(0, 2).toUpperCase(),
+          phone: '',
+        });
+      }
+    });
+    return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [chatItems, currentUserId, users]);
+
+  useEffect(() => {
+    if (activeView === 'games' && currentUserId) {
+      void loadGamesHome(currentUserId);
+    }
+  }, [activeView, currentUserId, loadGamesHome]);
+
+  useEffect(() => {
+    if (gameRoundPhase !== 'prompt' || !gameRoundMeta.roundStartedAt) {
+      setGameRoundSecondsLeft(null);
+      return undefined;
+    }
+    const started = Date.parse(gameRoundMeta.roundStartedAt);
+    const tick = () => {
+      const left = Math.max(
+        0,
+        Math.ceil((started + gameRoundMeta.roundTimeoutMs - Date.now()) / 1000),
+      );
+      setGameRoundSecondsLeft(left);
+    };
+    tick();
+    const handle = window.setInterval(tick, 250);
+    return () => window.clearInterval(handle);
+  }, [gameRoundMeta.roundStartedAt, gameRoundMeta.roundTimeoutMs, gameRoundPhase]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !currentUserId) return undefined;
+
+    const onGameInvite = (payload: GamePendingInvite) => {
+      if (!payload?.sessionId || !payload?.session) return;
+      if (payload.fromUserId && payload.fromUserId === currentUserIdRef.current) return;
+      setGamePendingInvite(payload);
+      const title = payload.title || payload.gameSlug || 'Game';
+      const fromName = getUserMeta(payload.fromUserId).name;
+      showToast(`${fromName} invited you to ${title}`, 4000);
+    };
+
+    const onGameSession = (payload: {
+      session?: GameSessionPublic;
+      action?: string;
+      error?: string;
+    }) => {
+      const session = payload?.session;
+      if (!session?.id) {
+        if (payload?.action === 'join_rejected' && payload.error) {
+          showToast(payload.error);
+        }
+        return;
+      }
+      if (payload?.action === 'join_rejected') {
+        if (payload.error) showToast(payload.error);
+        return;
+      }
+      upsertGameSessionMine(session);
+      if (gameActiveSessionIdRef.current && session.id === gameActiveSessionIdRef.current) {
+        setGameActiveSession(session);
+        if (session.status === 'lobby') setGameScreen('lobby');
+        if (session.status === 'active') {
+          setGameScreen((current) => (current === 'finished' ? current : 'play'));
+        }
+        if (session.status === 'finished') setGameScreen('finished');
+        if (session.status === 'cancelled') {
+          showToast('Game cancelled.');
+          void exitGameUi({ leaveServer: false, skipSocketLeave: false });
+        }
+      }
+      void refreshMyGameSessions(currentUserIdRef.current);
+    };
+
+    const onGameRound = (payload: {
+      sessionId?: string;
+      roundIndex?: number;
+      round?: GameRoundPublic | null;
+      roundStartedAt?: string | null;
+      roundTimeoutMs?: number;
+      phase?: 'prompt' | 'result';
+      session?: GameSessionPublic;
+      picks?: Array<{ userId: string; answerIndex: number | null }>;
+      players?: Array<{ userId: string; status: GamePlayerStatus; score: number }>;
+    }) => {
+      if (!payload?.sessionId) return;
+      if (gameActiveSessionIdRef.current && payload.sessionId !== gameActiveSessionIdRef.current) {
+        return;
+      }
+      if (!gameActiveSessionIdRef.current && payload.session) {
+        enterGameSession(payload.session, 'play');
+      }
+      if (payload.session) setGameActiveSession(payload.session);
+      setGameRoundMeta({
+        roundIndex: payload.roundIndex ?? 0,
+        roundStartedAt: payload.roundStartedAt || null,
+        roundTimeoutMs: payload.roundTimeoutMs || 30000,
+      });
+      if (payload.phase === 'result') {
+        setGameRoundPhase('result');
+        setGameRoundResult({
+          roundIndex: payload.roundIndex ?? 0,
+          round: payload.round,
+          picks: payload.picks || [],
+          players: payload.players || [],
+        });
+        if (payload.round) setGameCurrentRound(payload.round);
+        return;
+      }
+      setGameRoundPhase('prompt');
+      setGameCurrentRound(payload.round || null);
+      setGameRoundResult(null);
+      setGameMyAnswerIndex(null);
+      setGameScreen('play');
+    };
+
+    const onGameFinished = (payload: {
+      sessionId?: string;
+      session?: GameSessionPublic;
+      results?: GameResultsSummary | null;
+    }) => {
+      if (!payload?.sessionId) return;
+      if (gameActiveSessionIdRef.current && payload.sessionId !== gameActiveSessionIdRef.current) {
+        void refreshMyGameSessions(currentUserIdRef.current);
+        return;
+      }
+      if (payload.session) {
+        setGameActiveSession(payload.session);
+        upsertGameSessionMine(payload.session);
+      }
+      setGameScreen('finished');
+      setGameRoundPhase(null);
+      void refreshMyGameSessions(currentUserIdRef.current);
+      void loadGamesLeaderboard(currentUserIdRef.current);
+    };
+
+    socket.on('game:invite', onGameInvite);
+    socket.on('game:session', onGameSession);
+    socket.on('game:round', onGameRound);
+    socket.on('game:finished', onGameFinished);
+    return () => {
+      socket.off('game:invite', onGameInvite);
+      socket.off('game:session', onGameSession);
+      socket.off('game:round', onGameRound);
+      socket.off('game:finished', onGameFinished);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    currentUserId,
+    enterGameSession,
+    exitGameUi,
+    getUserMeta,
+    loadGamesLeaderboard,
+    refreshMyGameSessions,
+    upsertGameSessionMine,
+  ]);
+
+  const renderGamesView = () => {
+    const catalogEntry = gameCatalog.find((item) => item.slug === gameSelectedSlug)
+      || gameCatalog.find((item) => item.slug === gameActiveSession?.gameSlug);
+    const activePlayers = (gameActiveSession?.players || []).filter(
+      (player) => player.status === 'joined' || player.status === 'finished',
+    );
+    const joinedCount = (gameActiveSession?.players || []).filter(
+      (player) => player.status === 'joined',
+    ).length;
+    const isHost = gameActiveSession?.hostUserId === currentUserId;
+    const resumable = gameSessionsMine.filter(
+      (session) => session.status === 'lobby' || session.status === 'active',
+    );
+
+    const renderPlayerRow = (player: GamePlayerPublic) => {
+      const meta = getUserMeta(player.userId);
+      return (
+        <div className="game-player-row" key={player.userId}>
+          <strong>{meta.name}</strong>
+          <span>{player.status}{typeof player.score === 'number' ? ` · ${player.score} pts` : ''}</span>
+        </div>
+      );
+    };
+
+    if (gameScreen === 'invite' && catalogEntry) {
+      return (
+        <>
+          <section className="chat-sidebar community-sidebar games-sidebar">
+            <header className="chat-sidebar-header">
+              <h1>Invite</h1>
+            </header>
+            <div className="community-sidebar-scroll">
+              <p className="muted">{catalogEntry.title} · pick friends ({catalogEntry.minPlayers}–{catalogEntry.maxPlayers})</p>
+              {gameChatId ? <p className="game-chat-link">Sharing results to open chat</p> : null}
+              <div className="game-invite-list">
+                {gameInviteCandidates.map((user) => {
+                  const checked = gameInviteSelectedIds.includes(user.id);
+                  return (
+                    <label className="game-invite-row community-checkbox" key={user.id}>
+                      <input
+                        checked={checked}
+                        onChange={() => {
+                          setGameInviteSelectedIds((current) => {
+                            if (current.includes(user.id)) {
+                              return current.filter((id) => id !== user.id);
+                            }
+                            if (current.length + 1 >= (catalogEntry.maxPlayers)) {
+                              showToast(`Max ${catalogEntry.maxPlayers} players.`);
+                              return current;
+                            }
+                            return [...current, user.id];
+                          });
+                        }}
+                        type="checkbox"
+                      />
+                      <span>{user.name}</span>
+                    </label>
+                  );
+                })}
+                {!gameInviteCandidates.length ? <p className="muted">No contacts yet.</p> : null}
+              </div>
+              <div className="community-detail-actions game-actions-row">
+                <button
+                  disabled={gameBusy}
+                  onClick={() => {
+                    setGameScreen('list');
+                    setGameSelectedSlug('');
+                  }}
+                  type="button"
+                >
+                  Back
+                </button>
+                <button
+                  className="send-button"
+                  disabled={gameBusy}
+                  onClick={() => void createGameSession()}
+                  type="button"
+                >
+                  Create lobby
+                </button>
+              </div>
+            </div>
+          </section>
+          <main className="panel-shell community-detail-pane games-detail-pane">
+            <header className="panel-header">
+              <div>
+                <h2>{catalogEntry.title}</h2>
+                <p>{catalogEntry.description}</p>
+              </div>
+            </header>
+            <p className="game-points-note">{gamePointsNote}</p>
+          </main>
+        </>
+      );
+    }
+
+    if (gameScreen === 'lobby' && gameActiveSession) {
+      return (
+        <>
+          <section className="chat-sidebar community-sidebar games-sidebar">
+            <header className="chat-sidebar-header">
+              <h1>Lobby</h1>
+            </header>
+            <div className="community-sidebar-scroll">
+              <p className="muted">
+                {catalogEntry?.title || gameActiveSession.gameSlug}
+                {' · '}
+                {joinedCount} joined
+              </p>
+              {(gameActiveSession.players || []).map(renderPlayerRow)}
+              <div className="community-detail-actions game-actions-row">
+                {isHost ? (
+                  <>
+                    <button
+                      className="send-button"
+                      disabled={gameBusy || joinedCount < (catalogEntry?.minPlayers ?? 2)}
+                      onClick={() => void startGameSession()}
+                      type="button"
+                    >
+                      Start
+                    </button>
+                    <button disabled={gameBusy} onClick={() => void cancelGameSession()} type="button">
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    disabled={gameBusy}
+                    onClick={() => void exitGameUi({ leaveServer: true })}
+                    type="button"
+                  >
+                    Leave
+                  </button>
+                )}
+                <button disabled={gameBusy} onClick={() => void exitGameUi({ leaveServer: false })} type="button">
+                  Back to list
+                </button>
+              </div>
+            </div>
+          </section>
+          <main className="panel-shell community-detail-pane games-detail-pane">
+            <header className="panel-header">
+              <div>
+                <h2>Waiting in lobby</h2>
+                <p>Host starts when enough players have joined. Points are cosmetic only.</p>
+              </div>
+            </header>
+            <p className="game-points-note">{gamePointsNote}</p>
+          </main>
+        </>
+      );
+    }
+
+    if (gameScreen === 'play' && gameActiveSession) {
+      const round = gameCurrentRound
+        || (gameActiveSession.rounds?.[gameActiveSession.roundIndex] as GameRoundPublic | null);
+      return (
+        <>
+          <section className="chat-sidebar community-sidebar games-sidebar">
+            <header className="chat-sidebar-header">
+              <h1>Playing</h1>
+            </header>
+            <div className="community-sidebar-scroll">
+              <p className="muted">
+                Round {(gameRoundMeta.roundIndex ?? 0) + 1}
+                {typeof gameRoundSecondsLeft === 'number' ? ` · ${gameRoundSecondsLeft}s` : ''}
+              </p>
+              {activePlayers.map(renderPlayerRow)}
+              <button
+                className="community-inline-btn"
+                disabled={gameBusy}
+                onClick={() => void exitGameUi({ leaveServer: true })}
+                type="button"
+              >
+                Leave game
+              </button>
+            </div>
+          </section>
+          <main className="panel-shell community-detail-pane games-detail-pane">
+            <header className="panel-header community-detail-header">
+              <div>
+                <h2>{catalogEntry?.title || gameActiveSession.gameSlug}</h2>
+                <p>
+                  {gameRoundPhase === 'result' ? 'Round result' : 'Choose an answer'}
+                  {typeof gameRoundSecondsLeft === 'number' && gameRoundPhase === 'prompt'
+                    ? ` · ${gameRoundSecondsLeft}s left`
+                    : ''}
+                </p>
+              </div>
+            </header>
+            {round ? (
+              <div className="game-round-panel">
+                <h3>{round.prompt}</h3>
+                <div className="game-options">
+                  {round.options.map((option, index) => {
+                    const selected = gameMyAnswerIndex === index;
+                    const revealCorrect = gameRoundPhase === 'result'
+                      && typeof round.correctAnswerIndex === 'number'
+                      && round.correctAnswerIndex === index;
+                    return (
+                      <button
+                        className={`game-option-btn ${selected ? 'selected' : ''} ${revealCorrect ? 'correct' : ''}`}
+                        disabled={gameBusy || gameRoundPhase !== 'prompt' || gameMyAnswerIndex !== null}
+                        key={`${round.index}-${index}`}
+                        onClick={() => void submitGameAnswer(index)}
+                        type="button"
+                      >
+                        {option}
+                      </button>
+                    );
+                  })}
+                </div>
+                {gameMyAnswerIndex !== null && gameRoundPhase === 'prompt' ? (
+                  <p className="muted">Answer locked — waiting for others…</p>
+                ) : null}
+                {gameRoundPhase === 'result' && gameRoundResult ? (
+                  <div className="game-round-result">
+                    <h4>Picks</h4>
+                    {gameRoundResult.picks.map((pick) => (
+                      <p key={pick.userId}>
+                        {getUserMeta(pick.userId).name}
+                        {': '}
+                        {pick.answerIndex === null
+                          ? '—'
+                          : (gameRoundResult.round?.options?.[pick.answerIndex] ?? `#${pick.answerIndex}`)}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="muted">Waiting for round…</p>
+            )}
+          </main>
+        </>
+      );
+    }
+
+    if (gameScreen === 'finished' && gameActiveSession) {
+      const results = gameActiveSession.results;
+      return (
+        <>
+          <section className="chat-sidebar community-sidebar games-sidebar">
+            <header className="chat-sidebar-header">
+              <h1>Results</h1>
+            </header>
+            <div className="community-sidebar-scroll">
+              {(results?.scores || activePlayers.map((player) => ({
+                userId: player.userId,
+                score: player.score,
+              }))).map((row) => (
+                <div className="game-player-row" key={row.userId}>
+                  <strong>{getUserMeta(row.userId).name}</strong>
+                  <span>{row.score} pts</span>
+                </div>
+              ))}
+              <button
+                className="send-button community-inline-btn"
+                onClick={() => void exitGameUi({ leaveServer: false })}
+                type="button"
+              >
+                Back to games
+              </button>
+            </div>
+          </section>
+          <main className="panel-shell community-detail-pane games-detail-pane">
+            <header className="panel-header">
+              <div>
+                <h2>Game finished</h2>
+                <p>
+                  {results?.winnerUserIds?.length
+                    ? results.winnerUserIds.length > 1
+                      ? `Tie: ${results.winnerUserIds.map((id) => getUserMeta(id).name).join(', ')}`
+                      : `Winner: ${getUserMeta(results.winnerUserIds[0]).name}`
+                    : 'Thanks for playing'}
+                  {typeof results?.agreementPercent === 'number'
+                    ? ` · ${results.agreementPercent}% agreement`
+                    : ''}
+                </p>
+              </div>
+            </header>
+            {results?.funSummary ? <p>{results.funSummary}</p> : null}
+            <p className="game-points-note">{results?.pointsNote || gamePointsNote}</p>
+            {gameActiveSession.chatId ? (
+              <p className="muted">A summary was shared to the linked chat when available.</p>
+            ) : null}
+          </main>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <section className="chat-sidebar community-sidebar games-sidebar">
+          <header className="chat-sidebar-header">
+            <h1>Games</h1>
+          </header>
+          <div className="community-sidebar-scroll">
+            {gameChatId ? (
+              <p className="game-chat-link">Playing from chat — results can post there.</p>
+            ) : null}
+            <div className="community-section">
+              <h3>Active / resume</h3>
+              {resumable.length ? resumable.map((session) => {
+                const title = gameCatalog.find((item) => item.slug === session.gameSlug)?.title
+                  || session.gameSlug;
+                return (
+                  <button
+                    className="community-list-item"
+                    key={session.id}
+                    onClick={() => void resumeGameSession(session.id)}
+                    type="button"
+                  >
+                    <div className="community-list-avatar">🎮</div>
+                    <div className="community-list-copy">
+                      <strong>{title}</strong>
+                      <span>{session.status} · {(session.players || []).length} players</span>
+                    </div>
+                  </button>
+                );
+              }) : <p className="muted">No active sessions.</p>}
+            </div>
+            <div className="community-section">
+              <h3>Catalog</h3>
+              {gameCatalog.map((entry) => (
+                <button
+                  className={`community-list-item ${entry.comingSoon ? 'game-coming-soon' : ''}`}
+                  disabled={entry.comingSoon || gameBusy}
+                  key={entry.id}
+                  onClick={() => beginGameInviteFlow(entry.slug, gameChatId)}
+                  type="button"
+                >
+                  <div className="community-list-avatar">🎮</div>
+                  <div className="community-list-copy">
+                    <strong>{entry.title}</strong>
+                    <span>
+                      {entry.comingSoon ? 'Coming soon' : `${entry.minPlayers}–${entry.maxPlayers} players`}
+                      {' · '}
+                      {entry.description}
+                    </span>
+                  </div>
+                </button>
+              ))}
+              {!gameCatalog.length ? <p className="muted">Loading catalog…</p> : null}
+            </div>
+          </div>
+        </section>
+        <main className="panel-shell community-detail-pane games-detail-pane">
+          <header className="panel-header">
+            <div>
+              <h2>Games</h2>
+              <p>Play Quiz Battle or Would You Rather with friends. Fun points only — never cash.</p>
+            </div>
+          </header>
+          <p className="game-points-note">{gamePointsNote}</p>
+          <section className="game-leaderboard">
+            <h3>Leaderboard</h3>
+            <p className="muted">Cosmetic ranks — not redeemable, not gambling.</p>
+            {gameLeaderboardMine ? (
+              <p className="game-leaderboard-mine">
+                You: {gameLeaderboardMine.points} pts · {gameLeaderboardMine.wins} wins · {gameLeaderboardMine.gamesPlayed} played
+              </p>
+            ) : null}
+            <ol className="game-leaderboard-list">
+              {gameLeaderboard.slice(0, 10).map((row) => (
+                <li key={row.userId}>
+                  <span>#{row.rank} {row.name || getUserMeta(row.userId).name}</span>
+                  <span>{row.points} pts</span>
+                </li>
+              ))}
+            </ol>
+            {!gameLeaderboard.length ? <p className="muted">No scores yet — play a round!</p> : null}
+          </section>
+        </main>
+      </>
+    );
+  };
+
+  const renderVoiceRoomsView = () => {
+    const room = activeVoiceRoom;
+    const myPart = voiceParticipants.find(
+      (item) => item.userId === currentUserId && item.state === 'active',
+    );
+    const myRole = myPart?.role ?? room?.myRole ?? null;
+    const canModerate = voiceRoleAtLeast(myRole, 'moderator');
+    const isHost = myRole === 'host';
+    const canPublish = isVoicePublisherRole(myRole);
+    const speakers = voiceParticipants.filter(
+      (item) => item.state === 'active' && isVoicePublisherRole(item.role),
+    );
+    const listeners = voiceParticipants.filter(
+      (item) => item.state === 'active' && item.role === 'listener',
+    );
+
+    const renderRoomCard = (item: VoiceRoomPreview) => (
+      <button
+        className={`community-list-item ${room?.id === item.id ? 'active' : ''}`}
+        key={item.id}
+        onClick={() => void joinVoiceRoom(item.id)}
+        type="button"
+      >
+        <div className="community-list-avatar">🎙</div>
+        <div className="community-list-copy">
+          <strong>{item.title}</strong>
+          <span>
+            {item.privacy}
+            {item.myRole ? ` · ${item.myRole}` : ''}
+            {` · ${item.capacitySpeakers} speakers max`}
+          </span>
+        </div>
+      </button>
+    );
+
+    return (
+      <>
+        <section className="chat-sidebar community-sidebar voice-sidebar">
+          <header className="chat-sidebar-header">
+            <h1>Voice rooms</h1>
+          </header>
+
+          <div className="community-invite-accept">
+            <input
+              onChange={(event) => setVoiceInviteTokenDraft(event.target.value)}
+              placeholder="Invite token"
+              value={voiceInviteTokenDraft}
+            />
+            <button
+              className="send-button community-inline-btn"
+              disabled={voiceBusy}
+              onClick={() => void acceptVoiceInvite()}
+              type="button"
+            >
+              Accept
+            </button>
+          </div>
+
+          <div className="community-sidebar-scroll">
+            <div className="community-section">
+              <h3>Mine / live with you</h3>
+              {voiceRoomsMine.length
+                ? voiceRoomsMine.map(renderRoomCard)
+                : <p className="muted">No rooms yet.</p>}
+            </div>
+
+            <div className="community-section">
+              <h3>Live public</h3>
+              {voiceRoomsLivePublic.length
+                ? voiceRoomsLivePublic.map(renderRoomCard)
+                : <p className="muted">No public rooms live.</p>}
+            </div>
+
+            <div className="community-section community-create-form">
+              <h3>Create</h3>
+              <label>
+                <span>Title</span>
+                <input
+                  onChange={(event) => setVoiceCreateForm((current) => ({ ...current, title: event.target.value }))}
+                  value={voiceCreateForm.title}
+                />
+              </label>
+              <label>
+                <span>Description</span>
+                <textarea
+                  onChange={(event) => setVoiceCreateForm((current) => ({ ...current, description: event.target.value }))}
+                  value={voiceCreateForm.description}
+                />
+              </label>
+              <label>
+                <span>Rules</span>
+                <textarea
+                  onChange={(event) => setVoiceCreateForm((current) => ({ ...current, rules: event.target.value }))}
+                  value={voiceCreateForm.rules}
+                />
+              </label>
+              <label>
+                <span>Privacy</span>
+                <select
+                  onChange={(event) => setVoiceCreateForm((current) => ({
+                    ...current,
+                    privacy: event.target.value as VoiceRoomPrivacy,
+                  }))}
+                  value={voiceCreateForm.privacy}
+                >
+                  <option value="public">Public</option>
+                  <option value="private">Private</option>
+                  <option value="invite-only">Invite only</option>
+                </select>
+              </label>
+              <button className="send-button" disabled={voiceBusy} onClick={() => void createVoiceRoom()} type="button">
+                Go live
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <main className="panel-shell community-detail-pane voice-detail-pane">
+          {!room ? (
+            <header className="panel-header">
+              <div>
+                <h2>Voice rooms</h2>
+                <p>Join a live room or create one. Speakers mesh (≤8); listeners receive only.</p>
+              </div>
+            </header>
+          ) : (
+            <>
+              {voiceReconnecting ? (
+                <div className="voice-reconnecting-banner">Reconnecting…</div>
+              ) : null}
+              <header className="panel-header community-detail-header">
+                <div>
+                  <h2>{room.title}</h2>
+                  <p>
+                    {room.privacy}
+                    {myRole ? ` · ${myRole}` : ''}
+                    {` · ${speakers.length}/${room.capacitySpeakers} speakers`}
+                    {` · ${listeners.length} listeners`}
+                    {' · recording off'}
+                  </p>
+                </div>
+                <div className="community-detail-actions voice-room-actions">
+                  {canPublish ? (
+                    <button
+                      disabled={Boolean(myPart?.forceMuted && myPart.muted)}
+                      onClick={() => void toggleVoiceMic()}
+                      type="button"
+                    >
+                      {myPart?.muted || voiceMicMuted ? 'Unmute mic' : 'Mute mic'}
+                    </button>
+                  ) : null}
+                  {myRole === 'listener' ? (
+                    myPart?.handRaised ? (
+                      <button disabled={voiceBusy} onClick={() => void lowerVoiceHand()} type="button">
+                        Lower hand
+                      </button>
+                    ) : (
+                      <button disabled={voiceBusy} onClick={() => void raiseVoiceHand()} type="button">
+                        Raise hand
+                      </button>
+                    )
+                  ) : null}
+                  <button disabled={voiceBusy} onClick={() => void leaveVoiceRoom()} type="button">
+                    Leave
+                  </button>
+                  {isHost ? (
+                    <button disabled={voiceBusy} onClick={() => void endVoiceRoom()} type="button">
+                      End room
+                    </button>
+                  ) : null}
+                  {canModerate ? (
+                    <button disabled={voiceBusy} onClick={() => void createVoiceInvite()} type="button">
+                      Invite
+                    </button>
+                  ) : null}
+                </div>
+              </header>
+
+              {voiceCreatedInviteToken ? (
+                <p className="community-token">
+                  Invite token: <code>{voiceCreatedInviteToken}</code>
+                </p>
+              ) : null}
+              {room.description ? <p className="muted">{room.description}</p> : null}
+              {room.rules ? <p className="community-rules">{room.rules}</p> : null}
+
+              <div className="community-block">
+                <h3>Speakers</h3>
+                <div className="community-rooms-list">
+                  {speakers.length ? speakers.map((participant) => {
+                    const label = participant.name || getUserMeta(participant.userId).name;
+                    const isSelf = participant.userId === currentUserId;
+                    return (
+                      <div className="community-member-row voice-participant-row" key={participant.id}>
+                        <div>
+                          <strong>{label}{isSelf ? ' (you)' : ''}</strong>
+                          <small>
+                            {participant.role}
+                            {participant.muted ? ' · muted' : ''}
+                            {participant.forceMuted ? ' · force muted' : ''}
+                            {participant.handRaised ? ' · hand' : ''}
+                          </small>
+                        </div>
+                        {canModerate && !isSelf ? (
+                          <div className="community-member-actions">
+                            <button onClick={() => void muteVoiceParticipant(participant.userId, !participant.muted)} type="button">
+                              {participant.muted ? 'Unmute' : 'Mute'}
+                            </button>
+                            {participant.role !== 'host' ? (
+                              <button onClick={() => void demoteVoiceSpeaker(participant.userId)} type="button">
+                                Demote
+                              </button>
+                            ) : null}
+                            {isHost && participant.role !== 'host' && participant.role !== 'moderator' ? (
+                              <button onClick={() => void promoteVoiceModerator(participant.userId)} type="button">
+                                Make mod
+                              </button>
+                            ) : null}
+                            {participant.role !== 'host' ? (
+                              <button onClick={() => void removeVoiceParticipant(participant.userId)} type="button">
+                                Remove
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  }) : <p className="muted">No speakers yet.</p>}
+                </div>
+              </div>
+
+              <div className="community-block">
+                <h3>Listeners</h3>
+                <div className="community-rooms-list">
+                  {listeners.length ? listeners.map((participant) => {
+                    const label = participant.name || getUserMeta(participant.userId).name;
+                    const isSelf = participant.userId === currentUserId;
+                    return (
+                      <div className="community-member-row voice-participant-row" key={participant.id}>
+                        <div>
+                          <strong>{label}{isSelf ? ' (you)' : ''}</strong>
+                          <small>
+                            listener
+                            {participant.handRaised ? ' · hand raised' : ''}
+                            {participant.muted ? ' · muted' : ''}
+                          </small>
+                        </div>
+                        {canModerate && !isSelf ? (
+                          <div className="community-member-actions">
+                            {participant.handRaised ? (
+                              <>
+                                <button onClick={() => void approveVoiceSpeaker(participant.userId)} type="button">
+                                  Approve
+                                </button>
+                                <button onClick={() => void rejectVoiceHand(participant.userId)} type="button">
+                                  Reject
+                                </button>
+                              </>
+                            ) : (
+                              <button onClick={() => void approveVoiceSpeaker(participant.userId)} type="button">
+                                Promote
+                              </button>
+                            )}
+                            {isHost ? (
+                              <button onClick={() => void promoteVoiceModerator(participant.userId)} type="button">
+                                Make mod
+                              </button>
+                            ) : null}
+                            <button onClick={() => void removeVoiceParticipant(participant.userId)} type="button">
+                              Remove
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  }) : <p className="muted">No listeners.</p>}
+                </div>
+              </div>
+            </>
+          )}
+        </main>
+      </>
+    );
+  };
+
   const createDirectChat = async (peerUserId: string, seedMessage?: string) => {
     const response = await fetch(`${API_BASE_URL}/api/chats`, {
       method: 'POST',
@@ -4416,14 +7766,25 @@ function App() {
               Summarise
             </button>
             <button
+              className="summarise-header-button"
+              disabled={!currentUserId}
+              onClick={() => openPlayGameFromChat()}
+              title="Play a game"
+              type="button"
+            >
+              Play a game
+            </button>
+            <button
               onClick={() => {
-                const action = window.prompt('1 Mute  2 Archive  3 Pin', '1');
+                const action = window.prompt('1 Mute  2 Archive  3 Pin  4 Play a game', '1');
                 if (action === '1') {
                   toggleMuteChat(activeChat.id);
                 } else if (action === '2') {
                   toggleArchiveChat(activeChat.id);
                 } else if (action === '3') {
                   toggleFavoriteChat(activeChat.id);
+                } else if (action === '4') {
+                  openPlayGameFromChat();
                 }
               }}
               type="button"
@@ -4611,7 +7972,7 @@ function App() {
               </button>
             ) : (
             <article
-              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''} ${message.automated ? 'automated' : ''} ${focusedMessageId === message.id ? 'summary-focus' : ''}`}
+              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''} ${message.automated ? 'automated' : ''} ${message.anonymous ? 'anonymous' : ''} ${focusedMessageId === message.id ? 'summary-focus' : ''}`}
               id={`message-${message.id}`}
               key={message.id}
               onContextMenu={(event) => {
@@ -4621,6 +7982,11 @@ function App() {
                 }
               }}
             >
+              {message.anonymous ? (
+                <span className="anonymous-badge">
+                  {message.sender === 'me' ? 'Anonymous' : 'Anonymous Member'}
+                </span>
+              ) : null}
               {message.automated ? <span className="automated-badge">Automated reply</span> : null}
               {message.documentId ? (
                 <span className="document-badge">
@@ -4747,6 +8113,18 @@ function App() {
                 <span>{message.time}</span>
                 {appSettings.readReceiptsEnabled ? renderReceipt(message) : null}
               </div>
+              {message.anonymous
+              && !message.deletedForEveryone
+              && canRevealAnonymousAuthor(activeChat) ? (
+                <button
+                  className="reveal-author-button"
+                  disabled={anonymousRevealBusy}
+                  onClick={() => void revealAnonymousAuthor(message)}
+                  type="button"
+                >
+                  Reveal author
+                </button>
+              ) : null}
             </article>
             )
           ))}
@@ -4762,6 +8140,25 @@ function App() {
           </div>
         ) : null}
 
+        {canComposeAnonymous ? (
+          <div className="anonymous-composer-bar">
+            <button
+              className={`anonymous-toggle ${anonymousCompose ? 'on' : ''}`}
+              onClick={() => requestAnonymousCompose(!anonymousCompose)}
+              type="button"
+            >
+              {anonymousCompose
+                ? anonymousRemaining !== null
+                  ? `Anonymous on · ${anonymousRemaining} left today`
+                  : 'Anonymous on'
+                : 'Send as anonymous'}
+            </button>
+            {anonymousCompose ? (
+              <small>Name hidden from members · moderators may reveal for abuse</small>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="ai-composer-bar">
           <button
             className={aiHelperVisible ? 'active' : ''}
@@ -4770,6 +8167,18 @@ function App() {
             type="button"
           >
             AI helper
+          </button>
+          <button
+            disabled={aiTwinBusy || !currentUserId}
+            onClick={() => void runAiTwin()}
+            title={
+              aiTwinConfig && !aiTwinConfig.enabled
+                ? 'AI Twin is paused — enable in Business tools'
+                : 'Run Twin (drafts only, never auto-send)'
+            }
+            type="button"
+          >
+            {aiTwinBusy ? 'Twin…' : 'Run Twin'}
           </button>
           <button
             disabled={aiBusy || !currentUserId}
@@ -5085,6 +8494,7 @@ function App() {
         { id: 'broadcasts', label: 'Broadcasts' },
         { id: 'autoreplies', label: 'Auto-replies' },
         { id: 'ai', label: 'AI assistant' },
+        { id: 'twin', label: 'AI Twin' },
       ];
       const consentLabel = (consent: MarketingConsent) =>
         consent === 'opted_in' ? 'Opted in' : consent === 'opted_out' ? 'Opted out' : 'Unknown';
@@ -5139,6 +8549,11 @@ function App() {
                   if (tab.id === 'ai') {
                     void loadBusinessAiConfig();
                     setBusinessAiAskResult(null);
+                  }
+                  if (tab.id === 'twin') {
+                    void loadAiTwin();
+                    void loadAiTwinActions();
+                    setAiTwinNotice('');
                   }
                 }}
                 type="button"
@@ -6455,6 +9870,237 @@ function App() {
               </button>
             </div>
           ) : null}
+
+          {businessHubTab === 'twin' ? (
+            <div className="business-panel">
+              <h3>AI Twin</h3>
+              <p>
+                Acts as a supervised draft agent for your business. Drafts only fill the composer —
+                never auto-sent. Hard blocks cannot be removed.
+              </p>
+              {renderSettingsToggle(
+                aiTwinConfig?.enabled ? 'Enabled' : 'Paused',
+                Boolean(aiTwinConfig?.enabled),
+                (value) => void saveAiTwinConfig({ enabled: value }),
+                aiTwinConfig?.enabled
+                  ? 'Twin can propose drafts and organise enquiries'
+                  : 'Enable to run the Twin from chat or the action inbox',
+              )}
+
+              <h3>Capabilities</h3>
+              <div className="twin-capabilities">
+                <div>
+                  <strong>May</strong>
+                  <ul>
+                    {(aiTwinCapabilities?.may || TWIN_ALLOWED_TASKS.map((task) => task.label)).map(
+                      (item) => (
+                        <li key={item}>{item}</li>
+                      ),
+                    )}
+                  </ul>
+                </div>
+                <div className="twin-hard-blocks" role="note">
+                  <strong>Hard blocks (never allowed)</strong>
+                  <ul>
+                    {(
+                      aiTwinCapabilities?.mayNot ||
+                      aiTwinConfig?.blockedActions ||
+                      Object.keys(TWIN_HARD_BLOCK_LABELS)
+                    ).map((item) => (
+                      <li key={item}>{TWIN_HARD_BLOCK_LABELS[item] || item.replace(/_/g, ' ')}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+
+              <h3>Settings</h3>
+              <input
+                onBlur={() =>
+                  void saveAiTwinConfig({ displayName: aiTwinConfig?.displayName || 'AI Twin' })
+                }
+                onChange={(event) =>
+                  setAiTwinConfig((current) =>
+                    current
+                      ? { ...current, displayName: event.target.value }
+                      : ({ displayName: event.target.value } as AiTwinConfig),
+                  )
+                }
+                placeholder="Display name"
+                value={aiTwinConfig?.displayName || ''}
+              />
+              <label className="ai-tone-select">
+                <span>Permission</span>
+                <select
+                  aria-label="Twin permission tier"
+                  onChange={(event) =>
+                    void saveAiTwinConfig({
+                      permissionTier: event.target.value as TwinPermissionTier,
+                    })
+                  }
+                  value={aiTwinConfig?.permissionTier || 'draft_only'}
+                >
+                  <option value="draft_only">Draft only (owner review)</option>
+                  <option value="auto_routine">Auto routine (still no auto-send)</option>
+                </select>
+              </label>
+              <textarea
+                onBlur={() =>
+                  void saveAiTwinConfig({
+                    operatingHoursText: aiTwinConfig?.operatingHoursText || '',
+                  })
+                }
+                onChange={(event) =>
+                  setAiTwinConfig((current) =>
+                    current
+                      ? { ...current, operatingHoursText: event.target.value }
+                      : ({ operatingHoursText: event.target.value } as AiTwinConfig),
+                  )
+                }
+                placeholder="Approved operating hours text…"
+                value={aiTwinConfig?.operatingHoursText || ''}
+              />
+              <input
+                min={1}
+                max={200}
+                onBlur={() =>
+                  void saveAiTwinConfig({
+                    dailyActionLimit: Math.min(
+                      200,
+                      Math.max(1, Number(aiTwinConfig?.dailyActionLimit) || 40),
+                    ),
+                  })
+                }
+                onChange={(event) =>
+                  setAiTwinConfig((current) =>
+                    current
+                      ? { ...current, dailyActionLimit: Number(event.target.value) || 1 }
+                      : ({ dailyActionLimit: Number(event.target.value) || 1 } as AiTwinConfig),
+                  )
+                }
+                placeholder="Daily action limit"
+                type="number"
+                value={aiTwinConfig?.dailyActionLimit ?? 40}
+              />
+
+              <h3>Allowed tasks</h3>
+              <div className="twin-checklist">
+                {TWIN_ALLOWED_TASKS.map((task) => {
+                  const checked = (aiTwinConfig?.allowedTasks || []).includes(task.id);
+                  return (
+                    <label key={task.id}>
+                      <input
+                        checked={checked}
+                        onChange={() => {
+                          const current = aiTwinConfig?.allowedTasks || [];
+                          const next = checked
+                            ? current.filter((entry) => entry !== task.id)
+                            : [...current, task.id];
+                          void saveAiTwinConfig({ allowedTasks: next });
+                        }}
+                        type="checkbox"
+                      />
+                      <span>{task.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+
+              <h3>Data sources</h3>
+              <div className="twin-checklist">
+                {TWIN_DATA_SOURCES.map((source) => {
+                  const checked = (aiTwinConfig?.dataSources || []).includes(source.id);
+                  return (
+                    <label key={source.id}>
+                      <input
+                        checked={checked}
+                        onChange={() => {
+                          const current = aiTwinConfig?.dataSources || [];
+                          const next = checked
+                            ? current.filter((entry) => entry !== source.id)
+                            : [...current, source.id];
+                          void saveAiTwinConfig({ dataSources: next });
+                        }}
+                        type="checkbox"
+                      />
+                      <span>{source.label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+
+              {aiTwinNotice ? (
+                <p className="twin-notice" role="status">
+                  {aiTwinNotice}
+                </p>
+              ) : null}
+
+              <h3>Action inbox</h3>
+              <button
+                disabled={aiTwinBusy || !currentUserId}
+                onClick={() => {
+                  void loadAiTwin();
+                  void loadAiTwinActions();
+                }}
+                type="button"
+              >
+                Refresh
+              </button>
+              {aiTwinActions.length ? null : <p>No Twin actions yet.</p>}
+              {aiTwinActions.slice(0, 20).map((action) => (
+                <div
+                  className={`business-product-row twin-action-row status-${action.status}`}
+                  key={action.id}
+                >
+                  <div>
+                    <strong>
+                      {action.task.replace(/_/g, ' ')} · {action.status.replace(/_/g, ' ')}
+                    </strong>
+                    <small>{action.summary}</small>
+                    {action.draftText ? <p className="twin-draft-preview">{action.draftText}</p> : null}
+                    {action.status === 'blocked' ? (
+                      <p className="twin-blocked-banner" role="alert">
+                        Hard block — cannot approve.
+                      </p>
+                    ) : null}
+                    <small>{new Date(action.createdAt).toLocaleString()}</small>
+                  </div>
+                  <div className="business-product-actions">
+                    {action.status === 'proposed' ? (
+                      <>
+                        <button
+                          disabled={aiTwinBusy}
+                          onClick={() => void decideTwinAction(action.id, 'approve')}
+                          type="button"
+                        >
+                          Approve → draft
+                        </button>
+                        <button
+                          disabled={aiTwinBusy}
+                          onClick={() => void decideTwinAction(action.id, 'reject')}
+                          type="button"
+                        >
+                          Reject
+                        </button>
+                      </>
+                    ) : null}
+                    {action.status === 'executed_draft' && action.draftText ? (
+                      <button
+                        onClick={() =>
+                          fillComposerFromTwinDraft(
+                            action.draftText,
+                            'Filled draft — review before sending.',
+                          )
+                        }
+                        type="button"
+                      >
+                        Use draft
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </>
       );
     }
@@ -6705,6 +10351,536 @@ function App() {
     </main>
   );
 
+  const renderCommunityListCard = (community: CommunityPreview) => {
+    const selected = selectedCommunityId === community.id;
+    return (
+      <button
+        className={`community-list-item ${selected ? 'active' : ''}`}
+        key={community.id}
+        onClick={() => void loadCommunityDetail(community.id)}
+        type="button"
+      >
+        <div className="community-list-avatar">
+          {community.avatarUrl
+            ? <img alt="" src={community.avatarUrl} />
+            : (community.name || '?').slice(0, 1).toUpperCase()}
+        </div>
+        <div className="community-list-copy">
+          <strong>{community.name}</strong>
+          <span>
+            {community.privacy}
+            {community.memberCount ? ` · ${community.memberCount} members` : ''}
+            {community.myState === 'pending' ? ' · pending' : ''}
+            {community.muted ? ' · muted' : ''}
+          </span>
+        </div>
+      </button>
+    );
+  };
+
+  const renderCommunitiesView = () => {
+    const detail = communityDetail;
+    const role = detail?.myRole ?? communityMembership?.role ?? null;
+    const isActiveMember = detail?.myState === 'active' || communityMembership?.state === 'active';
+    const isPending = detail?.myState === 'pending' || communityMembership?.state === 'pending';
+    const canModerate = isActiveMember && communityRoleAtLeast(role, 'moderator');
+    const canAdmin = isActiveMember && communityRoleAtLeast(role, 'admin');
+
+    return (
+      <>
+        <section className="chat-sidebar community-sidebar">
+          <header className="chat-sidebar-header">
+            <h1>Communities</h1>
+          </header>
+
+          <div className="search-box desktop-search">
+            <input
+              aria-label="Search communities"
+              onChange={(event) => setCommunitiesSearchQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void searchCommunities();
+              }}
+              placeholder="Search communities"
+              value={communitiesSearchQuery}
+            />
+            <button className="send-button community-inline-btn" onClick={() => void searchCommunities()} type="button">
+              Search
+            </button>
+          </div>
+
+          <div className="community-invite-accept">
+            <input
+              onChange={(event) => setCommunityInviteTokenDraft(event.target.value)}
+              placeholder="Invite token"
+              value={communityInviteTokenDraft}
+            />
+            <button className="send-button community-inline-btn" onClick={() => void acceptCommunityInvite()} type="button">
+              Accept
+            </button>
+          </div>
+
+          <div className="community-sidebar-scroll">
+            {communitiesSearchResults.length ? (
+              <div className="community-section">
+                <h3>Search</h3>
+                {communitiesSearchResults.map(renderCommunityListCard)}
+                <button
+                  className="community-clear-search"
+                  onClick={() => setCommunitiesSearchResults([])}
+                  type="button"
+                >
+                  Clear search
+                </button>
+              </div>
+            ) : null}
+
+            <div className="community-section">
+              <h3>Mine</h3>
+              {communitiesMine.length
+                ? communitiesMine.map(renderCommunityListCard)
+                : <p className="muted">No communities yet.</p>}
+            </div>
+
+            <div className="community-section">
+              <h3>Discover</h3>
+              {communitiesDiscover.length
+                ? communitiesDiscover.map(renderCommunityListCard)
+                : <p className="muted">No public communities to discover.</p>}
+            </div>
+
+            <div className="community-section community-create-form">
+              <h3>Create</h3>
+              <label>
+                <span>Name</span>
+                <input
+                  onChange={(event) => setCommunityCreateForm((current) => ({ ...current, name: event.target.value }))}
+                  value={communityCreateForm.name}
+                />
+              </label>
+              <label>
+                <span>Description</span>
+                <textarea
+                  onChange={(event) => setCommunityCreateForm((current) => ({ ...current, description: event.target.value }))}
+                  value={communityCreateForm.description}
+                />
+              </label>
+              <label>
+                <span>Rules</span>
+                <textarea
+                  onChange={(event) => setCommunityCreateForm((current) => ({ ...current, rules: event.target.value }))}
+                  value={communityCreateForm.rules}
+                />
+              </label>
+              <label>
+                <span>Privacy</span>
+                <select
+                  onChange={(event) => setCommunityCreateForm((current) => ({
+                    ...current,
+                    privacy: event.target.value as CommunityPrivacy,
+                  }))}
+                  value={communityCreateForm.privacy}
+                >
+                  <option value="public">Public</option>
+                  <option value="private">Private</option>
+                  <option value="invite-only">Invite only</option>
+                </select>
+              </label>
+              <label>
+                <span>Avatar URL</span>
+                <input
+                  onChange={(event) => setCommunityCreateForm((current) => ({ ...current, avatarUrl: event.target.value }))}
+                  placeholder="https://..."
+                  value={communityCreateForm.avatarUrl}
+                />
+              </label>
+              <button className="send-button" disabled={communityBusy} onClick={() => void createCommunity()} type="button">
+                Create community
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <main className="panel-shell community-detail-pane">
+          {!detail ? (
+            <header className="panel-header">
+              <div>
+                <h2>Communities</h2>
+                <p>Select a community or create one to get started.</p>
+              </div>
+            </header>
+          ) : (
+            <>
+              <header className="panel-header community-detail-header">
+                <div>
+                  <h2>{detail.name}</h2>
+                  <p>
+                    {detail.privacy}
+                    {detail.memberCount ? ` · ${detail.memberCount} members` : ''}
+                    {role ? ` · ${role}` : ''}
+                    {isPending ? ' · join pending' : ''}
+                  </p>
+                </div>
+                <div className="community-detail-actions">
+                  {!isActiveMember && !isPending ? (
+                    <>
+                      {(detail.privacy === 'private' || detail.privacy === 'invite-only') ? (
+                        <input
+                          className="community-join-note"
+                          onChange={(event) => setCommunityJoinNote(event.target.value)}
+                          placeholder="Optional join note"
+                          value={communityJoinNote}
+                        />
+                      ) : null}
+                      <button
+                        className="send-button"
+                        disabled={communityBusy}
+                        onClick={() => void joinCommunity(detail.id)}
+                        type="button"
+                      >
+                        {detail.privacy === 'public' ? 'Join' : 'Request'}
+                      </button>
+                    </>
+                  ) : null}
+                  {isPending || isActiveMember ? (
+                    <button disabled={communityBusy} onClick={() => void leaveCommunity(detail.id)} type="button">
+                      {isPending ? 'Cancel request' : 'Leave'}
+                    </button>
+                  ) : null}
+                  {isActiveMember ? (
+                    <button
+                      onClick={() => void muteCommunity(detail.id, !detail.muted)}
+                      type="button"
+                    >
+                      {detail.muted ? 'Unmute' : 'Mute'}
+                    </button>
+                  ) : null}
+                </div>
+              </header>
+
+              {communityNotice ? <p className="community-notice">{communityNotice}</p> : null}
+              {communityBusy ? <p className="muted">Loading…</p> : null}
+
+              <div className="catalog-chips community-tabs">
+                {(['overview', 'members', 'requests', 'moderation', 'settings'] as const).map((tab) => {
+                  if (tab === 'members' && !isActiveMember) return null;
+                  if (tab === 'requests' && !canModerate) return null;
+                  if (tab === 'moderation' && !canModerate) return null;
+                  if (tab === 'settings' && !canAdmin) return null;
+                  return (
+                    <button
+                      className={communityDetailTab === tab ? 'active' : ''}
+                      key={tab}
+                      onClick={() => setCommunityDetailTab(tab)}
+                      type="button"
+                    >
+                      {tab === 'overview' ? 'Overview' : tab === 'members' ? 'Members' : tab === 'requests' ? 'Join requests' : tab === 'moderation' ? 'Moderation' : 'Settings'}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {communityDetailTab === 'overview' ? (
+                <section className="community-overview">
+                  {detail.description ? (
+                    <div className="community-block">
+                      <h3>About</h3>
+                      <p>{detail.description}</p>
+                    </div>
+                  ) : detail.limited ? (
+                    <p className="muted">Join to see the full community details.</p>
+                  ) : null}
+                  {detail.rules ? (
+                    <div className="community-block">
+                      <h3>Rules</h3>
+                      <p className="community-rules">{detail.rules}</p>
+                    </div>
+                  ) : null}
+
+                  {isActiveMember ? (
+                    <div className="community-block">
+                      <div className="status-board-header">
+                        <h3>Rooms</h3>
+                      </div>
+                      {communityRooms.length ? (
+                        <div className="community-rooms-list">
+                          {communityRooms.map((room) => (
+                            <article className="community-room-row" key={room.id}>
+                              <div>
+                                <strong>{room.title}</strong>
+                                <small>
+                                  {room.topic || (room.isAnnouncement ? 'Announcements' : 'Room')}
+                                  {room.canPost === false ? ' · read-only for you' : ''}
+                                  {room.allowAnonymous ? ' · anonymous allowed' : ''}
+                                </small>
+                              </div>
+                              <div className="community-room-actions">
+                                {canAdmin ? (
+                                  <label className="community-checkbox compact">
+                                    <input
+                                      checked={Boolean(room.allowAnonymous)}
+                                      disabled={communityBusy}
+                                      onChange={(event) => void updateCommunityRoomAllowAnonymous(
+                                        detail.id,
+                                        room,
+                                        event.target.checked,
+                                      )}
+                                      type="checkbox"
+                                    />
+                                    Allow anonymous
+                                  </label>
+                                ) : null}
+                                <button
+                                  className="send-button"
+                                  onClick={() => openCommunityRoomChat(room)}
+                                  type="button"
+                                >
+                                  Open chat
+                                </button>
+                              </div>
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">No rooms yet.</p>
+                      )}
+
+                      {canAdmin ? (
+                        <div className="community-create-room">
+                          <h4>Create room</h4>
+                          <input
+                            onChange={(event) => setCommunityRoomForm((current) => ({ ...current, title: event.target.value }))}
+                            placeholder="Room title"
+                            value={communityRoomForm.title}
+                          />
+                          <input
+                            onChange={(event) => setCommunityRoomForm((current) => ({ ...current, topic: event.target.value }))}
+                            placeholder="Topic"
+                            value={communityRoomForm.topic}
+                          />
+                          <label className="community-checkbox">
+                            <input
+                              checked={communityRoomForm.isAnnouncement}
+                              onChange={(event) => setCommunityRoomForm((current) => ({
+                                ...current,
+                                isAnnouncement: event.target.checked,
+                              }))}
+                              type="checkbox"
+                            />
+                            Announcement room
+                          </label>
+                          <label className="community-checkbox">
+                            <input
+                              checked={communityRoomForm.allowAnonymous}
+                              onChange={(event) => setCommunityRoomForm((current) => ({
+                                ...current,
+                                allowAnonymous: event.target.checked,
+                              }))}
+                              type="checkbox"
+                            />
+                            Allow anonymous posting
+                          </label>
+                          <button
+                            className="send-button"
+                            disabled={communityBusy}
+                            onClick={() => void createCommunityRoom(detail.id)}
+                            type="button"
+                          >
+                            Add room
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  <div className="community-block">
+                    <h3>Report</h3>
+                    <input
+                      onChange={(event) => setCommunityReportReason(event.target.value)}
+                      placeholder="Why are you reporting this community?"
+                      value={communityReportReason}
+                    />
+                    <button onClick={() => void reportCommunity(detail.id)} type="button">
+                      Submit report
+                    </button>
+                  </div>
+                </section>
+              ) : null}
+
+              {communityDetailTab === 'members' && isActiveMember ? (
+                <section className="community-block">
+                  <h3>Members</h3>
+                  {communityMembers.map((member) => (
+                    <article className="community-member-row" key={member.id}>
+                      <div>
+                        <strong>{member.name || member.userId}</strong>
+                        <small>{member.role}</small>
+                      </div>
+                      <div className="community-member-actions">
+                        {canAdmin && member.userId !== currentUserId && member.role !== 'owner' ? (
+                          <select
+                            onChange={(event) => void setCommunityMemberRole(
+                              detail.id,
+                              member.userId,
+                              event.target.value as CommunityRole,
+                            )}
+                            value={member.role}
+                          >
+                            <option value="member">member</option>
+                            <option value="moderator">moderator</option>
+                            {role === 'owner' ? <option value="admin">admin</option> : null}
+                          </select>
+                        ) : null}
+                        {canModerate && member.userId !== currentUserId && member.role !== 'owner' ? (
+                          <button onClick={() => void removeCommunityMember(detail.id, member.userId)} type="button">
+                            Remove
+                          </button>
+                        ) : null}
+                      </div>
+                    </article>
+                  ))}
+                </section>
+              ) : null}
+
+              {communityDetailTab === 'requests' && canModerate ? (
+                <section className="community-block">
+                  <h3>Join requests</h3>
+                  {communityJoinRequests.length ? communityJoinRequests.map((request) => (
+                    <article className="community-member-row" key={request.id}>
+                      <div>
+                        <strong>{request.userId}</strong>
+                        <small>{request.note || 'No note'}</small>
+                      </div>
+                      <div className="community-member-actions">
+                        <button onClick={() => void reviewCommunityJoinRequest(detail.id, request.id, 'approve')} type="button">
+                          Approve
+                        </button>
+                        <button onClick={() => void reviewCommunityJoinRequest(detail.id, request.id, 'reject')} type="button">
+                          Reject
+                        </button>
+                      </div>
+                    </article>
+                  )) : <p className="muted">No pending requests.</p>}
+                </section>
+              ) : null}
+
+              {communityDetailTab === 'moderation' && canModerate ? (
+                <section className="community-overview">
+                  <div className="community-block">
+                    <h3>Reports</h3>
+                    {communityModReports.length ? communityModReports.map((report) => (
+                      <article className="community-member-row" key={report.id}>
+                        <div>
+                          <strong>{report.reason}</strong>
+                          <small>{report.state} · {formatClock(report.createdAt)}</small>
+                        </div>
+                        {report.state === 'pending' ? (
+                          <div className="community-member-actions">
+                            <button onClick={() => void reviewCommunityReport(report.id, 'reviewed')} type="button">Review</button>
+                            <button onClick={() => void reviewCommunityReport(report.id, 'dismissed')} type="button">Dismiss</button>
+                            <button onClick={() => void reviewCommunityReport(report.id, 'actioned')} type="button">Actioned</button>
+                          </div>
+                        ) : null}
+                      </article>
+                    )) : <p className="muted">No pending reports.</p>}
+                  </div>
+                  <div className="community-block">
+                    <h3>Audit</h3>
+                    {communityAudit.length ? communityAudit.slice(0, 40).map((event) => (
+                      <article className="community-audit-row" key={event.id}>
+                        <strong>{event.action}</strong>
+                        <span>{event.detail}</span>
+                        <small>{formatClock(event.createdAt)}</small>
+                      </article>
+                    )) : <p className="muted">No audit events.</p>}
+                  </div>
+                </section>
+              ) : null}
+
+              {communityDetailTab === 'settings' && canAdmin ? (
+                <section className="community-block community-create-form">
+                  <h3>Settings</h3>
+                  <label>
+                    <span>Name</span>
+                    <input
+                      onChange={(event) => setCommunityEditForm((current) => ({ ...current, name: event.target.value }))}
+                      value={communityEditForm.name}
+                    />
+                  </label>
+                  <label>
+                    <span>Description</span>
+                    <textarea
+                      onChange={(event) => setCommunityEditForm((current) => ({ ...current, description: event.target.value }))}
+                      value={communityEditForm.description}
+                    />
+                  </label>
+                  <label>
+                    <span>Rules</span>
+                    <textarea
+                      onChange={(event) => setCommunityEditForm((current) => ({ ...current, rules: event.target.value }))}
+                      value={communityEditForm.rules}
+                    />
+                  </label>
+                  <label>
+                    <span>Privacy</span>
+                    <select
+                      onChange={(event) => setCommunityEditForm((current) => ({
+                        ...current,
+                        privacy: event.target.value as CommunityPrivacy,
+                      }))}
+                      value={communityEditForm.privacy}
+                    >
+                      <option value="public">Public</option>
+                      <option value="private">Private</option>
+                      <option value="invite-only">Invite only</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Avatar URL</span>
+                    <input
+                      onChange={(event) => setCommunityEditForm((current) => ({ ...current, avatarUrl: event.target.value }))}
+                      value={communityEditForm.avatarUrl}
+                    />
+                  </label>
+                  <label className="community-checkbox">
+                    <input
+                      checked={communityEditForm.pinnedRules}
+                      onChange={(event) => setCommunityEditForm((current) => ({
+                        ...current,
+                        pinnedRules: event.target.checked,
+                      }))}
+                      type="checkbox"
+                    />
+                    Pin rules
+                  </label>
+                  <button
+                    className="send-button"
+                    disabled={communityBusy}
+                    onClick={() => void saveCommunitySettings(detail.id)}
+                    type="button"
+                  >
+                    Save settings
+                  </button>
+
+                  <div className="community-invite-box">
+                    <h4>Invites</h4>
+                    <button onClick={() => void createCommunityInvite(detail.id)} type="button">
+                      Create invite token
+                    </button>
+                    {communityCreatedInviteToken ? (
+                      <p className="community-token">
+                        Token: <code>{communityCreatedInviteToken}</code>
+                      </p>
+                    ) : null}
+                  </div>
+                </section>
+              ) : null}
+            </>
+          )}
+        </main>
+      </>
+    );
+  };
+
   const renderUpdatesView = () => (
     <main className="panel-shell">
       <header className="panel-header">
@@ -6847,6 +11023,9 @@ function App() {
           </button>
           <button className={`rail-button ${activeView === 'calls' ? 'active' : ''}`} onClick={() => setActiveView('calls')} type="button">☎</button>
           <button className={`rail-button ${activeView === 'updates' ? 'active' : ''}`} onClick={() => setActiveView('updates')} type="button">◌</button>
+          <button className={`rail-button ${activeView === 'communities' ? 'active' : ''}`} onClick={() => setActiveView('communities')} type="button" title="Communities">◎</button>
+          <button className={`rail-button ${activeView === 'voiceRooms' ? 'active' : ''}`} onClick={() => setActiveView('voiceRooms')} type="button" title="Voice rooms">🎙</button>
+          <button className={`rail-button ${activeView === 'games' ? 'active' : ''}`} onClick={() => setActiveView('games')} type="button" title="Games">🎮</button>
           <button className={`rail-button ${activeView === 'catalog' ? 'active' : ''}`} onClick={() => setActiveView('catalog')} type="button">🏬</button>
           <button className={`rail-button ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')} type="button">⚙</button>
         </div>
@@ -6856,10 +11035,43 @@ function App() {
       {activeView === 'chats' ? renderChatsView() : null}
       {activeView === 'calls' ? renderCallsView() : null}
       {activeView === 'updates' ? renderUpdatesView() : null}
+      {activeView === 'communities' ? renderCommunitiesView() : null}
+      {activeView === 'voiceRooms' ? renderVoiceRoomsView() : null}
+      {activeView === 'games' ? renderGamesView() : null}
       {activeView === 'catalog' ? renderCatalogView() : null}
       {activeView === 'settings' ? renderSettingsView() : null}
 
       {toastMessage ? <div className="web-toast">{toastMessage}</div> : null}
+
+      {gamePendingInvite ? (
+        <div className="modal-overlay" onClick={() => setGamePendingInvite(null)}>
+          <div className="dialog-card game-invite-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>Game invite</h3>
+            <p>
+              {getUserMeta(gamePendingInvite.fromUserId).name}
+              {' invited you to '}
+              {gamePendingInvite.title || gamePendingInvite.gameSlug || 'a game'}
+              .
+            </p>
+            <p className="game-points-note muted">{gamePointsNote}</p>
+            <button
+              disabled={gameBusy}
+              onClick={() => void declineGameInvite(gamePendingInvite.sessionId)}
+              type="button"
+            >
+              Decline
+            </button>
+            <button
+              className="send-button"
+              disabled={gameBusy}
+              onClick={() => void acceptGameInvite(gamePendingInvite.sessionId)}
+              type="button"
+            >
+              Accept
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       {messageActionTarget ? (
         <div className="modal-overlay" onClick={() => setMessageActionTarget(null)}>
@@ -6891,6 +11103,64 @@ function App() {
             {messageActionTarget.sender === 'me' ? (
               <button onClick={() => void deleteMessage(messageActionTarget, 'everyone')} type="button">Delete for everyone</button>
             ) : null}
+            {messageActionTarget.anonymous && canRevealAnonymousAuthor(activeChat) ? (
+              <button
+                disabled={anonymousRevealBusy}
+                onClick={() => void revealAnonymousAuthor(messageActionTarget)}
+                type="button"
+              >
+                Reveal author
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {anonymousDisclosureOpen ? (
+        <div className="modal-overlay" onClick={() => setAnonymousDisclosureOpen(false)}>
+          <div className="dialog-card anonymous-disclosure-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Anonymous posting</h3>
+            <p>
+              Your display name is hidden from other members in this room. Anonymity is limited —
+              moderators and group admins can reveal authors during abuse investigations, and those
+              reveals are audited.
+            </p>
+            <div className="anonymous-disclosure-actions">
+              <button onClick={() => setAnonymousDisclosureOpen(false)} type="button">
+                Cancel
+              </button>
+              <button
+                className="send-button"
+                onClick={() => {
+                  setAnonymousDisclosureAccepted(true);
+                  setAnonymousCompose(true);
+                  setAnonymousDisclosureOpen(false);
+                }}
+                type="button"
+              >
+                Continue anonymously
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {anonymousRevealResult ? (
+        <div className="modal-overlay" onClick={() => setAnonymousRevealResult(null)}>
+          <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Author revealed</h3>
+            <p>
+              <strong>{anonymousRevealResult.authorName || 'Unknown member'}</strong>
+              {anonymousRevealResult.authorUserId
+                ? ` (${anonymousRevealResult.authorUserId})`
+                : ''}
+            </p>
+            <p className="muted" role="note">
+              {anonymousRevealResult.notice || 'Reveals are logged for moderation accountability.'}
+            </p>
+            <button onClick={() => setAnonymousRevealResult(null)} type="button">
+              Close
+            </button>
           </div>
         </div>
       ) : null}
