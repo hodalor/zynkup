@@ -535,6 +535,8 @@ function AppContent() {
     category: 'Phones',
     description: '',
     stockQuantity: '1',
+    costPrice: '',
+    lowStockThreshold: '2',
     location: '',
     condition: 'New',
     status: 'active',
@@ -542,6 +544,19 @@ function AppContent() {
     variantName: '',
     variantOptions: '',
   });
+  const [inventoryAlerts, setInventoryAlerts] = useState([]);
+  const [businessCustomers, setBusinessCustomers] = useState([]);
+  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [customerOrders, setCustomerOrders] = useState([]);
+  const [customerForm, setCustomerForm] = useState({
+    displayName: '',
+    phone: '',
+    tags: '',
+    note: '',
+    followUpAt: '',
+  });
+  const [customerNoteDraft, setCustomerNoteDraft] = useState('');
+  const [customerPrefs, setCustomerPrefs] = useState([]);
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory, setCatalogCategory] = useState('All');
   const [catalogStatusFilter, setCatalogStatusFilter] = useState('All');
@@ -558,9 +573,21 @@ function AppContent() {
   const [updatesFeed, setUpdatesFeed] = useState([]);
   const [statusComposerVisible, setStatusComposerVisible] = useState(false);
   const [statusComposerMode, setStatusComposerMode] = useState('text'); // text | photo | video
-  const [businessPanel, setBusinessPanel] = useState(''); // '' | catalog | customers | receipts | broadcast
+  const [statusTaggedProductId, setStatusTaggedProductId] = useState('');
+  const [statusProductSheet, setStatusProductSheet] = useState(null);
+  const [statusProductSeller, setStatusProductSeller] = useState(null);
+  const [statusOrderQuantity, setStatusOrderQuantity] = useState('1');
+  const [statusVariantPicks, setStatusVariantPicks] = useState({});
+  const [businessPanel, setBusinessPanel] = useState(''); // '' | catalog | customers | receipts | broadcast | orders | profile | dashboard | inventory
   const [broadcastDraft, setBroadcastDraft] = useState('');
-  const [paySheet, setPaySheet] = useState(''); // '' | send | request | topup | history
+  const [commerceOrders, setCommerceOrders] = useState([]);
+  const [saleReceipts, setSaleReceipts] = useState([]);
+  const [orderDetail, setOrderDetail] = useState(null);
+  const [receiptDetail, setReceiptDetail] = useState(null);
+  const [orderRoleFilter, setOrderRoleFilter] = useState('seller'); // seller | buyer | all
+  const [salesDashboard, setSalesDashboard] = useState(null);
+  const [salesDashboardPeriod, setSalesDashboardPeriod] = useState('7d');
+  const [paySheet, setPaySheet] = useState(''); // '' | send | request | topup | history | orders
   const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '' });
   const [payHistoryItems, setPayHistoryItems] = useState([]);
   const [newChatQuery, setNewChatQuery] = useState('');
@@ -1081,6 +1108,7 @@ function AppContent() {
       durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
       durationSeconds: message.durationSeconds,
       catalogItemId: message.catalogItemId,
+      receiptId: message.receiptId,
       receiptState: message.state,
       senderId: message.senderId,
       anonymous: Boolean(message.anonymous) || message.senderId === 'anonymous',
@@ -2563,6 +2591,8 @@ function AppContent() {
         description: item.description,
         stockQuantity: item.stockQuantity ?? 0,
         trackStock: item.trackStock !== false,
+        costPrice: item.costPrice ?? null,
+        lowStockThreshold: item.lowStockThreshold ?? 2,
         status: item.status || (item.takenDown ? 'archived' : 'active'),
         variants: item.variants || [],
         availabilityUpdatedAt: item.availabilityUpdatedAt || item.updatedAt || '',
@@ -2597,6 +2627,15 @@ function AppContent() {
       void fetchLinkedDevices(nextCurrentUserId);
     }
   };
+
+  useEffect(() => {
+    if (!currentUserId || authRequired) return;
+    void loadCommerceOrders('all', currentUserId);
+    void loadSaleReceipts(currentUserId);
+    void loadInventoryAlerts(currentUserId);
+    void loadBusinessCustomers(currentUserId);
+    void loadCustomerPreferences(currentUserId);
+  }, [currentUserId, authRequired]);
 
   useEffect(() => {
     updatesFeedRef.current = updatesFeed;
@@ -3202,6 +3241,37 @@ function AppContent() {
             : entry,
         ),
       );
+    });
+    socket.on('order:created', ({ order }) => {
+      if (!order?.id) return;
+      setCommerceOrders((current) => [order, ...current.filter((entry) => entry.id !== order.id)]);
+      if (order.sellerUserId === currentUserIdRef.current) {
+        showToast(`New order ${order.id}`, 'success');
+      }
+    });
+    socket.on('order:updated', ({ order }) => {
+      if (!order?.id) return;
+      setCommerceOrders((current) => current.map((entry) => (entry.id === order.id ? order : entry)));
+      setOrderDetail((current) => (current?.id === order.id ? order : current));
+    });
+    socket.on('receipt:created', ({ receipt }) => {
+      if (!receipt?.id) return;
+      setSaleReceipts((current) => [receipt, ...current.filter((entry) => entry.id !== receipt.id)]);
+    });
+    socket.on('inventory:alert', (alert) => {
+      if (!alert?.id) return;
+      setInventoryAlerts((current) => [alert, ...current.filter((entry) => entry.id !== alert.id)]);
+      showToast(`${alert.title} is low on stock (${alert.stockQuantity} left).`, 'error', 4200);
+    });
+    socket.on('customer:updated', ({ customer }) => {
+      if (!customer?.id) return;
+      if (customer.deletedAt) {
+        setBusinessCustomers((current) => current.filter((entry) => entry.id !== customer.id));
+        setSelectedCustomer((current) => (current?.id === customer.id ? null : current));
+        return;
+      }
+      setBusinessCustomers((current) => [customer, ...current.filter((entry) => entry.id !== customer.id)]);
+      setSelectedCustomer((current) => (current?.id === customer.id ? customer : current));
     });
     socket.on('message:receiptUpdated', (message) => {
       setMessagesByChat((current) => ({
@@ -4348,6 +4418,160 @@ function AppContent() {
     }
   };
 
+  const loadCommerceOrders = async (role = 'all', userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/orders?userId=${encodeURIComponent(userId)}&role=${encodeURIComponent(role)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load orders.', 'error');
+        return;
+      }
+      setCommerceOrders(payload.orders || []);
+    } catch {
+      showToast('Could not load orders.', 'error');
+    }
+  };
+
+  const loadSaleReceipts = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/receipts?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load receipts.', 'error');
+        return;
+      }
+      setSaleReceipts(payload.receipts || []);
+    } catch {
+      showToast('Could not load receipts.', 'error');
+    }
+  };
+
+  const formatSaleReceiptShare = (receipt) => {
+    if (!receipt) return '';
+    const lines = (receipt.items || []).map((item) => {
+      const variants = (item.variantSelections || []).map((entry) => `${entry.name} ${entry.option}`).join(', ');
+      return `- ${item.title}${variants ? ` (${variants})` : ''} x${item.quantity} · ${item.currency} ${item.price}`;
+    });
+    return [
+      `ZynkUp receipt ${receipt.receiptNumber}`,
+      receipt.businessName || receipt.sellerName,
+      `Buyer: ${receipt.buyerName}`,
+      ...lines,
+      `Subtotal: ${receipt.currency} ${receipt.subtotal}`,
+      receipt.discount ? `Discount: ${receipt.currency} ${receipt.discount}` : null,
+      receipt.tax ? `Tax: ${receipt.currency} ${receipt.tax}` : null,
+      `Total: ${receipt.currency} ${receipt.totalAmount}`,
+      `Payment: ${receipt.paymentMethod} · ${receipt.paymentReference}`,
+      `Issued: ${new Date(receipt.issuedAt || receipt.createdAt).toLocaleString()}`,
+      `Status: ${receipt.state}`,
+    ].filter(Boolean).join('\n');
+  };
+
+  const openSaleReceipt = async (receiptId) => {
+    if (!receiptId || !currentUserId) return;
+    const cached = saleReceipts.find((item) => item.id === receiptId);
+    if (cached) {
+      setReceiptDetail(cached);
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/receipts/${encodeURIComponent(receiptId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Receipt not found.', 'error');
+        return;
+      }
+      setReceiptDetail(payload.receipt);
+      setSaleReceipts((current) => [payload.receipt, ...current.filter((item) => item.id !== payload.receipt.id)]);
+    } catch {
+      showToast('Could not open receipt.', 'error');
+    }
+  };
+
+  const updateCommerceOrderState = async (order, nextState) => {
+    if (!order?.id || !currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/orders/${encodeURIComponent(order.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, state: nextState }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update the order.', 'error');
+        return;
+      }
+      setCommerceOrders((current) => current.map((entry) => (entry.id === payload.order.id ? payload.order : entry)));
+      setOrderDetail(payload.order);
+      if (payload.receipt) {
+        setSaleReceipts((current) => [payload.receipt, ...current.filter((item) => item.id !== payload.receipt.id)]);
+        showToast(`Paid. Receipt ${payload.receipt.receiptNumber} issued.`, 'success', 4200);
+      } else {
+        showToast(`Order marked ${nextState.replace('_', ' ')}.`, 'success');
+      }
+    } catch {
+      showToast('Could not update the order.', 'error');
+    }
+  };
+
+  const orderStateLabel = (state) => String(state || '').replace(/_/g, ' ');
+
+  const sellerOrderActions = (order) => {
+    if (order.sellerUserId !== currentUserId) return [];
+    if (order.state === 'pending_payment') return [['paid', 'Mark paid'], ['cancelled', 'Cancel']];
+    if (order.state === 'paid') return [['processing', 'Start processing'], ['cancelled', 'Cancel']];
+    if (order.state === 'processing') return [['dispatched', 'Mark dispatched']];
+    if (order.state === 'dispatched') return [['completed', 'Complete']];
+    return [];
+  };
+
+  const buyerOrderActions = (order) => {
+    if (order.buyerUserId !== currentUserId) return [];
+    if (order.state === 'pending_payment') return [['cancelled', 'Cancel order']];
+    return [];
+  };
+
+  const openOrdersPanel = (role = 'seller') => {
+    setOrderRoleFilter(role);
+    setBusinessPanel('orders');
+    void loadCommerceOrders(role);
+  };
+
+  const loadSalesDashboard = async (period = salesDashboardPeriod) => {
+    if (!currentUserId) return;
+    try {
+      const query = new URLSearchParams({
+        userId: currentUserId,
+        period,
+      });
+      if (activeBusinessId) query.set('businessId', activeBusinessId);
+      const response = await fetch(`${API_BASE_URL}/api/sales/dashboard?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load the sales dashboard.', 'error');
+        return;
+      }
+      setSalesDashboard(payload);
+      setSalesDashboardPeriod(payload.period || period);
+    } catch {
+      showToast('Could not load the sales dashboard.', 'error');
+    }
+  };
+
+  const openSalesDashboard = () => {
+    setBusinessPanel('dashboard');
+    void loadSalesDashboard(salesDashboardPeriod);
+  };
+
+  const moneyLabel = (amount, currency = accountCurrency) =>
+    `${currency || ''} ${Number(amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
   const addBusinessStaff = async () => {
     if (!activeBusiness) {
       showToast('Switch to a business first.', 'error');
@@ -4482,6 +4706,10 @@ function AppContent() {
           description: catalogForm.description.trim() || 'New item from your business catalog.',
           stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
           trackStock: catalogForm.trackStock,
+          costPrice: catalogForm.costPrice.trim() === ''
+            ? null
+            : Number.parseFloat(catalogForm.costPrice),
+          lowStockThreshold: Number.parseInt(catalogForm.lowStockThreshold, 10) || 2,
           status: catalogForm.status,
           variants,
           location: catalogForm.location.trim(),
@@ -4502,6 +4730,8 @@ function AppContent() {
         category: 'Phones',
         description: '',
         stockQuantity: '1',
+        costPrice: '',
+        lowStockThreshold: '2',
         location: '',
         condition: 'New',
         status: 'active',
@@ -4557,46 +4787,306 @@ function AppContent() {
     }
   };
 
+  const mergeCatalogItem = (item) => {
+    if (!item?.id) return;
+    setCatalogItems((current) =>
+      current.map((entry) =>
+        entry.id === item.id
+          ? {
+              ...entry,
+              title: item.title ?? entry.title,
+              price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
+              priceAmount: item.price ?? entry.priceAmount,
+              currency: item.currency ?? entry.currency,
+              isPublic: item.isPublic == null ? entry.isPublic : Boolean(item.isPublic),
+              category: item.category ?? entry.category,
+              description: item.description ?? entry.description,
+              stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
+              status: item.status ?? entry.status,
+              trackStock: item.trackStock ?? entry.trackStock,
+              costPrice: item.costPrice ?? entry.costPrice,
+              lowStockThreshold: item.lowStockThreshold ?? entry.lowStockThreshold ?? 2,
+              variants: item.variants ?? entry.variants,
+              availabilityUpdatedAt: item.availabilityUpdatedAt ?? entry.availabilityUpdatedAt,
+              imageUri: item.imageUrls?.[0] ?? entry.imageUri,
+              imageUris: item.imageUrls ?? entry.imageUris,
+            }
+          : entry,
+      ),
+    );
+  };
+
   const adjustCatalogStock = async (itemId, nextStock) => {
+    const current = catalogItems.find((entry) => entry.id === itemId);
+    const delta = Math.max(0, nextStock) - Number(current?.stockQuantity ?? 0);
+    if (!delta || !currentUserId) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(itemId)}`, {
-        method: 'PATCH',
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(itemId)}/stock-adjust`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stockQuantity: Math.max(0, nextStock) }),
+        body: JSON.stringify({
+          userId: currentUserId,
+          delta,
+          reason: delta > 0 ? 'Stock received' : 'Manual stock adjustment',
+          lowStockThreshold: current?.lowStockThreshold,
+        }),
       });
+      const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showToast('Could not update stock.', 'error');
+        showToast(payload.error || 'Could not update stock.', 'error');
         return;
       }
-      const payload = await response.json();
-      if (payload.item) {
-        const item = payload.item;
-        setCatalogItems((current) =>
-          current.map((entry) =>
-            entry.id === item.id
-              ? {
-                  ...entry,
-                  title: item.title ?? entry.title,
-                  price: item.price != null ? `${item.currency ?? 'GHS'} ${item.price}` : entry.price,
-                  priceAmount: item.price ?? entry.priceAmount,
-                  currency: item.currency ?? entry.currency,
-                  isPublic: item.isPublic == null ? entry.isPublic : Boolean(item.isPublic),
-                  category: item.category ?? entry.category,
-                  description: item.description ?? entry.description,
-                  stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
-                  status: item.status ?? entry.status,
-                  trackStock: item.trackStock ?? entry.trackStock,
-                  variants: item.variants ?? entry.variants,
-                  availabilityUpdatedAt: item.availabilityUpdatedAt ?? entry.availabilityUpdatedAt,
-                  imageUri: item.imageUrls?.[0] ?? entry.imageUri,
-                  imageUris: item.imageUrls ?? entry.imageUris,
-                }
-              : entry,
-          ),
-        );
+      if (payload.item) mergeCatalogItem(payload.item);
+      if (payload.alert) {
+        setInventoryAlerts((alerts) => [payload.alert, ...alerts.filter((entry) => entry.id !== payload.alert.id)]);
+        showToast(`${payload.alert.title} is low on stock.`, 'error', 3600);
       }
     } catch {
       showToast('Network error while updating stock.', 'error');
+    }
+  };
+
+  const loadInventoryAlerts = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/inventory/alerts?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setInventoryAlerts(payload.alerts || []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const reviewInventoryAlert = async (alertId) => {
+    if (!currentUserId || !alertId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/inventory/alerts/${encodeURIComponent(alertId)}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not review alert.', 'error');
+        return;
+      }
+      setInventoryAlerts((current) => current.map((entry) => (entry.id === payload.alert.id ? payload.alert : entry)));
+      showToast('Alert marked reviewed.', 'success');
+    } catch {
+      showToast('Could not review alert.', 'error');
+    }
+  };
+
+  const loadBusinessCustomers = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setBusinessCustomers(payload.customers || []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadCustomerDetail = async (customerId) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not open customer.', 'error');
+        return;
+      }
+      setSelectedCustomer(payload.customer || null);
+      setCustomerOrders(payload.orders || []);
+      setCustomerNoteDraft('');
+    } catch {
+      showToast('Could not open customer.', 'error');
+    }
+  };
+
+  const createBusinessCustomer = async () => {
+    if (!currentUserId) return;
+    const displayName = customerForm.displayName.trim();
+    if (!displayName) {
+      showToast('Add a customer name.', 'error');
+      return;
+    }
+    const tags = customerForm.tags
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          displayName,
+          phone: customerForm.phone.trim() || undefined,
+          tags: tags.length ? tags : undefined,
+          note: customerForm.note.trim() || undefined,
+          followUpAt: customerForm.followUpAt.trim() || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save customer.', 'error');
+        return;
+      }
+      if (payload.customer) {
+        setBusinessCustomers((current) => [payload.customer, ...current.filter((entry) => entry.id !== payload.customer.id)]);
+      }
+      setCustomerForm({ displayName: '', phone: '', tags: '', note: '', followUpAt: '' });
+      showToast(payload.existing ? 'Customer record updated.' : 'Customer saved.', 'success');
+    } catch {
+      showToast('Could not save customer.', 'error');
+    }
+  };
+
+  const addCustomerNote = async (customerId) => {
+    const text = customerNoteDraft.trim();
+    if (!currentUserId || !customerId || !text) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}/notes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, text }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not add note.', 'error');
+        return;
+      }
+      if (payload.customer) {
+        setSelectedCustomer(payload.customer);
+        setBusinessCustomers((current) => [payload.customer, ...current.filter((entry) => entry.id !== payload.customer.id)]);
+      }
+      setCustomerNoteDraft('');
+      showToast('Note added.', 'success');
+    } catch {
+      showToast('Could not add note.', 'error');
+    }
+  };
+
+  const updateBusinessCustomer = async (customerId, patch) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, ...patch }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update customer.', 'error');
+        return;
+      }
+      if (payload.customer) {
+        setSelectedCustomer(payload.customer);
+        setBusinessCustomers((current) => [payload.customer, ...current.filter((entry) => entry.id !== payload.customer.id)]);
+      }
+      showToast('Customer updated.', 'success');
+    } catch {
+      showToast('Could not update customer.', 'error');
+    }
+  };
+
+  const deleteBusinessCustomer = async (customerId) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}?userId=${encodeURIComponent(currentUserId)}`,
+        { method: 'DELETE' },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not delete customer.', 'error');
+        return;
+      }
+      setBusinessCustomers((current) => current.filter((entry) => entry.id !== customerId));
+      setSelectedCustomer(null);
+      setCustomerOrders([]);
+      showToast('Customer record removed.', 'success');
+    } catch {
+      showToast('Could not delete customer.', 'error');
+    }
+  };
+
+  const loadCustomerPreferences = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/me/customer-preferences?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setCustomerPrefs(payload.preferences || []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const updateMyMarketingPreference = async (customerId, marketingConsent) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/me/customer-preferences`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, customerId, marketingConsent }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update preference.', 'error');
+        return;
+      }
+      setCustomerPrefs((current) =>
+        current.map((entry) =>
+          entry.customerId === customerId
+            ? {
+                ...entry,
+                marketingConsent: payload.preference?.marketingConsent || marketingConsent,
+                marketingConsentUpdatedAt: payload.preference?.marketingConsentUpdatedAt || entry.marketingConsentUpdatedAt,
+              }
+            : entry,
+        ),
+      );
+      showToast(marketingConsent === 'opted_in' ? 'Opted in to marketing.' : 'Opted out of marketing.', 'success');
+    } catch {
+      showToast('Could not update preference.', 'error');
+    }
+  };
+
+  const importContactAsCustomer = async (contact) => {
+    if (!currentUserId || !contact) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          displayName: contact.name || 'Customer',
+          phone: contact.phone || undefined,
+          customerUserId: contact.linkedUserId || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not add customer.', 'error');
+        return;
+      }
+      if (payload.customer) {
+        setBusinessCustomers((current) => [payload.customer, ...current.filter((entry) => entry.id !== payload.customer.id)]);
+        void loadCustomerDetail(payload.customer.id);
+      }
+      showToast('Added to customer records.', 'success');
+    } catch {
+      showToast('Could not add customer.', 'error');
     }
   };
 
@@ -4834,17 +5324,13 @@ function AppContent() {
       return;
     }
 
-    const recipients = [
-      ...new Set(
-        [
-          ...contactItems.map((contact) => contact.linkedUserId).filter(Boolean),
-          ...Object.keys(usersById).filter((id) => id !== currentUserId),
-        ],
-      ),
-    ];
+    const optedInRecipients = businessCustomers
+      .filter((customer) => customer.marketingConsent === 'opted_in' && customer.customerUserId)
+      .map((customer) => customer.customerUserId);
+    const recipients = [...new Set(optedInRecipients.filter(Boolean))];
 
     if (!recipients.length) {
-      showToast('No registered customers yet. Sync contacts first.', 'error', 3600);
+      showToast('No opted-in customers yet. Only customers who opted in receive broadcasts.', 'error', 4200);
       return;
     }
 
@@ -5078,6 +5564,102 @@ function AppContent() {
     }
   };
 
+  const openStatusProduct = async (catalogItemId, statusId) => {
+    if (!catalogItemId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(catalogItemId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.item) {
+        showToast(payload.error || 'That product is no longer available.', 'error');
+        return;
+      }
+      setStatusProductSheet({ ...payload.item, fromStatusId: statusId || null });
+      setStatusProductSeller(payload.seller || null);
+      setStatusOrderQuantity('1');
+      setStatusVariantPicks({});
+      closeStatusViewer();
+    } catch {
+      showToast('Could not open this product.', 'error');
+    }
+  };
+
+  const placeStatusProductOrder = async () => {
+    if (!statusProductSheet || !currentUserId) return;
+    const quantity = Math.max(1, Number.parseInt(statusOrderQuantity, 10) || 1);
+    const variants = statusProductSheet.variants || [];
+    const selections = variants.map((variant) => ({
+      name: variant.name,
+      option: statusVariantPicks[variant.name] || '',
+    }));
+    if (selections.some((entry) => !entry.option)) {
+      showToast('Choose each product option first.', 'error');
+      return;
+    }
+    try {
+      const orderResponse = await fetch(`${API_BASE_URL}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          buyerUserId: currentUserId,
+          catalogItemId: statusProductSheet.id,
+          quantity,
+          variantSelections: selections,
+          statusId: statusProductSheet.fromStatusId || undefined,
+          clientRequestId: `req-${currentUserId}-${statusProductSheet.id}-${quantity}-${Date.now()}`,
+        }),
+      });
+      const orderPayload = await orderResponse.json().catch(() => ({}));
+      if (!orderResponse.ok) {
+        showToast(orderPayload.error || 'Could not create the order.', 'error');
+        return;
+      }
+      if (orderPayload.order) {
+        setCommerceOrders((current) => [
+          orderPayload.order,
+          ...current.filter((entry) => entry.id !== orderPayload.order.id),
+        ]);
+      }
+      const payResponse = await fetch(`${API_BASE_URL}/api/payments/intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'send',
+          amount: orderPayload.order.totalAmount,
+          currency: orderPayload.order.currency,
+          note: orderPayload.order.items?.[0]?.title || statusProductSheet.title,
+          userId: currentUserId,
+          orderId: orderPayload.order.id,
+        }),
+      });
+      const payPayload = await payResponse.json().catch(() => ({}));
+      if (!payResponse.ok) {
+        showToast(payPayload.error || 'Order created, but payment could not start.', 'error', 4200);
+        return;
+      }
+      const sellerId = statusProductSheet.sellerId;
+      const productCard = {
+        id: statusProductSheet.id,
+        title: `Order ${orderPayload.order.id} · ${statusProductSheet.title}`,
+        price: `${orderPayload.order.currency} ${orderPayload.order.totalAmount}`,
+        priceAmount: orderPayload.order.totalAmount,
+        currency: orderPayload.order.currency,
+        imageUri: statusProductSheet.imageUrls?.[0],
+      };
+      setStatusProductSheet(null);
+      setStatusProductSeller(null);
+      showToast(
+        payPayload.message || `Order ${orderPayload.order.id} is pending payment.`,
+        'success',
+        4800,
+      );
+      if (sellerId && sellerId !== currentUserId) {
+        await sendCatalogCard(productCard, sellerId);
+      }
+    } catch {
+      showToast('Could not start checkout.', 'error');
+    }
+  };
+
   const postStatus = async () => {
     const text = statusDraft.trim();
     const wantsMedia = statusComposerMode === 'photo' || statusComposerMode === 'video';
@@ -5125,6 +5707,7 @@ function AppContent() {
           fontSize: statusComposerMode === 'text' ? statusFontSize : undefined,
           businessId: activeBusinessId || undefined,
           audience: statusAudience,
+          catalogItemId: statusTaggedProductId || undefined,
         }),
       });
       if (!response.ok) {
@@ -5141,9 +5724,10 @@ function AppContent() {
       }
       setStatusDraft('');
       setStatusAssetUris([]);
+      setStatusTaggedProductId('');
       setStatusComposerMode('text');
       setStatusComposerVisible(false);
-      showToast('Status posted.', 'success');
+      showToast(statusTaggedProductId ? 'Status posted with product tag.' : 'Status posted.', 'success');
     } catch {
       showToast('Network error while posting status.', 'error');
     }
@@ -6610,6 +7194,22 @@ function AppContent() {
             </Pressable>
           </View>
         ) : null}
+        {message.receiptId ? (
+          <View style={styles.catalogActionRow}>
+            <Pressable style={styles.draftAction} onPress={() => void openSaleReceipt(message.receiptId)}>
+              <Text style={styles.draftActionText}>View receipt</Text>
+            </Pressable>
+            <Pressable
+              style={styles.draftAction}
+              onPress={() => {
+                const receipt = saleReceipts.find((item) => item.id === message.receiptId);
+                void Share.share({ message: receipt ? formatSaleReceiptShare(receipt) : (message.text || 'Receipt') });
+              }}
+            >
+              <Text style={styles.draftActionText}>Share</Text>
+            </Pressable>
+          </View>
+        ) : null}
 
         {message.attachment && message.kind !== 'image' ? (
           <View style={styles.attachmentCard}>
@@ -6981,8 +7581,10 @@ function AppContent() {
     const missedCalls = calls.filter((call) => call.state === 'missed' || call.state === 'declined');
     const pendingPayments = payHistoryItems.filter((item) => /pending|awaiting|queued/i.test(String(item.status || '')));
     const lowStockItems = filteredCatalogItems.filter((item) => {
+      if (item.trackStock === false) return false;
       const stock = Number(item.stockQuantity ?? 0);
-      return stock > 0 && stock <= 2;
+      const threshold = Number(item.lowStockThreshold ?? 2);
+      return stock <= threshold;
     });
     const cards = [];
 
@@ -7438,6 +8040,7 @@ function AppContent() {
               { label: 'Send', icon: '↗', action: 'send' },
               { label: 'Request', icon: '+', action: 'request' },
               { label: 'Top up', icon: '▭', action: 'topup' },
+              { label: 'Orders', icon: '▣', action: 'orders' },
               { label: 'History', icon: '◔', action: 'history' },
             ].map((action) => (
               <Pressable
@@ -7445,6 +8048,10 @@ function AppContent() {
                 style={styles.payHeroAction}
                 onPress={() => {
                   setPayForm({ amount: '', phone: '', note: '' });
+                  if (action.action === 'orders') {
+                    setOrderRoleFilter('buyer');
+                    void loadCommerceOrders('buyer');
+                  }
                   setPaySheet(action.action);
                 }}
               >
@@ -7705,8 +8312,13 @@ function AppContent() {
   const renderBusiness = () => {
     const businessName = profile.businessName || profile.name || 'Your business';
     const registeredCustomers = contactItems.filter((contact) => contact.registered || contact.linkedUserId);
-    const customerCount = registeredCustomers.length;
-    const orderCount = payHistoryItems.length;
+    const customerCount = businessCustomers.length || registeredCustomers.length;
+    const dueFollowUps = businessCustomers.filter(
+      (customer) => customer.followUpAt && new Date(customer.followUpAt).getTime() <= Date.now(),
+    ).length;
+    const sellerOrders = commerceOrders.filter((order) => order.sellerUserId === currentUserId);
+    const orderCount = sellerOrders.length || payHistoryItems.length;
+    const openOrderCount = sellerOrders.filter((order) => !['completed', 'cancelled', 'refunded'].includes(order.state)).length;
     const catalogCount = filteredCatalogItems.length;
 
     return (
@@ -7775,8 +8387,8 @@ function AppContent() {
                 <Text style={styles.businessStatLabel}>Products</Text>
               </View>
               <View style={styles.businessStatCard}>
-                <Text style={styles.businessStatValue}>{orderCount}</Text>
-                <Text style={styles.businessStatLabel}>Payments</Text>
+                <Text style={styles.businessStatValue}>{openOrderCount || orderCount}</Text>
+                <Text style={styles.businessStatLabel}>Orders</Text>
               </View>
               <View style={styles.businessStatCard}>
                 <Text style={styles.businessStatValue}>{customerCount}</Text>
@@ -7784,10 +8396,19 @@ function AppContent() {
               </View>
             </View>
             {activeBusiness ? (
-              <Pressable style={[styles.authDarkButton, { marginTop: 12 }]} onPress={openBusinessStorefrontEditor}>
-                <Text style={styles.authDarkButtonText}>Edit storefront</Text>
+              <View style={{ marginTop: 12, gap: 8 }}>
+                <Pressable style={styles.authDarkButton} onPress={openSalesDashboard}>
+                  <Text style={styles.authDarkButtonText}>Sales dashboard</Text>
+                </Pressable>
+                <Pressable style={styles.ghostButton} onPress={openBusinessStorefrontEditor}>
+                  <Text style={styles.ghostButtonText}>Edit storefront</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Pressable style={[styles.authDarkButton, { marginTop: 12 }]} onPress={openSalesDashboard}>
+                <Text style={styles.authDarkButtonText}>Sales dashboard</Text>
               </Pressable>
-            ) : null}
+            )}
           </View>
 
           {activeBusiness && activeBusiness.ownerUserId === currentUserId ? (
@@ -7825,6 +8446,11 @@ function AppContent() {
           ) : null}
 
           <View style={styles.businessGrid}>
+            <Pressable style={styles.businessGridCard} onPress={openSalesDashboard}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▦</Text></View>
+              <Text style={styles.businessGridTitle}>Dashboard</Text>
+              <Text style={styles.businessGridMeta}>Sales & stock</Text>
+            </Pressable>
             <Pressable style={styles.businessGridCard} onPress={openBusinessStorefrontEditor}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◎</Text></View>
               <Text style={styles.businessGridTitle}>Storefront</Text>
@@ -7840,18 +8466,52 @@ function AppContent() {
             <Pressable
               style={styles.businessGridCard}
               onPress={() => {
-                void syncPhoneContacts(currentUserId);
+                void loadBusinessCustomers();
+                void syncPhoneContacts(currentUserId, { quiet: true });
+                setSelectedCustomer(null);
                 setBusinessPanel('customers');
               }}
             >
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◌</Text></View>
               <Text style={styles.businessGridTitle}>Customers</Text>
-              <Text style={styles.businessGridMeta}>{customerCount} on ZynkUp</Text>
+              <Text style={styles.businessGridMeta}>
+                {dueFollowUps ? `${dueFollowUps} follow-ups` : `${customerCount} records`}
+              </Text>
             </Pressable>
-            <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('receipts')}>
+            <Pressable style={styles.businessGridCard} onPress={() => openOrdersPanel('seller')}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▣</Text></View>
+              <Text style={styles.businessGridTitle}>Orders</Text>
+              <Text style={styles.businessGridMeta}>
+                {openOrderCount ? `${openOrderCount} open` : `${sellerOrders.length} total`}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void loadInventoryAlerts();
+                setBusinessPanel('inventory');
+              }}
+            >
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▥</Text></View>
+              <Text style={styles.businessGridTitle}>Inventory</Text>
+              <Text style={styles.businessGridMeta}>
+                {inventoryAlerts.filter((alert) => alert.state === 'open').length
+                  ? `${inventoryAlerts.filter((alert) => alert.state === 'open').length} alerts`
+                  : 'Stock & alerts'}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void loadSaleReceipts();
+                setBusinessPanel('receipts');
+              }}
+            >
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>□</Text></View>
               <Text style={styles.businessGridTitle}>Receipts</Text>
-              <Text style={styles.businessGridMeta}>Auto-generated</Text>
+              <Text style={styles.businessGridMeta}>
+                {saleReceipts.filter((item) => item.sellerUserId === currentUserId && item.state === 'issued').length || 'Auto-generated'}
+              </Text>
             </Pressable>
             <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('broadcast')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◍</Text></View>
@@ -8107,6 +8767,40 @@ function AppContent() {
             (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
             'If off, you will not send or see blue ticks. Delivered ticks still work.',
           )}
+          <Text style={styles.settingsSectionCaption}>Marketing preferences</Text>
+          <Text style={styles.cardBody}>
+            Businesses you bought from keep a customer record. Opting in is required before they can broadcast to you.
+          </Text>
+          <Pressable style={styles.catalogChip} onPress={() => void loadCustomerPreferences()}>
+            <Text style={styles.catalogChipText}>Refresh preferences</Text>
+          </Pressable>
+          {customerPrefs.length ? null : (
+            <Text style={styles.cardBody}>No business customer records linked to you yet.</Text>
+          )}
+          {customerPrefs.map((pref) => (
+            <View key={pref.customerId} style={styles.sheetOption}>
+              <Text style={styles.sheetOptionTitle}>
+                Seller {pref.sellerUserId}
+              </Text>
+              <Text style={styles.sheetOptionBody}>
+                Status: {pref.marketingConsent}
+              </Text>
+              <View style={styles.stockControls}>
+                <Pressable
+                  style={styles.catalogChip}
+                  onPress={() => void updateMyMarketingPreference(pref.customerId, 'opted_in')}
+                >
+                  <Text style={styles.catalogChipText}>Opt in</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.catalogChip}
+                  onPress={() => void updateMyMarketingPreference(pref.customerId, 'opted_out')}
+                >
+                  <Text style={styles.catalogChipText}>Opt out</Text>
+                </Pressable>
+              </View>
+            </View>
+          ))}
           <Text style={styles.settingsSectionCaption}>Locked chats</Text>
           <Text style={styles.cardBody}>
             Locked chats need your PIN. Notifications hide the message text. This does not stop screenshots.
@@ -9312,8 +10006,35 @@ function AppContent() {
                 </Pressable>
               ))}
             </View>
+            {filteredCatalogItems.filter((item) => (item.status || 'active') === 'active' && !item.takenDown).length ? (
+              <>
+                <Text style={styles.lightSectionLabel}>TAG A PRODUCT</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                  <Pressable
+                    style={[styles.marketFilterChip, !statusTaggedProductId ? styles.marketFilterChipOn : null]}
+                    onPress={() => setStatusTaggedProductId('')}
+                  >
+                    <Text style={styles.marketFilterText}>No product</Text>
+                  </Pressable>
+                  {filteredCatalogItems
+                    .filter((item) => (item.status || 'active') === 'active' && !item.takenDown)
+                    .slice(0, 20)
+                    .map((item) => (
+                      <Pressable
+                        key={item.id}
+                        style={[styles.marketFilterChip, statusTaggedProductId === item.id ? styles.marketFilterChipOn : null]}
+                        onPress={() => setStatusTaggedProductId(item.id)}
+                      >
+                        <Text style={styles.marketFilterText} numberOfLines={1}>{item.title}</Text>
+                      </Pressable>
+                    ))}
+                </ScrollView>
+              </>
+            ) : null}
             <Pressable style={styles.sendButtonWide} onPress={() => void postStatus()}>
-              <Text style={styles.sendButtonText}>Post status</Text>
+              <Text style={styles.sendButtonText}>
+                {statusTaggedProductId ? 'Post status with product' : 'Post status'}
+              </Text>
             </Pressable>
           </View>
         </View>
@@ -9408,16 +10129,9 @@ function AppContent() {
                   {activeStatusItem?.catalogItemId ? (
                     <Pressable
                       style={styles.sendButtonWide}
-                      onPress={() => {
-                        const product = catalogItems.find((item) => item.id === activeStatusItem.catalogItemId);
-                        if (!product) {
-                          showToast('That product is no longer available.', 'error');
-                          return;
-                        }
-                        void sendCatalogCard(product, activeStatusItem.userId);
-                      }}
+                      onPress={() => void openStatusProduct(activeStatusItem.catalogItemId, activeStatusItem.id)}
                     >
-                      <Text style={styles.sendButtonText}>Add to cart</Text>
+                      <Text style={styles.sendButtonText}>View product</Text>
                     </Pressable>
                   ) : null}
                   <View style={styles.storyStatsRow}>
@@ -9702,20 +10416,160 @@ function AppContent() {
           <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
             <View style={styles.statusComposerHeader}>
               <Text style={styles.statusComposerTitle}>
-                {businessPanel === 'profile'
-                  ? 'Storefront'
-                  : businessPanel === 'catalog'
-                    ? 'My catalog'
-                    : businessPanel === 'customers'
-                      ? 'Customers'
-                      : businessPanel === 'receipts'
-                        ? 'Receipts'
-                        : 'Broadcast'}
+                {businessPanel === 'dashboard'
+                  ? 'Sales dashboard'
+                  : businessPanel === 'profile'
+                    ? 'Storefront'
+                    : businessPanel === 'catalog'
+                      ? 'My catalog'
+                      : businessPanel === 'customers'
+                        ? 'Customers'
+                        : businessPanel === 'orders'
+                          ? 'Orders'
+                          : businessPanel === 'inventory'
+                            ? 'Inventory'
+                            : businessPanel === 'receipts'
+                              ? 'Receipts'
+                              : 'Broadcast'}
               </Text>
               <Pressable onPress={() => setBusinessPanel('')}>
                 <Text style={styles.storyClose}>Close</Text>
               </Pressable>
             </View>
+
+            {businessPanel === 'dashboard' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                  {[
+                    ['today', 'Today'],
+                    ['7d', '7 days'],
+                    ['30d', '30 days'],
+                  ].map(([id, label]) => (
+                    <Pressable
+                      key={id}
+                      style={[styles.marketFilterChip, salesDashboardPeriod === id ? styles.marketFilterChipOn : null]}
+                      onPress={() => {
+                        setSalesDashboardPeriod(id);
+                        void loadSalesDashboard(id);
+                      }}
+                    >
+                      <Text style={styles.marketFilterText}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+                {salesDashboard ? (
+                  <>
+                    <Text style={styles.cardBody}>
+                      {salesDashboard.periodStart ? new Date(salesDashboard.periodStart).toLocaleDateString() : ''}
+                      {' – '}
+                      {salesDashboard.periodEnd ? new Date(salesDashboard.periodEnd).toLocaleDateString() : ''}
+                      {' · '}
+                      {salesDashboard.currency}
+                      {salesDashboard.estimated ? ' · Estimated' : ' · Live'}
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      Updated {salesDashboard.lastUpdatedAt ? new Date(salesDashboard.lastUpdatedAt).toLocaleString() : ''}
+                    </Text>
+                    <View style={styles.businessStatsRow}>
+                      <Pressable
+                        style={styles.businessStatCard}
+                        onPress={() => {
+                          setBusinessPanel('');
+                          openOrdersPanel('seller');
+                        }}
+                      >
+                        <Text style={styles.businessStatValue}>{salesDashboard.metrics?.pendingOrders ?? 0}</Text>
+                        <Text style={styles.businessStatLabel}>Pending orders</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.businessStatCard}
+                        onPress={() => {
+                          void loadSaleReceipts();
+                          setBusinessPanel('receipts');
+                        }}
+                      >
+                        <Text style={styles.businessStatValue}>{salesDashboard.metrics?.confirmedSalesCount ?? 0}</Text>
+                        <Text style={styles.businessStatLabel}>Confirmed sales</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.businessStatCard}
+                        onPress={() => setBusinessPanel('catalog')}
+                      >
+                        <Text style={styles.businessStatValue}>{salesDashboard.metrics?.lowStockCount ?? 0}</Text>
+                        <Text style={styles.businessStatLabel}>Low stock</Text>
+                      </Pressable>
+                    </View>
+                    {salesDashboard.canSeeFinance ? (
+                      <>
+                        <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>SALES (NOT PROFIT)</Text>
+                        <Text style={styles.sheetOptionTitle}>
+                          Gross sales {moneyLabel(salesDashboard.metrics?.grossSales, salesDashboard.currency)}
+                        </Text>
+                        <Text style={styles.sheetOptionBody}>
+                          Refunds {moneyLabel(salesDashboard.metrics?.refunds, salesDashboard.currency)}
+                          {' · '}
+                          Net sales {moneyLabel(salesDashboard.metrics?.netSales, salesDashboard.currency)}
+                        </Text>
+                        <Text style={styles.sheetOptionBody}>
+                          Cash received {moneyLabel(salesDashboard.metrics?.cashReceived, salesDashboard.currency)}
+                          {' (confirmed payments only)'}
+                        </Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {salesDashboard.metrics?.grossProfitAvailable
+                            ? `Gross profit ${moneyLabel(salesDashboard.metrics?.grossProfit, salesDashboard.currency)} · COGS ${moneyLabel(salesDashboard.metrics?.costOfGoodsSold, salesDashboard.currency)}`
+                            : 'Gross profit unavailable — add cost prices on products first.'}
+                        </Text>
+                        <Text style={styles.cardBody}>{salesDashboard.metrics?.grossProfitNote}</Text>
+                      </>
+                    ) : (
+                      <Text style={styles.cardBody}>Financial totals are limited to owners and managers.</Text>
+                    )}
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>TOP PRODUCTS</Text>
+                    {(salesDashboard.topProducts || []).length ? null : (
+                      <Text style={styles.sheetOptionBody}>No confirmed sales in this period.</Text>
+                    )}
+                    {(salesDashboard.topProducts || []).map((product) => (
+                      <Text key={product.catalogItemId || product.title} style={styles.sheetOptionBody}>
+                        {product.title} · {product.units} sold
+                        {product.revenue != null ? ` · ${moneyLabel(product.revenue, salesDashboard.currency)}` : ''}
+                      </Text>
+                    ))}
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>LOW STOCK</Text>
+                    {(salesDashboard.lowStock || []).length ? null : (
+                      <Text style={styles.sheetOptionBody}>Stock looks fine right now.</Text>
+                    )}
+                    {(salesDashboard.lowStock || []).map((item) => (
+                      <Pressable key={item.id} style={styles.sheetOption} onPress={() => setBusinessPanel('catalog')}>
+                        <Text style={styles.sheetOptionTitle}>{item.title}</Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {item.stockQuantity} left · alert at {item.lowStockThreshold}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    <Pressable
+                      style={[styles.ghostButton, { marginTop: 12 }]}
+                      onPress={() => {
+                        const lines = [
+                          `ZynkUp sales report (${salesDashboard.period})`,
+                          `Currency ${salesDashboard.currency}`,
+                          `Pending orders ${salesDashboard.metrics?.pendingOrders ?? 0}`,
+                          `Confirmed sales ${salesDashboard.metrics?.confirmedSalesCount ?? 0}`,
+                          salesDashboard.canSeeFinance
+                            ? `Gross sales ${salesDashboard.metrics?.grossSales} · Net sales ${salesDashboard.metrics?.netSales} · Cash received ${salesDashboard.metrics?.cashReceived}`
+                            : null,
+                          `Low stock ${salesDashboard.metrics?.lowStockCount ?? 0}`,
+                        ].filter(Boolean);
+                        void Share.share({ message: lines.join('\n') });
+                      }}
+                    >
+                      <Text style={styles.ghostButtonText}>Share report</Text>
+                    </Pressable>
+                  </>
+                ) : (
+                  <Text style={styles.cardBody}>Loading sales figures…</Text>
+                )}
+              </ScrollView>
+            ) : null}
 
             {businessPanel === 'profile' ? (
               <ScrollView style={styles.businessPanelScroll}>
@@ -9877,6 +10731,22 @@ function AppContent() {
                   keyboardType="number-pad"
                   style={styles.input}
                 />
+                <TextInput
+                  value={catalogForm.costPrice}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, costPrice: value }))}
+                  placeholder={`Cost price (${accountCurrency}) — for gross profit`}
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="decimal-pad"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={catalogForm.lowStockThreshold}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, lowStockThreshold: value.replace(/[^\d]/g, '') }))}
+                  placeholder="Low-stock alert threshold"
+                  placeholderTextColor="#7d8b92"
+                  keyboardType="number-pad"
+                  style={styles.input}
+                />
                 {renderSettingsToggle(
                   'Track stock',
                   catalogForm.trackStock,
@@ -9946,7 +10816,9 @@ function AppContent() {
                       <Text style={styles.sheetOptionTitle}>{item.title}</Text>
                       <Text style={styles.sheetOptionBody}>
                         {item.price} · {item.status || 'active'}
-                        {item.trackStock === false ? ' · Stock not tracked' : ` · Stock ${item.stockQuantity ?? 0}`}
+                        {item.trackStock === false
+                          ? ' · Stock not tracked'
+                          : ` · Stock ${item.stockQuantity ?? 0}${Number(item.stockQuantity ?? 0) <= Number(item.lowStockThreshold ?? 2) ? ' · Low stock' : ''}`}
                       </Text>
                       {(item.variants || []).length ? (
                         <Text style={styles.sheetOptionBody}>
@@ -10001,51 +10873,320 @@ function AppContent() {
 
             {businessPanel === 'customers' ? (
               <ScrollView style={styles.businessPanelScroll}>
-                <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
-                  <Text style={styles.sendButtonText}>Sync contacts</Text>
-                </Pressable>
-                {contactItems.length ? null : (
-                  <Text style={styles.cardBody}>No customers yet. Sync your phone book to find people already on ZynkUp.</Text>
-                )}
-                {contactItems.map((customer) => (
-                  <View key={customer.id} style={styles.contactPickRow}>
-                    {renderPersonAvatar({
-                      userId: customer.linkedUserId,
-                      name: customer.name,
-                      size: 44,
-                      onPress: () => onAvatarPress(customer.linkedUserId, customer.name),
-                    })}
+                {selectedCustomer ? (
+                  <>
                     <Pressable
-                      style={styles.contactPickCopy}
+                      style={styles.catalogChip}
                       onPress={() => {
-                        if (customer.linkedUserId) {
-                          setBusinessPanel('');
-                          void createDirectChat(customer.linkedUserId);
-                        }
+                        setSelectedCustomer(null);
+                        setCustomerOrders([]);
                       }}
                     >
-                      <Text style={styles.sheetOptionTitle}>{customer.name}</Text>
+                      <Text style={styles.catalogChipText}>Back to list</Text>
+                    </Pressable>
+                    <Text style={styles.sheetOptionTitle}>{selectedCustomer.displayName}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {selectedCustomer.phone || 'No phone'}
+                      {selectedCustomer.customerUserId ? ' · On ZynkUp' : ''}
+                      {' · '}
+                      {selectedCustomer.marketingConsent === 'opted_in'
+                        ? 'Marketing opted in'
+                        : selectedCustomer.marketingConsent === 'opted_out'
+                          ? 'Marketing opted out'
+                          : 'Marketing consent unknown'}
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {selectedCustomer.orderCount || 0} orders · spent{' '}
+                      {selectedCustomer.currency || profile.currency || 'GHS'}{' '}
+                      {Number(selectedCustomer.totalSpent || 0).toFixed(2)}
+                    </Text>
+                    {selectedCustomer.tags?.length ? (
+                      <Text style={styles.sheetOptionBody}>Tags: {selectedCustomer.tags.join(', ')}</Text>
+                    ) : null}
+                    {selectedCustomer.followUpAt ? (
                       <Text style={styles.sheetOptionBody}>
-                        {customer.phone}
-                        {customer.registered ? ' · On ZynkUp' : ' · Invite pending'}
+                        Follow-up {new Date(selectedCustomer.followUpAt).toLocaleString()}
+                        {selectedCustomer.followUpNote ? ` · ${selectedCustomer.followUpNote}` : ''}
                       </Text>
+                    ) : null}
+                    <View style={styles.stockControls}>
+                      {selectedCustomer.customerUserId ? (
+                        <Pressable
+                          style={styles.catalogChip}
+                          onPress={() => {
+                            setBusinessPanel('');
+                            void createDirectChat(selectedCustomer.customerUserId);
+                          }}
+                        >
+                          <Text style={styles.catalogChipText}>Message</Text>
+                        </Pressable>
+                      ) : null}
+                      <Pressable
+                        style={styles.catalogChip}
+                        onPress={() =>
+                          void updateBusinessCustomer(selectedCustomer.id, {
+                            followUpAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                            followUpNote: 'Follow up tomorrow',
+                          })
+                        }
+                      >
+                        <Text style={styles.catalogChipText}>Follow up tomorrow</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.catalogChip}
+                        onPress={() => void updateBusinessCustomer(selectedCustomer.id, { marketingConsent: 'opted_out' })}
+                      >
+                        <Text style={styles.catalogChipText}>Mark opted out</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.catalogChip}
+                        onPress={() => void deleteBusinessCustomer(selectedCustomer.id)}
+                      >
+                        <Text style={styles.catalogChipText}>Delete record</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>NOTES</Text>
+                    <TextInput
+                      value={customerNoteDraft}
+                      onChangeText={setCustomerNoteDraft}
+                      placeholder="Add a private note"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <Pressable style={styles.sendButtonWide} onPress={() => void addCustomerNote(selectedCustomer.id)}>
+                      <Text style={styles.sendButtonText}>Save note</Text>
+                    </Pressable>
+                    {(selectedCustomer.notes || []).map((note) => (
+                      <View key={note.id} style={styles.sheetOption}>
+                        <Text style={styles.sheetOptionBody}>{note.text}</Text>
+                        <Text style={styles.sheetOptionBody}>{new Date(note.createdAt).toLocaleString()}</Text>
+                      </View>
+                    ))}
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>PURCHASE HISTORY</Text>
+                    {customerOrders.length ? null : (
+                      <Text style={styles.sheetOptionBody}>No linked orders yet.</Text>
+                    )}
+                    {customerOrders.map((order) => (
+                      <View key={order.id} style={styles.sheetOption}>
+                        <Text style={styles.sheetOptionTitle}>{order.itemTitle}</Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {order.state} · {order.currency} {Number(order.totalAmount || 0).toFixed(2)} ·{' '}
+                          {new Date(order.createdAt).toLocaleDateString()}
+                        </Text>
+                      </View>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.cardBody}>
+                      Customer records are separate from personal profiles. Orders create a record automatically. Marketing
+                      stays unknown until the customer opts in.
+                    </Text>
+                    <Text style={styles.lightSectionLabel}>ADD CUSTOMER</Text>
+                    <TextInput
+                      value={customerForm.displayName}
+                      onChangeText={(value) => setCustomerForm((current) => ({ ...current, displayName: value }))}
+                      placeholder="Name"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <TextInput
+                      value={customerForm.phone}
+                      onChangeText={(value) => setCustomerForm((current) => ({ ...current, phone: value }))}
+                      placeholder="Phone"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                      keyboardType="phone-pad"
+                    />
+                    <TextInput
+                      value={customerForm.tags}
+                      onChangeText={(value) => setCustomerForm((current) => ({ ...current, tags: value }))}
+                      placeholder="Tags (comma separated)"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <TextInput
+                      value={customerForm.note}
+                      onChangeText={(value) => setCustomerForm((current) => ({ ...current, note: value }))}
+                      placeholder="First note (optional)"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <Pressable style={styles.sendButtonWide} onPress={() => void createBusinessCustomer()}>
+                      <Text style={styles.sendButtonText}>Save customer</Text>
+                    </Pressable>
+                    <Pressable style={styles.catalogChip} onPress={() => void loadBusinessCustomers()}>
+                      <Text style={styles.catalogChipText}>Refresh records</Text>
+                    </Pressable>
+                    <Pressable style={styles.catalogChip} onPress={() => void syncPhoneContacts(currentUserId)}>
+                      <Text style={styles.catalogChipText}>Sync phone contacts</Text>
+                    </Pressable>
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>CUSTOMER RECORDS</Text>
+                    {businessCustomers.length ? null : (
+                      <Text style={styles.cardBody}>No CRM records yet. Save one above or wait for an order.</Text>
+                    )}
+                    {businessCustomers.map((customer) => {
+                      const due =
+                        customer.followUpAt && new Date(customer.followUpAt).getTime() <= Date.now();
+                      return (
+                        <Pressable
+                          key={customer.id}
+                          style={styles.sheetOption}
+                          onPress={() => void loadCustomerDetail(customer.id)}
+                        >
+                          <Text style={styles.sheetOptionTitle}>
+                            {customer.displayName}
+                            {due ? ' · Follow-up due' : ''}
+                          </Text>
+                          <Text style={styles.sheetOptionBody}>
+                            {(customer.tags || []).join(', ') || 'No tags'}
+                            {' · '}
+                            {customer.orderCount || 0} orders
+                            {' · '}
+                            {customer.marketingConsent}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>PHONE BOOK ON ZYNKUP</Text>
+                    {contactItems.filter((contact) => contact.registered || contact.linkedUserId).map((contact) => (
+                      <View key={contact.id} style={styles.contactPickRow}>
+                        {renderPersonAvatar({
+                          userId: contact.linkedUserId,
+                          name: contact.name,
+                          size: 44,
+                          onPress: () => onAvatarPress(contact.linkedUserId, contact.name),
+                        })}
+                        <Pressable style={styles.contactPickCopy} onPress={() => void importContactAsCustomer(contact)}>
+                          <Text style={styles.sheetOptionTitle}>{contact.name}</Text>
+                          <Text style={styles.sheetOptionBody}>{contact.phone} · Tap to add to CRM</Text>
+                        </Pressable>
+                      </View>
+                    ))}
+                  </>
+                )}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'inventory' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.cardBody}>
+                  Low-stock alerts fire when quantity reaches each product threshold. Sales and adjustments are recorded in the inventory ledger.
+                </Text>
+                <Text style={styles.lightSectionLabel}>OPEN ALERTS</Text>
+                {inventoryAlerts.filter((alert) => alert.state === 'open').length ? null : (
+                  <Text style={styles.sheetOptionBody}>No open stock alerts.</Text>
+                )}
+                {inventoryAlerts.filter((alert) => alert.state === 'open').map((alert) => (
+                  <View key={alert.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{alert.title}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {alert.stockQuantity} left · alert at {alert.lowStockThreshold}
+                    </Text>
+                    <Pressable style={styles.catalogChip} onPress={() => void reviewInventoryAlert(alert.id)}>
+                      <Text style={styles.catalogChipText}>Mark reviewed</Text>
                     </Pressable>
                   </View>
                 ))}
+                <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>TRACKED PRODUCTS</Text>
+                {filteredCatalogItems.filter((item) => item.trackStock !== false).map((item) => {
+                  const low = Number(item.stockQuantity ?? 0) <= Number(item.lowStockThreshold ?? 2);
+                  return (
+                    <View key={item.id} style={styles.sheetOption}>
+                      <Text style={styles.sheetOptionTitle}>{item.title}{low ? ' · Low' : ''}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        Stock {item.stockQuantity ?? 0} · threshold {item.lowStockThreshold ?? 2}
+                      </Text>
+                      <View style={styles.stockControls}>
+                        <Pressable style={styles.stockButton} onPress={() => void adjustCatalogStock(item.id, (item.stockQuantity ?? 0) - 1)}>
+                          <Text style={styles.stockButtonText}>-</Text>
+                        </Pressable>
+                        <Pressable style={styles.stockButton} onPress={() => void adjustCatalogStock(item.id, (item.stockQuantity ?? 0) + 1)}>
+                          <Text style={styles.stockButtonText}>+</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'orders' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                  {[
+                    ['seller', 'Selling'],
+                    ['buyer', 'Buying'],
+                    ['all', 'All'],
+                  ].map(([id, label]) => (
+                    <Pressable
+                      key={id}
+                      style={[styles.marketFilterChip, orderRoleFilter === id ? styles.marketFilterChipOn : null]}
+                      onPress={() => {
+                        setOrderRoleFilter(id);
+                        void loadCommerceOrders(id);
+                      }}
+                    >
+                      <Text style={styles.marketFilterText}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+                {commerceOrders.length ? null : (
+                  <Text style={styles.cardBody}>No orders yet. When someone buys from a tagged status or catalogue, it shows here.</Text>
+                )}
+                {commerceOrders.map((order) => {
+                  const item = order.items?.[0];
+                  return (
+                    <Pressable
+                      key={order.id}
+                      style={styles.sheetOption}
+                      onPress={() => setOrderDetail(order)}
+                    >
+                      <Text style={styles.sheetOptionTitle}>{item?.title || 'Order'}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        {order.id} · {orderStateLabel(order.state)} · {order.currency} {order.totalAmount}
+                      </Text>
+                      <Text style={styles.sheetOptionBody}>
+                        Qty {item?.quantity || 1}
+                        {order.sellerUserId === currentUserId ? ' · You sell' : ' · You buy'}
+                        {' · '}
+                        {new Date(order.createdAt).toLocaleString()}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </ScrollView>
             ) : null}
 
             {businessPanel === 'receipts' ? (
               <ScrollView style={styles.businessPanelScroll}>
-                {payHistoryItems.length ? null : (
-                  <Text style={styles.cardBody}>No receipts yet. Payments you send or receive will show here.</Text>
+                {saleReceipts.length ? null : (
+                  <Text style={styles.cardBody}>
+                    No sale receipts yet. A receipt is created automatically when an order is marked paid.
+                  </Text>
                 )}
-                {payHistoryItems.map((receipt) => (
-                  <View key={receipt.id} style={styles.sheetOption}>
-                    <Text style={styles.sheetOptionTitle}>{receipt.title}</Text>
-                    <Text style={styles.sheetOptionBody}>{receipt.time} · {receipt.amount}</Text>
-                  </View>
+                {saleReceipts.map((receipt) => (
+                  <Pressable key={receipt.id} style={styles.sheetOption} onPress={() => setReceiptDetail(receipt)}>
+                    <Text style={styles.sheetOptionTitle}>{receipt.receiptNumber}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {receipt.businessName || receipt.sellerName} · {receipt.currency} {receipt.totalAmount}
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {receipt.state} · {new Date(receipt.issuedAt || receipt.createdAt).toLocaleString()}
+                    </Text>
+                  </Pressable>
                 ))}
+                {payHistoryItems.length ? (
+                  <>
+                    <Text style={[styles.lightSectionLabel, { marginTop: 16 }]}>WALLET HISTORY</Text>
+                    {payHistoryItems.map((receipt) => (
+                      <View key={receipt.id} style={styles.sheetOption}>
+                        <Text style={styles.sheetOptionTitle}>{receipt.title}</Text>
+                        <Text style={styles.sheetOptionBody}>{receipt.time} · {receipt.amount}</Text>
+                      </View>
+                    ))}
+                  </>
+                ) : null}
               </ScrollView>
             ) : null}
 
@@ -10087,12 +11228,33 @@ function AppContent() {
                     ? 'Request money'
                     : paySheet === 'topup'
                       ? 'Top up wallet'
-                      : 'Payment history'}
+                      : paySheet === 'orders'
+                        ? 'My orders'
+                        : 'Payment history'}
               </Text>
               <Pressable onPress={() => setPaySheet('')}>
                 <Text style={styles.storyClose}>Close</Text>
               </Pressable>
             </View>
+            {paySheet === 'orders' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                {commerceOrders.length ? null : (
+                  <Text style={styles.cardBody}>No purchases yet. Order from a tagged status or product page.</Text>
+                )}
+                {commerceOrders.map((order) => {
+                  const item = order.items?.[0];
+                  return (
+                    <Pressable key={order.id} style={styles.sheetOption} onPress={() => setOrderDetail(order)}>
+                      <Text style={styles.sheetOptionTitle}>{item?.title || 'Order'}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        {orderStateLabel(order.state)} · {order.currency} {order.totalAmount}
+                      </Text>
+                      <Text style={styles.sheetOptionBody}>{new Date(order.createdAt).toLocaleString()}</Text>
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+            ) : null}
             {paySheet === 'history' ? (
               <ScrollView style={styles.businessPanelScroll}>
                 {payHistoryItems.length ? null : (
@@ -10105,7 +11267,8 @@ function AppContent() {
                   </View>
                 ))}
               </ScrollView>
-            ) : (
+            ) : null}
+            {paySheet && paySheet !== 'history' && paySheet !== 'orders' ? (
               <View>
                 {(paySheet === 'send' || paySheet === 'request') ? (
                   <TextInput
@@ -10141,7 +11304,152 @@ function AppContent() {
                   </Text>
                 </Pressable>
               </View>
-            )}
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(orderDetail)}
+        onRequestClose={() => setOrderDetail(null)}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>Order details</Text>
+              <Pressable onPress={() => setOrderDetail(null)}>
+                <Text style={styles.storyClose}>Close</Text>
+              </Pressable>
+            </View>
+            {orderDetail ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.sheetOptionTitle}>{orderDetail.items?.[0]?.title || 'Order'}</Text>
+                <Text style={styles.sheetOptionBody}>{orderDetail.id}</Text>
+                <Text style={styles.sheetOptionBody}>
+                  {orderStateLabel(orderDetail.state)} · {orderDetail.currency} {orderDetail.totalAmount}
+                </Text>
+                <Text style={styles.sheetOptionBody}>
+                  Qty {orderDetail.items?.[0]?.quantity || 1}
+                  {(orderDetail.items?.[0]?.variantSelections || []).length
+                    ? ` · ${(orderDetail.items[0].variantSelections || []).map((entry) => `${entry.name}: ${entry.option}`).join(', ')}`
+                    : ''}
+                </Text>
+                <Text style={styles.sheetOptionBody}>
+                  {orderDetail.sellerUserId === currentUserId ? 'You are the seller' : 'You are the buyer'}
+                </Text>
+                {orderDetail.receiptId ? (
+                  <Pressable
+                    style={[styles.sendButtonWide, { marginTop: 12 }]}
+                    onPress={() => void openSaleReceipt(orderDetail.receiptId)}
+                  >
+                    <Text style={styles.sendButtonText}>View receipt</Text>
+                  </Pressable>
+                ) : (
+                  <Text style={[styles.sheetOptionBody, { marginTop: 8 }]}>
+                    Receipt appears after payment is confirmed.
+                  </Text>
+                )}
+                <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>HISTORY</Text>
+                {(orderDetail.history || []).slice().reverse().map((entry, index) => (
+                  <Text key={`${entry.at}-${index}`} style={styles.sheetOptionBody}>
+                    {orderStateLabel(entry.state)} · {new Date(entry.at).toLocaleString()}
+                    {entry.note ? ` · ${entry.note}` : ''}
+                  </Text>
+                ))}
+                <View style={[styles.catalogActionRow, { marginTop: 16 }]}>
+                  {[...sellerOrderActions(orderDetail), ...buyerOrderActions(orderDetail)].map(([state, label]) => (
+                    <Pressable
+                      key={state}
+                      style={styles.catalogChip}
+                      onPress={() => void updateCommerceOrderState(orderDetail, state)}
+                    >
+                      <Text style={styles.catalogChipText}>{label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {orderDetail.buyerUserId === currentUserId || orderDetail.sellerUserId === currentUserId ? (
+                  <Pressable
+                    style={[styles.ghostButton, { marginTop: 10 }]}
+                    onPress={() => {
+                      const peerId = orderDetail.sellerUserId === currentUserId
+                        ? orderDetail.buyerUserId
+                        : orderDetail.sellerUserId;
+                      setOrderDetail(null);
+                      setBusinessPanel('');
+                      setPaySheet('');
+                      void createDirectChat(peerId);
+                    }}
+                  >
+                    <Text style={styles.ghostButtonText}>Open chat</Text>
+                  </Pressable>
+                ) : null}
+              </ScrollView>
+            ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(receiptDetail)}
+        onRequestClose={() => setReceiptDetail(null)}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>Receipt</Text>
+              <Pressable onPress={() => setReceiptDetail(null)}>
+                <Text style={styles.storyClose}>Close</Text>
+              </Pressable>
+            </View>
+            {receiptDetail ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.sheetOptionTitle}>{receiptDetail.receiptNumber}</Text>
+                <Text style={styles.sheetOptionBody}>{receiptDetail.businessName || receiptDetail.sellerName}</Text>
+                <Text style={styles.sheetOptionBody}>Buyer: {receiptDetail.buyerName}</Text>
+                <Text style={styles.sheetOptionBody}>
+                  {receiptDetail.state} · {new Date(receiptDetail.issuedAt || receiptDetail.createdAt).toLocaleString()}
+                </Text>
+                <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>ITEMS</Text>
+                {(receiptDetail.items || []).map((item, index) => (
+                  <Text key={`${item.catalogItemId}-${index}`} style={styles.sheetOptionBody}>
+                    {item.title} x{item.quantity} · {item.currency} {item.price}
+                    {(item.variantSelections || []).length
+                      ? ` · ${(item.variantSelections || []).map((entry) => `${entry.name}: ${entry.option}`).join(', ')}`
+                      : ''}
+                  </Text>
+                ))}
+                <Text style={[styles.sheetOptionTitle, { marginTop: 12 }]}>
+                  Total {receiptDetail.currency} {receiptDetail.totalAmount}
+                </Text>
+                <Text style={styles.sheetOptionBody}>
+                  Payment: {receiptDetail.paymentMethod} · {receiptDetail.paymentReference}
+                </Text>
+                <View style={[styles.catalogActionRow, { marginTop: 16 }]}>
+                  <Pressable
+                    style={styles.sendButtonWide}
+                    onPress={() => void Share.share({ message: formatSaleReceiptShare(receiptDetail) })}
+                  >
+                    <Text style={styles.sendButtonText}>Share receipt</Text>
+                  </Pressable>
+                  {receiptDetail.orderId ? (
+                    <Pressable
+                      style={styles.ghostButton}
+                      onPress={() => {
+                        const order = commerceOrders.find((entry) => entry.id === receiptDetail.orderId);
+                        setReceiptDetail(null);
+                        if (order) setOrderDetail(order);
+                      }}
+                    >
+                      <Text style={styles.ghostButtonText}>Open order</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              </ScrollView>
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -10502,6 +11810,102 @@ function AppContent() {
             </Pressable>
           </Pressable>
         </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(statusProductSheet)}
+        onRequestClose={() => {
+          setStatusProductSheet(null);
+          setStatusProductSeller(null);
+        }}
+      >
+        <View style={styles.peerProfileScreen}>
+          <Pressable
+            style={styles.viewerClose}
+            onPress={() => {
+              setStatusProductSheet(null);
+              setStatusProductSeller(null);
+            }}
+          >
+            <Text style={styles.viewerCloseText}>Close</Text>
+          </Pressable>
+          {statusProductSheet?.imageUrls?.[0] ? (
+            <Image source={{ uri: statusProductSheet.imageUrls[0] }} style={styles.peerCatalogImage} />
+          ) : null}
+          <Text style={styles.peerProfileName}>{statusProductSheet?.title}</Text>
+          <Text style={styles.peerProfileMeta}>
+            {statusProductSheet?.currency} {statusProductSheet?.price}
+            {statusProductSheet?.purchasable === false ? ' · Unavailable' : ''}
+          </Text>
+          <Text style={styles.peerProfileMeta}>
+            {statusProductSeller?.businessName || statusProductSeller?.name || 'Seller'}
+            {statusProductSeller?.verified ? ' ✓' : ''}
+          </Text>
+          <Text style={styles.peerProfileMeta}>{statusProductSheet?.description || ''}</Text>
+          {(statusProductSheet?.variants || []).map((variant) => (
+            <View key={variant.id || variant.name} style={{ marginBottom: 8, paddingHorizontal: 20 }}>
+              <Text style={styles.lightSectionLabel}>{variant.name}</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                {(variant.options || []).map((option) => (
+                  <Pressable
+                    key={option}
+                    style={[styles.marketFilterChip, statusVariantPicks[variant.name] === option ? styles.marketFilterChipOn : null]}
+                    onPress={() => setStatusVariantPicks((current) => ({ ...current, [variant.name]: option }))}
+                  >
+                    <Text style={styles.marketFilterText}>{option}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+          ))}
+          <View style={{ paddingHorizontal: 20, marginTop: 8 }}>
+            <TextInput
+              value={statusOrderQuantity}
+              onChangeText={(value) => setStatusOrderQuantity(value.replace(/[^\d]/g, '') || '1')}
+              placeholder="Quantity"
+              placeholderTextColor="#7d8b92"
+              keyboardType="number-pad"
+              style={styles.input}
+            />
+          </View>
+          <View style={[styles.catalogActionRow, { paddingHorizontal: 20, marginTop: 8 }]}>
+            {statusProductSheet?.sellerId && statusProductSheet.sellerId !== currentUserId ? (
+              <Pressable
+                style={styles.ghostButton}
+                onPress={() => {
+                  const sellerId = statusProductSheet.sellerId;
+                  setStatusProductSheet(null);
+                  setStatusProductSeller(null);
+                  void createDirectChat(sellerId);
+                }}
+              >
+                <Text style={styles.ghostButtonText}>Chat seller</Text>
+              </Pressable>
+            ) : null}
+            <Pressable
+              style={styles.sendButtonWide}
+              onPress={() => void placeStatusProductOrder()}
+            >
+              <Text style={styles.sendButtonText}>
+                {statusProductSheet?.purchasable === false ? 'Unavailable' : 'Order & pay'}
+              </Text>
+            </Pressable>
+          </View>
+          {statusProductSeller?.businessId ? (
+            <Pressable
+              style={[styles.ghostButton, { marginHorizontal: 20, marginTop: 10 }]}
+              onPress={() => {
+                const businessId = statusProductSeller.businessId;
+                setStatusProductSheet(null);
+                setStatusProductSeller(null);
+                void openPublicBusiness(businessId);
+              }}
+            >
+              <Text style={styles.ghostButtonText}>Open business storefront</Text>
+            </Pressable>
+          ) : null}
+        </View>
       </Modal>
       <Modal
         transparent
