@@ -47,6 +47,16 @@ import {
   recordGroupMemberJoinsFromServer,
   type BadgesDeps,
 } from './badgesApi.js';
+import {
+  hasOpenAi,
+  openaiChat,
+  openaiRewrite,
+  openaiSuggestReplies,
+  openaiSummarize,
+  openaiTranscribeAudioUrl,
+  openaiTranslate,
+  openaiTwinDraft,
+} from './openaiProvider.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
@@ -1309,14 +1319,17 @@ const resolveCatalogStatus = (
 };
 
 const paymentIntentSchema = z.object({
-  action: z.enum(['send', 'request', 'topup']),
+  action: z.enum(['send', 'request', 'topup', 'checkout']),
   amount: z.number().positive(),
   currency: z.string().min(3).max(5).default('GHS'),
   phone: z.string().min(6).max(30).optional(),
+  email: z.string().email().optional(),
   note: z.string().max(160).optional(),
   userId: z.string().min(1).optional(),
   orderId: z.string().min(1).max(80).optional(),
-  provider: z.enum(['mtn_momo', 'vodafone_cash', 'airteltigo']).default('mtn_momo'),
+  // Paystack is the default card/MoMo aggregator (not Flutterwave). MTN MoMo direct remains optional.
+  provider: z.enum(['paystack', 'mtn_momo', 'vodafone_cash', 'airteltigo']).default('paystack'),
+  callbackUrl: z.string().url().optional(),
 });
 
 const createOrderSchema = z.object({
@@ -7475,7 +7488,21 @@ app.post('/api/ai/suggest-replies', async (req, res) => {
   if (!target) {
     return res.status(404).json({ error: 'No message found to suggest a reply for.' });
   }
-  const suggestions = buildSuggestedReplies(target.text || '', parseResult.data.tone);
+  let suggestions = buildSuggestedReplies(target.text || '', parseResult.data.tone);
+  if (hasOpenAi()) {
+    try {
+      const aiSuggestions = await openaiSuggestReplies(target.text || '', parseResult.data.tone);
+      suggestions = aiSuggestions.map((entry, index) => ({
+        id: `sug-${Date.now()}-${index}`,
+        text: entry.text,
+        tone: (entry.tone as z.infer<typeof aiToneSchema>) || parseResult.data.tone || 'polite',
+        reason: entry.reason,
+        source: 'openai' as const,
+      }));
+    } catch {
+      // Keep template suggestions if OpenAI fails.
+    }
+  }
   return res.json({
     suggestions,
     contextUsed: {
@@ -7484,7 +7511,7 @@ app.post('/api/ai/suggest-replies', async (req, res) => {
       senderId: target.senderId,
     },
     autoSend: false,
-    notice: 'Suggestions are templates. Edit before sending. Nothing is sent automatically.',
+    notice: 'Suggestions are drafts. Edit before sending. Nothing is sent automatically.',
   });
 });
 
@@ -7496,12 +7523,26 @@ app.post('/api/ai/rewrite', async (req, res) => {
   const tones: Array<z.infer<typeof aiToneSchema>> = parseResult.data.tone
     ? [parseResult.data.tone]
     : ['polite', 'concise', 'professional', 'friendly', 'apologetic'];
-  const variants = tones.map((tone, index) => ({
-    id: `rw-${Date.now()}-${index}`,
-    tone,
-    text: rewriteWithTone(parseResult.data.text, tone),
-    source: 'template' as const,
-  }));
+  const variants = [];
+  for (let index = 0; index < tones.length; index += 1) {
+    const tone = tones[index];
+    let text = rewriteWithTone(parseResult.data.text, tone);
+    let source: 'template' | 'openai' = 'template';
+    if (hasOpenAi()) {
+      try {
+        text = await openaiRewrite(parseResult.data.text, tone);
+        source = 'openai';
+      } catch {
+        // template fallback
+      }
+    }
+    variants.push({
+      id: `rw-${Date.now()}-${index}`,
+      tone,
+      text,
+      source,
+    });
+  }
   return res.json({
     variants,
     autoSend: false,
@@ -7660,12 +7701,7 @@ app.post('/api/ai/dictate', async (req, res) => {
     });
   }
   if (parseResult.data.audioUrl) {
-    const hasProvider = Boolean(
-      process.env.SPEECH_TO_TEXT_API_KEY
-      || process.env.OPENAI_API_KEY
-      || process.env.GOOGLE_SPEECH_API_KEY,
-    );
-    if (!hasProvider) {
+    if (!hasOpenAi()) {
       return res.status(503).json({
         error: 'Server speech-to-text is not configured yet.',
         needsProvider: true,
@@ -7673,12 +7709,22 @@ app.post('/api/ai/dictate', async (req, res) => {
         notice: 'Use on-device dictation, or type and edit the draft manually.',
       });
     }
-    // Provider wiring lands when keys are available; keep contract stable.
-    return res.status(501).json({
-      error: 'Speech provider is configured but not wired in this build.',
-      needsProvider: true,
-      autoSend: false,
-    });
+    try {
+      const transcript = await openaiTranscribeAudioUrl(parseResult.data.audioUrl);
+      return res.json({
+        text: transcript.text,
+        autoSend: false,
+        source: 'openai_whisper',
+        language: transcript.language,
+        notice: 'Review and edit before sending. Dictation never sends automatically.',
+      });
+    } catch (error) {
+      return res.status(502).json({
+        error: error instanceof Error ? error.message : 'Speech transcription failed',
+        autoSend: false,
+        needsProvider: false,
+      });
+    }
   }
   return res.status(400).json({ error: 'Provide dictated text or an audio URL.' });
 });
@@ -7693,6 +7739,19 @@ const TRANSLATION_GLOSSARY: Record<string, Partial<Record<'en' | 'tw' | 'ga' | '
   goodbye: { en: 'Goodbye', tw: 'Nante yie', ga: 'Nyɔɔ', ee: 'Hede nyuie', pcm: 'I dey go' },
   'how much': { en: 'How much?', tw: 'Ɛyɛ sɛn?', ga: 'Eji ene?', ee: 'Ga nenie?', pcm: 'How much?' },
   'good morning': { en: 'Good morning', tw: 'Mema wo akye', ga: 'Ojekoo', ee: 'Ŋdi', pcm: 'Good morning' },
+  // G3 Pidgin / everyday West African chat
+  'how far': { en: 'Hello', tw: 'Ɛte sɛn?', ga: 'Te oyɔɔ?', ee: 'Efɔ̃a?', pcm: 'How far' },
+  abeg: { en: 'Please', tw: 'Mepa wo kyɛw', ga: 'Ofaine', ee: 'Taflatse', pcm: 'Abeg' },
+  'i dey come': { en: 'I am coming', tw: 'Merekɔ', ga: 'Mi yaa ba', ee: 'Mele gbɔna', pcm: 'I dey come' },
+  'i dey go': { en: 'I am leaving', tw: 'Merekɔ', ga: 'Mi yaa tee', ee: 'Meyi', pcm: 'I dey go' },
+  'wetin dey happen': { en: 'What is going on?', tw: 'Dɛn na ɛrekɔ so?', ga: 'Nɛɛji?', ee: 'Nukae le dzɔm?', pcm: 'Wetin dey happen' },
+  'no wahala': { en: 'No problem', tw: 'Ɛnyɛ asɛm', ga: 'Ebbbii kɛ', ee: 'Amesiame o', pcm: 'No wahala' },
+  'i go check': { en: 'I will check', tw: 'Mɛhwɛ', ga: 'Mi maa kane', ee: 'Madekpɔ', pcm: 'I go check' },
+  'send am': { en: 'Send it', tw: 'Mane no', ga: 'Ha lɛ', ee: 'Ɖo e', pcm: 'Send am' },
+  'you dey': { en: 'Are you around?', tw: 'Wowɔ hɔ?', ga: 'O yɔɔ?', ee: 'Èle afi a?', pcm: 'You dey?' },
+  'make we talk': { en: 'Let us talk', tw: 'Ma yɛnkasa', ga: 'Wɔ maa wiemo', ee: 'Mina míado nu', pcm: 'Make we talk' },
+  'i go pay': { en: 'I will pay', tw: 'Mɛtua', ga: 'Mi maa ha shika', ee: 'Made xe', pcm: 'I go pay' },
+  'momo number': { en: 'Mobile money number', tw: 'MoMo nɔma', ga: 'MoMo number', ee: 'MoMo xexlẽdzesi', pcm: 'MoMo number' },
 };
 
 const glossaryTranslate = (
@@ -7750,11 +7809,6 @@ app.post('/api/messages/:messageId/transcribe', async (req, res) => {
     });
   }
 
-  const hasProvider = Boolean(
-    process.env.SPEECH_TO_TEXT_API_KEY
-    || process.env.OPENAI_API_KEY
-    || process.env.GOOGLE_SPEECH_API_KEY,
-  );
   const audioUrl = message.mediaUrls?.[0] || '';
   if (!audioUrl) {
     const updated: Message = {
@@ -7766,7 +7820,7 @@ app.post('/api/messages/:messageId/transcribe', async (req, res) => {
     return res.status(422).json({ error: 'Voice note has no audio URL.', message: updated });
   }
 
-  if (!hasProvider) {
+  if (!hasOpenAi()) {
     // If sender already typed a caption into text (non-default), surface that as a caption transcript.
     const caption = (message.text || '').trim();
     const looksLikeCaption = caption && !/^(audio|voice( note)?)$/i.test(caption);
@@ -7789,22 +7843,51 @@ app.post('/api/messages/:messageId/transcribe', async (req, res) => {
       needsProvider: !looksLikeCaption,
       notice: looksLikeCaption
         ? 'Showing the sender caption as text. Full speech transcription needs a provider key.'
-        : 'Speech transcription provider is not configured yet.',
+        : 'Speech transcription provider is not configured yet. Set OPENAI_API_KEY.',
     });
   }
 
-  // Provider key present but wiring is intentionally deferred.
   const pending: Message = {
     ...message,
     transcriptStatus: 'pending',
     transcriptUpdatedAt: new Date().toISOString(),
   };
   await saveMessageUpdate(pending);
-  return res.status(501).json({
-    error: 'Speech provider is configured but not wired in this build.',
-    message: pending,
-    needsProvider: true,
-  });
+
+  try {
+    const result = await openaiTranscribeAudioUrl(audioUrl, parseResult.data.language);
+    const updated: Message = {
+      ...message,
+      transcript: result.text,
+      transcriptStatus: 'ready',
+      transcriptLanguage: result.language || parseResult.data.language || 'auto',
+      transcriptUpdatedAt: new Date().toISOString(),
+    };
+    await saveMessageUpdate(updated);
+    for (const participantId of chat.participants) {
+      io.to(`user:${participantId}`).emit('message:transcript', {
+        message: presentMessage(updated, participantId),
+      });
+    }
+    return res.json({
+      message: updated,
+      transcript: updated.transcript,
+      cached: false,
+      source: 'openai_whisper',
+      notice: 'Transcript ready. Review before relying on it for decisions.',
+    });
+  } catch (error) {
+    const failed: Message = {
+      ...message,
+      transcriptStatus: 'failed',
+      transcriptUpdatedAt: new Date().toISOString(),
+    };
+    await saveMessageUpdate(failed);
+    return res.status(502).json({
+      error: error instanceof Error ? error.message : 'Transcription failed',
+      message: failed,
+    });
+  }
 });
 
 app.post('/api/ai/translate', async (req, res) => {
@@ -7842,12 +7925,7 @@ app.post('/api/ai/translate', async (req, res) => {
     });
   }
 
-  const hasProvider = Boolean(
-    process.env.TRANSLATE_API_KEY
-    || process.env.OPENAI_API_KEY
-    || process.env.GOOGLE_TRANSLATE_API_KEY,
-  );
-  if (!hasProvider) {
+  if (!hasOpenAi()) {
     return res.json({
       translatedText: text,
       sourceLanguage: sourceLanguage === 'auto' ? 'auto' : sourceLanguage,
@@ -7856,14 +7934,27 @@ app.post('/api/ai/translate', async (req, res) => {
       partial: true,
       needsProvider: true,
       testedPairs: ['en↔tw', 'en↔ga', 'en↔ee', 'en↔pcm'],
-      notice: 'Full translation needs a provider. Common phrases can still use the built-in glossary.',
+      notice: 'Full translation needs OPENAI_API_KEY. Common phrases can still use the built-in glossary.',
     });
   }
 
-  return res.status(501).json({
-    error: 'Translation provider is configured but not wired in this build.',
-    needsProvider: true,
-  });
+  try {
+    const result = await openaiTranslate(text, targetLanguage, sourceLanguage);
+    return res.json({
+      translatedText: result.translatedText,
+      sourceLanguage: result.detectedSource || (sourceLanguage === 'auto' ? 'auto' : sourceLanguage),
+      targetLanguage,
+      method: 'openai',
+      partial: false,
+      testedPairs: ['en↔tw', 'en↔ga', 'en↔ee', 'en↔pcm'],
+      notice: 'AI translation — review names, amounts, and promises before relying on it.',
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: error instanceof Error ? error.message : 'Translation failed',
+      needsProvider: false,
+    });
+  }
 });
 
 app.post('/api/ai/assistant', async (req, res) => {
@@ -7903,10 +7994,21 @@ app.post('/api/ai/assistant', async (req, res) => {
   if (data.task === 'rewrite') {
     if (!contextText) return res.status(400).json({ error: 'Add text to rewrite.' });
     const tone = data.tone || 'polite';
+    let result = rewriteWithTone(contextText, tone);
+    let source: 'template' | 'openai' = 'template';
+    if (hasOpenAi()) {
+      try {
+        result = await openaiRewrite(contextText, tone);
+        source = 'openai';
+      } catch {
+        // template fallback
+      }
+    }
     return res.json({
       task: data.task,
-      result: rewriteWithTone(contextText, tone),
+      result,
       tone,
+      source,
       autoSend: false,
       contextUsed: contextMeta,
       notice: 'Review and edit before sending. The assistant never sends for you.',
@@ -7915,7 +8017,21 @@ app.post('/api/ai/assistant', async (req, res) => {
 
   if (data.task === 'suggest_reply') {
     if (!data.chatId) return res.status(400).json({ error: 'chatId is required for suggest_reply.' });
-    const suggestions = buildSuggestedReplies(contextText || 'Hello', data.tone);
+    let suggestions = buildSuggestedReplies(contextText || 'Hello', data.tone);
+    if (hasOpenAi()) {
+      try {
+        const aiSuggestions = await openaiSuggestReplies(contextText || 'Hello', data.tone);
+        suggestions = aiSuggestions.map((entry, index) => ({
+          id: `sug-${Date.now()}-${index}`,
+          text: entry.text,
+          tone: (entry.tone as z.infer<typeof aiToneSchema>) || data.tone || 'polite',
+          reason: entry.reason,
+          source: 'openai' as const,
+        }));
+      } catch {
+        // template fallback
+      }
+    }
     return res.json({
       task: data.task,
       suggestions,
@@ -7949,28 +8065,78 @@ app.post('/api/ai/assistant', async (req, res) => {
     if (!contextText) return res.status(400).json({ error: 'Add text to translate.' });
     const targetLanguage = data.targetLanguage || 'en';
     const glossary = glossaryTranslate(contextText, targetLanguage);
+    if (glossary) {
+      return res.json({
+        task: data.task,
+        result: glossary.translatedText,
+        targetLanguage,
+        partial: glossary.partial,
+        needsProvider: false,
+        method: 'glossary',
+        autoSend: false,
+        contextUsed: contextMeta,
+        notice: 'Glossary translation — review before relying on it.',
+      });
+    }
+    if (hasOpenAi()) {
+      try {
+        const result = await openaiTranslate(contextText, targetLanguage);
+        return res.json({
+          task: data.task,
+          result: result.translatedText,
+          targetLanguage,
+          partial: false,
+          needsProvider: false,
+          method: 'openai',
+          autoSend: false,
+          contextUsed: contextMeta,
+          notice: 'AI translation — review before relying on it.',
+        });
+      } catch (error) {
+        return res.status(502).json({
+          error: error instanceof Error ? error.message : 'Translation failed',
+        });
+      }
+    }
     return res.json({
       task: data.task,
-      result: glossary?.translatedText || contextText,
+      result: contextText,
       targetLanguage,
-      partial: glossary ? glossary.partial : true,
-      needsProvider: !glossary,
+      partial: true,
+      needsProvider: true,
       autoSend: false,
       contextUsed: contextMeta,
-      notice: glossary
-        ? 'Glossary translation — review before relying on it.'
-        : 'No glossary match. Full MT needs a provider.',
+      notice: 'No glossary match. Set OPENAI_API_KEY for full translation.',
     });
   }
 
   if (data.task === 'explain') {
     if (!contextText) return res.status(400).json({ error: 'Add text to explain.' });
+    let result = `Plain-language reading: this message is about “${contextText.slice(0, 160)}”. Check any amounts, dates or promises yourself before you reply.`;
+    if (hasOpenAi()) {
+      try {
+        result = await openaiChat(
+          [
+            {
+              role: 'system',
+              content:
+                'Explain this chat message in plain language for a West African user. '
+                + 'Short paragraph. Flag PIN/OTP/money risks. Not legal or financial advice.',
+            },
+            { role: 'user', content: contextText },
+          ],
+          { temperature: 0.3, maxTokens: 280 },
+        );
+      } catch {
+        // heuristic fallback
+      }
+    }
     return res.json({
       task: data.task,
-      result: `Plain-language reading: this message is about “${contextText.slice(0, 160)}”. Check any amounts, dates or promises yourself before you reply.`,
+      result,
       autoSend: false,
       contextUsed: contextMeta,
-      notice: 'Explanation is heuristic, not legal or financial advice.',
+      notice: 'Explanation is not legal or financial advice.',
     });
   }
 
@@ -7981,10 +8147,21 @@ app.post('/api/ai/assistant', async (req, res) => {
   const draftBase = prompt.startsWith('Draft') || prompt.startsWith('Write')
     ? prompt
     : `Regarding your message: ${prompt}`;
+  let result = rewriteWithTone(draftBase, tone);
+  let source: 'template' | 'openai' = 'template';
+  if (hasOpenAi()) {
+    try {
+      result = await openaiRewrite(draftBase, tone);
+      source = 'openai';
+    } catch {
+      // template fallback
+    }
+  }
   return res.json({
     task: 'draft',
-    result: rewriteWithTone(draftBase, tone),
+    result,
     tone,
+    source,
     autoSend: false,
     contextUsed: contextMeta,
     notice: 'Draft only. Edit before sending. Never treat AI wording as a final commitment.',
@@ -8474,7 +8651,16 @@ app.post('/api/ai/twin/run', async (req, res) => {
       requiresApproval: true,
     });
   } else if (twin.allowedTasks.includes('draft_reply')) {
-    const suggestions = buildSuggestedReplies(inputPreview || 'Hello', 'professional');
+    let draftText = buildSuggestedReplies(inputPreview || 'Hello', 'professional')[0]?.text
+      || 'Automated draft (AI Twin): Thanks for your message — I will confirm shortly.';
+    if (hasOpenAi()) {
+      try {
+        draftText = await openaiTwinDraft(inputPreview || 'Hello', 'draft_reply', twin.operatingHoursText || '');
+      } catch {
+        // template fallback
+      }
+    }
+    const suggestions = [{ text: draftText }];
     pushAction({
       task: 'draft_reply',
       status: 'proposed',
@@ -8613,38 +8799,107 @@ app.post('/api/payments/intent', async (req, res) => {
     });
   }
 
-  // Provider keys (MTN MoMo / etc.) will be wired later via env.
-  // This endpoint keeps the client flow ready and returns a staged intent.
+  const data = parseResult.data;
+  const createdAt = new Date().toISOString();
+  const intentId = `pay-${Date.now()}`;
+  const paystackSecret = (process.env.PAYSTACK_SECRET_KEY || '').trim();
+  const mtnKey = (process.env.MTN_MOMO_API_KEY || process.env.PAYMENT_PROVIDER_API_KEY || '').trim();
+
+  let providerPayload: Record<string, unknown> | null = null;
+  let status: 'awaiting_provider_keys' | 'queued' | 'initialized' = 'awaiting_provider_keys';
+  let authorizationUrl: string | null = null;
+  let accessCode: string | null = null;
+  let providerReference: string | null = null;
+
+  if (data.provider === 'paystack') {
+    if (!paystackSecret) {
+      status = 'awaiting_provider_keys';
+    } else {
+      try {
+        const amountKobo = Math.round(data.amount * 100);
+        const email = data.email
+          || (data.userId ? `${data.userId.replace(/[^a-zA-Z0-9]/g, '')}@zynkup.payments` : 'payments@zynkup.app');
+        const response = await fetch('https://api.paystack.co/transaction/initialize', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${paystackSecret}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email,
+            amount: amountKobo,
+            currency: data.currency.toUpperCase(),
+            reference: intentId,
+            callback_url: data.callbackUrl,
+            metadata: {
+              orderId: data.orderId || null,
+              userId: data.userId || null,
+              note: data.note || null,
+              phone: data.phone || null,
+              action: data.action,
+            },
+          }),
+        });
+        const payload = (await response.json().catch(() => ({}))) as {
+          status?: boolean;
+          message?: string;
+          data?: { authorization_url?: string; access_code?: string; reference?: string };
+        };
+        if (!response.ok || !payload.status) {
+          return res.status(502).json({
+            error: payload.message || `Paystack initialize failed (${response.status})`,
+          });
+        }
+        status = 'initialized';
+        authorizationUrl = payload.data?.authorization_url || null;
+        accessCode = payload.data?.access_code || null;
+        providerReference = payload.data?.reference || intentId;
+        providerPayload = { paystack: payload.data };
+      } catch (error) {
+        return res.status(502).json({
+          error: error instanceof Error ? error.message : 'Paystack request failed',
+        });
+      }
+    }
+  } else if (mtnKey) {
+    status = 'queued';
+  }
+
   const intent = {
-    id: `pay-${Date.now()}`,
-    ...parseResult.data,
-    status: process.env.MTN_MOMO_API_KEY || process.env.PAYMENT_PROVIDER_API_KEY
-      ? 'queued'
-      : 'awaiting_provider_keys',
-    createdAt: new Date().toISOString(),
+    id: intentId,
+    ...data,
+    status,
+    authorizationUrl,
+    accessCode,
+    providerReference,
+    providerPayload,
+    createdAt,
   };
 
   const db = await getDb();
   if (db) {
     await db.collection('payments').insertOne({ ...intent });
   }
-  if (parseResult.data.orderId) {
-    const order = (await readOrders()).find((entry) => entry.id === parseResult.data.orderId);
+  if (data.orderId) {
+    const order = (await readOrders()).find((entry) => entry.id === data.orderId);
     if (order) {
       await saveOrder({
         ...order,
         paymentId: intent.id,
-        updatedAt: intent.createdAt,
+        updatedAt: createdAt,
       });
     }
   }
-  return res.status(201).json({
-    intent,
-    message:
-      intent.status === 'awaiting_provider_keys'
-        ? 'Payment flow is ready. Add provider API keys to process live transfers.'
-        : 'Payment intent accepted and queued for the provider.',
-  });
+
+  const message = status === 'initialized'
+    ? 'Paystack checkout ready — open authorizationUrl to complete payment.'
+    : status === 'queued'
+      ? 'Payment intent queued for the mobile-money provider.'
+      : data.provider === 'paystack'
+        ? 'Add PAYSTACK_SECRET_KEY (and optional PAYSTACK_PUBLIC_KEY) to enable live checkout.'
+        : 'Add MTN_MOMO_API_KEY for direct MoMo, or use provider=paystack.';
+
+  return res.status(201).json({ intent, message });
 });
 
 app.get('/api/profile', async (req, res) => {
