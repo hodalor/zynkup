@@ -7,6 +7,8 @@ const NAV = [
   ['numbers', 'Blocked numbers'],
   ['marketplace', 'Marketplace'],
   ['businesses', 'Businesses'],
+  ['orders', 'Orders'],
+  ['customers', 'Customers'],
   ['payments', 'Payments'],
   ['activity', 'Activity'],
   ['announcements', 'Announcements'],
@@ -134,6 +136,8 @@ export default function App() {
       numbers: '/api/admin/blocks',
       marketplace: '/api/admin/catalog',
       businesses: '/api/admin/businesses',
+      orders: '/api/admin/orders',
+      customers: '/api/admin/customers',
       payments: '/api/admin/payments',
       activity: '/api/admin/activity',
       announcements: '/api/admin/announcements',
@@ -162,6 +166,8 @@ export default function App() {
     if (page === 'numbers') return data.blocks || [];
     if (page === 'marketplace') return data.items || [];
     if (page === 'businesses') return data.businesses || [];
+    if (page === 'orders') return data.orders || [];
+    if (page === 'customers') return data.customers || [];
     if (page === 'payments') return data.payments || [];
     if (page === 'activity') return data.messages || [];
     if (page === 'announcements') return data.announcements || [];
@@ -303,6 +309,50 @@ export default function App() {
               ]}
               rows={data?.requests || []}
               onRow={(row) => setModal({ kind: 'boost', row })}
+            />
+          </>
+        ) : null}
+        {page === 'customers' ? (
+          <>
+            <Cards items={[
+              ['Records', data?.customers?.length || 0],
+              ['Active', data?.active || 0],
+              ['Opted in', data?.optedIn || 0],
+              ['Opted out', data?.optedOut || 0],
+            ]} />
+            <Table
+              columns={[
+                { key: 'displayName', label: 'Name' },
+                { key: 'sellerUserId', label: 'Seller' },
+                { key: 'marketingConsent', label: 'Consent' },
+                { key: 'orderCount', label: 'Orders' },
+                { key: 'totalSpent', label: 'Spent', render: (row) => money(row.totalSpent, row.currency) },
+                { key: 'updatedAt', label: 'Updated', render: (row) => row.updatedAt ? new Date(row.updatedAt).toLocaleString() : '' },
+              ]}
+              rows={rows}
+              onRow={(row) => setModal({ kind: 'detail', row })}
+            />
+          </>
+        ) : null}
+        {page === 'orders' ? (
+          <>
+            <Cards items={[
+              ['Orders', data?.orders?.length || 0],
+              ['Open', data?.open || 0],
+              ['Pending payment', data?.pendingPayment || 0],
+              ['Latest', rows[0]?.state || '—'],
+            ]} />
+            <Table
+              columns={[
+                { key: 'id', label: 'Order' },
+                { key: 'state', label: 'State' },
+                { key: 'totalAmount', label: 'Total', render: (row) => money(row.totalAmount, row.currency) },
+                { key: 'buyerUserId', label: 'Buyer' },
+                { key: 'sellerUserId', label: 'Seller' },
+                { key: 'createdAt', label: 'When', render: (row) => row.createdAt ? new Date(row.createdAt).toLocaleString() : '' },
+              ]}
+              rows={rows}
+              onRow={(row) => setModal({ kind: 'detail', row })}
             />
           </>
         ) : null}
