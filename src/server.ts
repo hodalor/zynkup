@@ -60,6 +60,11 @@ type Message = {
   actorBusinessId?: string;
   actorName?: string;
   expiresAt?: string;
+  automated?: boolean;
+  autoReplySource?: string;
+  documentId?: string;
+  documentKind?: 'quotation' | 'invoice';
+  broadcastCampaignId?: string;
 };
 
 type Chat = {
@@ -251,6 +256,123 @@ type BusinessCustomer = {
   updatedAt: string;
 };
 
+type AutoReplyRule = {
+  id: string;
+  keywords: string[];
+  response: string;
+  enabled: boolean;
+};
+
+type BusinessAutoReplyConfig = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  greetingEnabled: boolean;
+  greetingText: string;
+  awayEnabled: boolean;
+  awayText: string;
+  hoursText: string;
+  humanHandoverKeywords: string[];
+  rules: AutoReplyRule[];
+  cooldownSeconds: number;
+  pausedChatIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AutoReplyLog = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  chatId: string;
+  customerUserId: string;
+  triggerMessageId: string;
+  replyMessageId: string;
+  source: 'greeting' | 'away' | 'hours' | 'rule' | 'handover';
+  ruleId?: string | null;
+  createdAt: string;
+};
+
+type CommerceDocKind = 'quotation' | 'invoice';
+type QuotationState = 'draft' | 'sent' | 'accepted' | 'rejected' | 'expired' | 'converted';
+type InvoiceState = 'draft' | 'sent' | 'accepted' | 'rejected' | 'paid' | 'overdue' | 'voided';
+
+type CommerceDocLine = {
+  id: string;
+  catalogItemId?: string | null;
+  title: string;
+  description?: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+};
+
+type CommerceDocument = {
+  id: string;
+  kind: CommerceDocKind;
+  number: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  customerUserId?: string | null;
+  customerName: string;
+  customerPhone?: string;
+  chatId?: string | null;
+  currency: string;
+  lines: CommerceDocLine[];
+  subtotal: number;
+  discountAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  notes?: string;
+  paymentTerms?: string;
+  expiresAt?: string | null;
+  dueAt?: string | null;
+  state: QuotationState | InvoiceState;
+  version: number;
+  versions: Array<{
+    version: number;
+    at: string;
+    byUserId: string;
+    snapshot: {
+      lines: CommerceDocLine[];
+      subtotal: number;
+      discountAmount: number;
+      taxAmount: number;
+      totalAmount: number;
+      notes?: string;
+      paymentTerms?: string;
+    };
+  }>;
+  history: Array<{ state: string; at: string; byUserId: string; note?: string }>;
+  sourceQuotationId?: string | null;
+  orderId?: string | null;
+  paymentId?: string | null;
+  receiptId?: string | null;
+  messageId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BroadcastSegment = 'opted_in' | 'repeat_buyers' | 'all_customers' | 'tag';
+
+type BroadcastCampaign = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  text: string;
+  segment: BroadcastSegment;
+  tag?: string | null;
+  status: 'draft' | 'sending' | 'sent' | 'cancelled' | 'failed';
+  audienceCount: number;
+  sentCount: number;
+  failedCount: number;
+  scheduledAt?: string | null;
+  sentAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type OrderState =
   | 'pending_payment'
   | 'paid'
@@ -284,6 +406,8 @@ type CommerceOrder = {
   totalAmount: number;
   currency: string;
   state: OrderState;
+  deliveryReference?: string | null;
+  fulfilmentNote?: string | null;
   history: Array<{ state: OrderState; at: string; byUserId: string; note?: string }>;
   createdAt: string;
   updatedAt: string;
@@ -498,6 +622,11 @@ const receiptCounters: Record<string, number> = {};
 const seedInventoryMovements: InventoryMovement[] = [];
 const seedInventoryAlerts: InventoryAlert[] = [];
 const seedBusinessCustomers: BusinessCustomer[] = [];
+const seedAutoReplyConfigs: BusinessAutoReplyConfig[] = [];
+const seedAutoReplyLogs: AutoReplyLog[] = [];
+const seedCommerceDocuments: CommerceDocument[] = [];
+const seedBroadcastCampaigns: BroadcastCampaign[] = [];
+const documentCounters: Record<string, number> = {};
 
 const settingsMenu = [
   'Favorites',
@@ -756,6 +885,130 @@ const customerPreferenceSchema = z.object({
   marketingConsent: z.enum(['opted_in', 'opted_out']),
 });
 
+const autoReplyRuleSchema = z.object({
+  id: z.string().min(1).max(80).optional(),
+  keywords: z.array(z.string().trim().min(1).max(60)).min(1).max(12),
+  response: z.string().trim().min(1).max(800),
+  enabled: z.boolean().optional(),
+});
+
+const upsertAutoReplySchema = z.object({
+  userId: z.string().min(1),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  enabled: z.boolean().optional(),
+  greetingEnabled: z.boolean().optional(),
+  greetingText: z.string().trim().max(800).optional(),
+  awayEnabled: z.boolean().optional(),
+  awayText: z.string().trim().max(800).optional(),
+  hoursText: z.string().trim().max(400).optional(),
+  humanHandoverKeywords: z.array(z.string().trim().min(1).max(60)).max(20).optional(),
+  rules: z.array(autoReplyRuleSchema).max(40).optional(),
+  cooldownSeconds: z.number().int().min(10).max(3600).optional(),
+  pausedChatIds: z.array(z.string().min(1).max(80)).max(200).optional(),
+});
+
+const autoReplyPauseSchema = z.object({
+  userId: z.string().min(1),
+  chatId: z.string().min(1),
+  paused: z.boolean(),
+});
+
+const commerceDocLineSchema = z.object({
+  catalogItemId: z.string().min(1).max(80).optional().nullable(),
+  title: z.string().trim().min(1).max(160),
+  description: z.string().trim().max(400).optional(),
+  quantity: z.number().positive().max(100000),
+  unitPrice: z.number().nonnegative().max(100000000),
+});
+
+const createCommerceDocSchema = z.object({
+  userId: z.string().min(1),
+  kind: z.enum(['quotation', 'invoice']),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  customerUserId: z.string().min(1).max(80).optional().nullable(),
+  customerName: z.string().trim().min(1).max(120),
+  customerPhone: z.string().trim().max(40).optional(),
+  chatId: z.string().min(1).max(80).optional().nullable(),
+  currency: z.string().min(3).max(5).default('GHS'),
+  lines: z.array(commerceDocLineSchema).min(1).max(40),
+  discountAmount: z.number().nonnegative().max(100000000).optional(),
+  taxAmount: z.number().nonnegative().max(100000000).optional(),
+  notes: z.string().trim().max(1000).optional(),
+  paymentTerms: z.string().trim().max(240).optional(),
+  expiresAt: z.string().min(1).max(40).optional().nullable(),
+  dueAt: z.string().min(1).max(40).optional().nullable(),
+  sendNow: z.boolean().optional(),
+});
+
+const updateCommerceDocSchema = z.object({
+  userId: z.string().min(1),
+  customerName: z.string().trim().min(1).max(120).optional(),
+  customerPhone: z.string().trim().max(40).optional(),
+  customerUserId: z.string().min(1).max(80).optional().nullable(),
+  chatId: z.string().min(1).max(80).optional().nullable(),
+  lines: z.array(commerceDocLineSchema).min(1).max(40).optional(),
+  discountAmount: z.number().nonnegative().max(100000000).optional(),
+  taxAmount: z.number().nonnegative().max(100000000).optional(),
+  notes: z.string().trim().max(1000).optional(),
+  paymentTerms: z.string().trim().max(240).optional(),
+  expiresAt: z.string().min(1).max(40).optional().nullable(),
+  dueAt: z.string().min(1).max(40).optional().nullable(),
+  currency: z.string().min(3).max(5).optional(),
+});
+
+const commerceDocActionSchema = z.object({
+  userId: z.string().min(1),
+  note: z.string().trim().max(240).optional(),
+  chatId: z.string().min(1).max(80).optional().nullable(),
+  paymentId: z.string().min(1).max(80).optional().nullable(),
+  markCashReceived: z.boolean().optional(),
+});
+
+const createBroadcastSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().min(1).max(1000),
+  segment: z.enum(['opted_in', 'repeat_buyers', 'all_customers', 'tag']).default('opted_in'),
+  tag: z.string().trim().min(1).max(40).optional(),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  scheduledAt: z.string().min(1).max(40).optional().nullable(),
+  sendNow: z.boolean().optional(),
+});
+
+const aiToneSchema = z.enum(['polite', 'concise', 'professional', 'friendly', 'apologetic']);
+
+const suggestRepliesSchema = z.object({
+  userId: z.string().min(1),
+  chatId: z.string().min(1),
+  messageId: z.string().min(1).max(80).optional(),
+  tone: aiToneSchema.optional(),
+});
+
+const rewriteMessageSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().min(1).max(2000),
+  tone: aiToneSchema.default('polite'),
+});
+
+const scamCheckSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().min(1).max(4000),
+});
+
+const summarizeChatSchema = z.object({
+  userId: z.string().min(1),
+  chatId: z.string().min(1),
+  scope: z.enum(['unread', 'recent', 'range']).default('unread'),
+  limit: z.number().int().min(5).max(300).optional(),
+  since: z.string().min(1).max(40).optional(),
+  until: z.string().min(1).max(40).optional(),
+});
+
+const dictateSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().max(4000).optional(),
+  audioUrl: z.string().url().optional(),
+});
+
 const resolveCatalogStatus = (
   status: CatalogProductStatus | undefined,
   stockQuantity: number,
@@ -795,6 +1048,8 @@ const updateOrderSchema = z.object({
   userId: z.string().min(1),
   state: z.enum(['pending_payment', 'paid', 'processing', 'dispatched', 'completed', 'cancelled', 'refunded']),
   note: z.string().trim().max(200).optional(),
+  deliveryReference: z.string().trim().max(120).optional().nullable(),
+  fulfilmentNote: z.string().trim().max(400).optional().nullable(),
 });
 
 const ORDER_TRANSITIONS: Record<OrderState, OrderState[]> = {
@@ -3488,6 +3743,518 @@ const ensureCustomerFromOrder = async (order: CommerceOrder) => {
   return created;
 };
 
+const defaultAutoReplyConfig = (sellerUserId: string, businessId?: string | null): BusinessAutoReplyConfig => {
+  const now = new Date().toISOString();
+  return {
+    id: `ar-${sellerUserId}${businessId ? `-${businessId}` : ''}`,
+    sellerUserId,
+    businessId: businessId || null,
+    enabled: false,
+    greetingEnabled: true,
+    greetingText: 'Thanks for messaging us. A teammate will reply soon.',
+    awayEnabled: true,
+    awayText: 'We are away right now. Leave a message and we will get back to you.',
+    hoursText: '',
+    humanHandoverKeywords: ['human', 'agent', 'person', 'speak to someone', 'real person'],
+    rules: [],
+    cooldownSeconds: 90,
+    pausedChatIds: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+};
+
+const readAutoReplyConfigs = async () => {
+  const db = await getDb();
+  if (!db) return [...seedAutoReplyConfigs];
+  return db
+    .collection<BusinessAutoReplyConfig>('businessAutoReplies')
+    .find({}, { projection: { _id: 0 } })
+    .toArray();
+};
+
+const saveAutoReplyConfig = async (config: BusinessAutoReplyConfig) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedAutoReplyConfigs.findIndex((entry) => entry.id === config.id);
+    if (index >= 0) seedAutoReplyConfigs[index] = config;
+    else seedAutoReplyConfigs.unshift(config);
+    return config;
+  }
+  await db.collection<BusinessAutoReplyConfig>('businessAutoReplies').updateOne(
+    { id: config.id },
+    { $set: config },
+    { upsert: true },
+  );
+  return config;
+};
+
+const getAutoReplyConfigForSeller = async (sellerUserId: string, businessId?: string | null) => {
+  const configs = await readAutoReplyConfigs();
+  if (businessId) {
+    const byBusiness = configs.find(
+      (entry) => entry.sellerUserId === sellerUserId && entry.businessId === businessId,
+    );
+    if (byBusiness) return byBusiness;
+  }
+  const personal = configs.find(
+    (entry) => entry.sellerUserId === sellerUserId && (!entry.businessId || entry.businessId === null),
+  );
+  return personal || defaultAutoReplyConfig(sellerUserId, businessId || null);
+};
+
+const saveAutoReplyLog = async (log: AutoReplyLog) => {
+  const db = await getDb();
+  if (!db) {
+    seedAutoReplyLogs.unshift(log);
+    if (seedAutoReplyLogs.length > 500) seedAutoReplyLogs.length = 500;
+    return log;
+  }
+  await db.collection<AutoReplyLog>('autoReplyLogs').insertOne(log);
+  return log;
+};
+
+const textIncludesAny = (haystack: string, needles: string[]) => {
+  const text = haystack.toLowerCase();
+  return needles.some((needle) => {
+    const value = needle.trim().toLowerCase();
+    return value && text.includes(value);
+  });
+};
+
+const matchAutoReply = (
+  config: BusinessAutoReplyConfig,
+  incomingText: string,
+  isFirstCustomerMessage: boolean,
+): { source: AutoReplyLog['source']; text: string; ruleId?: string | null } | null => {
+  if (!config.enabled) return null;
+  const text = incomingText.trim();
+  if (!text) return null;
+
+  if (textIncludesAny(text, config.humanHandoverKeywords || [])) {
+    return {
+      source: 'handover',
+      text: 'Connecting you to a person now. Automation is paused for this chat.',
+    };
+  }
+
+  const activeRules = (config.rules || []).filter((rule) => rule.enabled !== false);
+  for (const rule of activeRules) {
+    if (textIncludesAny(text, rule.keywords || [])) {
+      return { source: 'rule', text: rule.response, ruleId: rule.id };
+    }
+  }
+
+  if (
+    config.hoursText
+    && textIncludesAny(text, ['hours', 'open today', 'opening', 'closing', 'are you open', 'when do you open', 'closed'])
+  ) {
+    return {
+      source: 'hours',
+      text: `Our hours: ${config.hoursText}`,
+    };
+  }
+
+  if (isFirstCustomerMessage && config.greetingEnabled && config.greetingText) {
+    return { source: 'greeting', text: config.greetingText };
+  }
+
+  if (config.awayEnabled && config.awayText) {
+    return { source: 'away', text: config.awayText };
+  }
+
+  return null;
+};
+
+const emitMessageToChat = async (message: Message, chat: Chat, sendingBusiness?: BusinessProfile | null) => {
+  const senderUser = (await readUsers()).find((user) => user.id === message.senderId);
+  const senderProfile = senderUser ? await readProfile(senderUser.id) : null;
+  const recipientIds = new Set(chat.participants);
+  sendingBusiness?.members.forEach((member) => recipientIds.add(member.userId));
+  for (const participantId of recipientIds) {
+    const delivered = presentMessage(message, participantId);
+    io.to(`user:${participantId}`).emit('message:new', {
+      ...delivered,
+      sender: delivered.senderId === 'anonymous' || !senderUser
+        ? undefined
+        : {
+            id: senderUser.id,
+            name: senderUser.name,
+            phone: senderUser.phone,
+            username: senderProfile?.username || '',
+            avatar: senderUser.avatar,
+            photoUri: senderProfile?.photoUri || '',
+          },
+    });
+  }
+  const updatedChat = await updateChatAfterMessage(
+    chat.id,
+    message.automated ? `[Auto] ${message.text}` : message.text,
+    message.sentAt,
+    message.senderId,
+  );
+  if (updatedChat) {
+    for (const participantId of chat.participants) {
+      io.emit('chat:updated', {
+        ...updatedChat,
+        unreadCount: updatedChat.unreadByUser?.[participantId] ?? 0,
+        viewerUserId: participantId,
+      });
+    }
+  }
+};
+
+const maybeSendBusinessAutoReply = async (params: {
+  chat: Chat;
+  incoming: Message;
+  senderId: string;
+}) => {
+  const { chat, incoming, senderId } = params;
+  if (incoming.automated || incoming.anonymous || chat.kind !== 'direct') return null;
+  if (incoming.kind !== 'text' || !incoming.text?.trim()) return null;
+
+  const peerId = chat.participants.find((id) => id !== senderId);
+  if (!peerId) return null;
+
+  // Only auto-reply when messaging a business owner/seller account.
+  const businesses = await businessesForUser(peerId);
+  const ownedBusiness = businesses.find((business) => business.ownerUserId === peerId)
+    || businesses[0]
+    || null;
+  const config = await getAutoReplyConfigForSeller(peerId, ownedBusiness?.id || null);
+  if (!config.enabled) return null;
+  if ((config.pausedChatIds || []).includes(chat.id)) return null;
+
+  const recentLogs = (await (async () => {
+    const db = await getDb();
+    if (!db) return seedAutoReplyLogs.filter((entry) => entry.chatId === chat.id);
+    return db
+      .collection<AutoReplyLog>('autoReplyLogs')
+      .find({ chatId: chat.id }, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray();
+  })());
+  const lastLog = recentLogs[0];
+  if (
+    lastLog
+    && Date.now() - new Date(lastLog.createdAt).getTime() < (config.cooldownSeconds || 90) * 1000
+  ) {
+    return null;
+  }
+
+  const priorCustomerMessages = (await readMessages()).filter(
+    (entry) =>
+      entry.chatId === chat.id
+      && entry.senderId === senderId
+      && !entry.automated
+      && entry.id !== incoming.id,
+  );
+  const match = matchAutoReply(config, incoming.text, priorCustomerMessages.length === 0);
+  if (!match) return null;
+
+  let nextConfig = config;
+  if (match.source === 'handover') {
+    nextConfig = {
+      ...config,
+      pausedChatIds: Array.from(new Set([...(config.pausedChatIds || []), chat.id])).slice(-200),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveAutoReplyConfig(nextConfig);
+  }
+
+  const replyText = match.text.startsWith('Automated:')
+    ? match.text
+    : `Automated: ${match.text}`;
+  const reply: Message = {
+    id: `m${Date.now()}-auto`,
+    chatId: chat.id,
+    senderId: peerId,
+    clientRef: `auto-${incoming.id}`,
+    kind: 'text',
+    text: replyText,
+    mediaUrls: [],
+    sentAt: new Date().toISOString(),
+    state: 'sent',
+    actorBusinessId: ownedBusiness?.id,
+    actorName: ownedBusiness?.name || 'Business assistant',
+    automated: true,
+    autoReplySource: match.source,
+  };
+  await persistMessage(reply);
+  await emitMessageToChat(reply, chat, ownedBusiness);
+  const log: AutoReplyLog = {
+    id: `arl${Date.now()}`,
+    sellerUserId: peerId,
+    businessId: ownedBusiness?.id || null,
+    chatId: chat.id,
+    customerUserId: senderId,
+    triggerMessageId: incoming.id,
+    replyMessageId: reply.id,
+    source: match.source,
+    ruleId: match.ruleId || null,
+    createdAt: new Date().toISOString(),
+  };
+  await saveAutoReplyLog(log);
+  io.to(`user:${peerId}`).emit('autoReply:sent', { log, message: reply });
+  return { reply, log, config: nextConfig };
+};
+
+const readCommerceDocuments = async () => {
+  const db = await getDb();
+  if (!db) return [...seedCommerceDocuments];
+  return db
+    .collection<CommerceDocument>('commerceDocuments')
+    .find({}, { projection: { _id: 0 }, sort: { updatedAt: -1 } })
+    .toArray();
+};
+
+const saveCommerceDocument = async (doc: CommerceDocument) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedCommerceDocuments.findIndex((entry) => entry.id === doc.id);
+    if (index >= 0) seedCommerceDocuments[index] = doc;
+    else seedCommerceDocuments.unshift(doc);
+    return doc;
+  }
+  await db.collection<CommerceDocument>('commerceDocuments').updateOne(
+    { id: doc.id },
+    { $set: doc },
+    { upsert: true },
+  );
+  return doc;
+};
+
+const nextDocumentNumber = async (kind: CommerceDocKind, sellerUserId: string) => {
+  const year = new Date().getFullYear();
+  const prefix = kind === 'quotation' ? 'Q' : 'INV';
+  const key = `${prefix}-${sellerUserId}-${year}`;
+  const db = await getDb();
+  if (!db) {
+    documentCounters[key] = (documentCounters[key] || 0) + 1;
+    return `${prefix}-${year}-${String(documentCounters[key]).padStart(4, '0')}`;
+  }
+  const result = await db.collection('documentCounters').findOneAndUpdate(
+    { id: key },
+    { $inc: { seq: 1 }, $setOnInsert: { id: key, createdAt: new Date().toISOString() } },
+    { upsert: true, returnDocument: 'after' },
+  );
+  const seq = Number((result as { seq?: number } | null)?.seq || 1);
+  return `${prefix}-${year}-${String(seq).padStart(4, '0')}`;
+};
+
+const buildDocLines = (lines: Array<z.infer<typeof commerceDocLineSchema>>): CommerceDocLine[] =>
+  lines.map((line, index) => {
+    const quantity = Number(line.quantity);
+    const unitPrice = Number(line.unitPrice);
+    return {
+      id: `line-${Date.now()}-${index}`,
+      catalogItemId: line.catalogItemId || null,
+      title: line.title.trim(),
+      description: line.description || '',
+      quantity,
+      unitPrice,
+      amount: Number((quantity * unitPrice).toFixed(2)),
+    };
+  });
+
+const computeDocTotals = (
+  lines: CommerceDocLine[],
+  discountAmount = 0,
+  taxAmount = 0,
+) => {
+  const subtotal = Number(lines.reduce((sum, line) => sum + Number(line.amount || 0), 0).toFixed(2));
+  const discount = Math.min(subtotal, Math.max(0, Number(discountAmount || 0)));
+  const tax = Math.max(0, Number(taxAmount || 0));
+  const totalAmount = Number((subtotal - discount + tax).toFixed(2));
+  return { subtotal, discountAmount: discount, taxAmount: tax, totalAmount };
+};
+
+const expireQuotationsIfNeeded = async (docs: CommerceDocument[]) => {
+  const now = Date.now();
+  const updated: CommerceDocument[] = [];
+  for (const doc of docs) {
+    if (
+      doc.kind === 'quotation'
+      && doc.state === 'sent'
+      && doc.expiresAt
+      && new Date(doc.expiresAt).getTime() < now
+    ) {
+      const next: CommerceDocument = {
+        ...doc,
+        state: 'expired',
+        updatedAt: new Date().toISOString(),
+        history: [
+          ...doc.history,
+          { state: 'expired', at: new Date().toISOString(), byUserId: 'system', note: 'Expired automatically' },
+        ],
+      };
+      await saveCommerceDocument(next);
+      updated.push(next);
+    } else {
+      updated.push(doc);
+    }
+  }
+  return updated;
+};
+
+const shareDocumentInChat = async (doc: CommerceDocument, byUserId: string, chatId?: string | null) => {
+  const targetChatId = chatId || doc.chatId;
+  if (!targetChatId) return { doc, message: null as Message | null };
+  const chat = (await readChats()).find((entry) => entry.id === targetChatId);
+  if (!chat) return { doc, message: null as Message | null };
+  const label = doc.kind === 'quotation' ? 'Quotation' : 'Invoice';
+  const message: Message = {
+    id: `m${Date.now()}-doc`,
+    chatId: chat.id,
+    senderId: byUserId,
+    clientRef: `doc-${doc.id}-v${doc.version}`,
+    kind: 'text',
+    text: `${label} ${doc.number}: ${doc.currency} ${doc.totalAmount.toFixed(2)} (${doc.state})`,
+    mediaUrls: [],
+    sentAt: new Date().toISOString(),
+    state: 'sent',
+    documentId: doc.id,
+    documentKind: doc.kind,
+  };
+  await persistMessage(message);
+  await emitMessageToChat(message, chat, null);
+  const next: CommerceDocument = {
+    ...doc,
+    chatId: chat.id,
+    messageId: message.id,
+    updatedAt: new Date().toISOString(),
+  };
+  await saveCommerceDocument(next);
+  return { doc: next, message };
+};
+
+const readBroadcastCampaigns = async () => {
+  const db = await getDb();
+  if (!db) return [...seedBroadcastCampaigns];
+  return db
+    .collection<BroadcastCampaign>('broadcastCampaigns')
+    .find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } })
+    .toArray();
+};
+
+const saveBroadcastCampaign = async (campaign: BroadcastCampaign) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedBroadcastCampaigns.findIndex((entry) => entry.id === campaign.id);
+    if (index >= 0) seedBroadcastCampaigns[index] = campaign;
+    else seedBroadcastCampaigns.unshift(campaign);
+    return campaign;
+  }
+  await db.collection<BroadcastCampaign>('broadcastCampaigns').updateOne(
+    { id: campaign.id },
+    { $set: campaign },
+    { upsert: true },
+  );
+  return campaign;
+};
+
+const resolveBroadcastAudience = async (
+  sellerUserId: string,
+  segment: BroadcastSegment,
+  tag?: string | null,
+) => {
+  const customers = (await readBusinessCustomers()).filter(
+    (entry) => entry.sellerUserId === sellerUserId && !entry.deletedAt && entry.customerUserId,
+  );
+  if (segment === 'opted_in') {
+    return customers.filter((entry) => entry.marketingConsent === 'opted_in');
+  }
+  if (segment === 'repeat_buyers') {
+    return customers.filter(
+      (entry) => entry.marketingConsent === 'opted_in' && Number(entry.orderCount || 0) >= 2,
+    );
+  }
+  if (segment === 'tag') {
+    const needle = (tag || '').toLowerCase();
+    return customers.filter(
+      (entry) =>
+        entry.marketingConsent === 'opted_in'
+        && entry.tags.some((value) => value.toLowerCase() === needle),
+    );
+  }
+  // all_customers still requires opt-in for marketing
+  return customers.filter((entry) => entry.marketingConsent === 'opted_in');
+};
+
+const sendBroadcastCampaign = async (campaign: BroadcastCampaign) => {
+  const audience = await resolveBroadcastAudience(
+    campaign.sellerUserId,
+    campaign.segment,
+    campaign.tag,
+  );
+  let sentCount = 0;
+  let failedCount = 0;
+  const sending: BroadcastCampaign = {
+    ...campaign,
+    status: 'sending',
+    audienceCount: audience.length,
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBroadcastCampaign(sending);
+
+  for (const customer of audience) {
+    try {
+      const peerUserId = customer.customerUserId!;
+      let chat = (await readChats()).find(
+        (entry) =>
+          entry.kind === 'direct'
+          && entry.participants.includes(campaign.sellerUserId)
+          && entry.participants.includes(peerUserId)
+          && chatSpaceOf(entry) === 'personal',
+      );
+      if (!chat) {
+        chat = {
+          id: `c${Date.now()}-${peerUserId.slice(-4)}`,
+          title: customer.displayName || 'Customer',
+          kind: 'direct',
+          participants: [campaign.sellerUserId, peerUserId],
+          unreadCount: 0,
+          unreadByUser: {},
+          lastMessagePreview: '',
+          updatedAt: new Date().toISOString(),
+          space: 'personal',
+        };
+        await saveChatRecord(chat);
+      }
+      const message: Message = {
+        id: `m${Date.now()}-bc-${sentCount}-${peerUserId.slice(-6)}`,
+        chatId: chat.id,
+        senderId: campaign.sellerUserId,
+        clientRef: `broadcast-${campaign.id}-${peerUserId}`,
+        kind: 'text',
+        text: campaign.text,
+        mediaUrls: [],
+        sentAt: new Date().toISOString(),
+        state: 'sent',
+        broadcastCampaignId: campaign.id,
+      };
+      await persistMessage(message);
+      await emitMessageToChat(message, chat, null);
+      sentCount += 1;
+    } catch {
+      failedCount += 1;
+    }
+  }
+
+  const finished: BroadcastCampaign = {
+    ...sending,
+    status: sentCount ? 'sent' : 'failed',
+    sentCount,
+    failedCount,
+    sentAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBroadcastCampaign(finished);
+  io.to(`user:${campaign.sellerUserId}`).emit('broadcast:updated', { campaign: finished });
+  return finished;
+};
+
 const persistCall = async (call: Call) => {
   const db = await getDb();
   if (!db) {
@@ -4944,13 +5711,23 @@ app.patch('/api/orders/:orderId', async (req, res) => {
     return res.status(400).json({ error: denyReason });
   }
   const now = new Date().toISOString();
+  const fulfilmentNote = parseResult.data.fulfilmentNote ?? order.fulfilmentNote ?? null;
+  const deliveryReference = parseResult.data.deliveryReference === undefined
+    ? order.deliveryReference ?? null
+    : parseResult.data.deliveryReference;
+  const historyNote = [
+    parseResult.data.note || '',
+    deliveryReference && nextState === 'dispatched' ? `Ref ${deliveryReference}` : '',
+  ].filter(Boolean).join(' · ');
   const updated: CommerceOrder = {
     ...order,
     state: nextState,
+    deliveryReference,
+    fulfilmentNote,
     updatedAt: now,
     history: [
       ...order.history,
-      { state: nextState, at: now, byUserId: parseResult.data.userId, note: parseResult.data.note || '' },
+      { state: nextState, at: now, byUserId: parseResult.data.userId, note: historyNote },
     ],
   };
   let finalOrder = updated;
@@ -5581,6 +6358,858 @@ app.patch('/api/me/customer-preferences', async (req, res) => {
       marketingConsentUpdatedAt: updated.marketingConsentUpdatedAt,
     },
   });
+});
+
+app.get('/api/auto-replies', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : null;
+  const config = await getAutoReplyConfigForSeller(userId, businessId);
+  return res.json({ config });
+});
+
+app.put('/api/auto-replies', async (req, res) => {
+  const parseResult = upsertAutoReplySchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid auto-reply settings.' });
+  }
+  const existing = await getAutoReplyConfigForSeller(
+    parseResult.data.userId,
+    parseResult.data.businessId || null,
+  );
+  const now = new Date().toISOString();
+  const rules = (parseResult.data.rules ?? existing.rules).map((rule, index) => ({
+    id: rule.id || `rule-${Date.now()}-${index}`,
+    keywords: rule.keywords.map((keyword) => keyword.trim()).filter(Boolean).slice(0, 12),
+    response: rule.response.trim().slice(0, 800),
+    enabled: rule.enabled !== false,
+  }));
+  const next: BusinessAutoReplyConfig = {
+    ...existing,
+    id: existing.id || `ar-${parseResult.data.userId}`,
+    sellerUserId: parseResult.data.userId,
+    businessId: parseResult.data.businessId === undefined
+      ? existing.businessId || null
+      : parseResult.data.businessId,
+    enabled: parseResult.data.enabled ?? existing.enabled,
+    greetingEnabled: parseResult.data.greetingEnabled ?? existing.greetingEnabled,
+    greetingText: parseResult.data.greetingText ?? existing.greetingText,
+    awayEnabled: parseResult.data.awayEnabled ?? existing.awayEnabled,
+    awayText: parseResult.data.awayText ?? existing.awayText,
+    hoursText: parseResult.data.hoursText ?? existing.hoursText,
+    humanHandoverKeywords:
+      parseResult.data.humanHandoverKeywords ?? existing.humanHandoverKeywords,
+    rules,
+    cooldownSeconds: parseResult.data.cooldownSeconds ?? existing.cooldownSeconds,
+    pausedChatIds: parseResult.data.pausedChatIds ?? existing.pausedChatIds,
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+  };
+  await saveAutoReplyConfig(next);
+  io.to(`user:${parseResult.data.userId}`).emit('autoReply:updated', { config: next });
+  return res.json({ config: next });
+});
+
+app.post('/api/auto-replies/pause-chat', async (req, res) => {
+  const parseResult = autoReplyPauseSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Chat id required.' });
+  }
+  const config = await getAutoReplyConfigForSeller(parseResult.data.userId, null);
+  const paused = new Set(config.pausedChatIds || []);
+  if (parseResult.data.paused) paused.add(parseResult.data.chatId);
+  else paused.delete(parseResult.data.chatId);
+  const next: BusinessAutoReplyConfig = {
+    ...config,
+    pausedChatIds: Array.from(paused).slice(-200),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveAutoReplyConfig(next);
+  return res.json({ config: next });
+});
+
+app.get('/api/auto-replies/logs', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const db = await getDb();
+  const logs = db
+    ? await db
+      .collection<AutoReplyLog>('autoReplyLogs')
+      .find({ sellerUserId: userId }, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .toArray()
+    : seedAutoReplyLogs.filter((entry) => entry.sellerUserId === userId).slice(0, 100);
+  return res.json({ logs });
+});
+
+app.get('/api/documents', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const kind = typeof req.query.kind === 'string' ? req.query.kind : '';
+  let docs = await expireQuotationsIfNeeded(await readCommerceDocuments());
+  docs = docs.filter(
+    (entry) => entry.sellerUserId === userId || entry.customerUserId === userId,
+  );
+  if (kind === 'quotation' || kind === 'invoice') {
+    docs = docs.filter((entry) => entry.kind === kind);
+  }
+  return res.json({ documents: docs });
+});
+
+app.post('/api/documents', async (req, res) => {
+  const parseResult = createCommerceDocSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Add at least one line item and a customer name.' });
+  }
+  const data = parseResult.data;
+  const lines = buildDocLines(data.lines);
+  const totals = computeDocTotals(lines, data.discountAmount, data.taxAmount);
+  const now = new Date().toISOString();
+  const number = await nextDocumentNumber(data.kind, data.userId);
+  const doc: CommerceDocument = {
+    id: `doc${Date.now()}`,
+    kind: data.kind,
+    number,
+    sellerUserId: data.userId,
+    businessId: data.businessId || null,
+    customerUserId: data.customerUserId || null,
+    customerName: data.customerName,
+    customerPhone: data.customerPhone || '',
+    chatId: data.chatId || null,
+    currency: data.currency || 'GHS',
+    lines,
+    ...totals,
+    notes: data.notes || '',
+    paymentTerms: data.paymentTerms || '',
+    expiresAt: data.kind === 'quotation' ? (data.expiresAt || null) : null,
+    dueAt: data.kind === 'invoice' ? (data.dueAt || null) : null,
+    state: 'draft',
+    version: 1,
+    versions: [{
+      version: 1,
+      at: now,
+      byUserId: data.userId,
+      snapshot: {
+        lines,
+        ...totals,
+        notes: data.notes || '',
+        paymentTerms: data.paymentTerms || '',
+      },
+    }],
+    history: [{ state: 'draft', at: now, byUserId: data.userId, note: 'Created' }],
+    sourceQuotationId: null,
+    orderId: null,
+    paymentId: null,
+    receiptId: null,
+    messageId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveCommerceDocument(doc);
+  let finalDoc = doc;
+  if (data.sendNow) {
+    finalDoc = {
+      ...doc,
+      state: 'sent',
+      updatedAt: new Date().toISOString(),
+      history: [...doc.history, { state: 'sent', at: new Date().toISOString(), byUserId: data.userId, note: 'Sent' }],
+    };
+    await saveCommerceDocument(finalDoc);
+    const shared = await shareDocumentInChat(finalDoc, data.userId, data.chatId);
+    finalDoc = shared.doc;
+  }
+  io.to(`user:${data.userId}`).emit('document:updated', { document: finalDoc });
+  if (finalDoc.customerUserId) {
+    io.to(`user:${finalDoc.customerUserId}`).emit('document:updated', { document: finalDoc });
+  }
+  return res.status(201).json({ document: finalDoc });
+});
+
+app.get('/api/documents/:documentId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const docs = await expireQuotationsIfNeeded(await readCommerceDocuments());
+  const doc = docs.find((entry) => entry.id === req.params.documentId);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  if (userId && doc.sellerUserId !== userId && doc.customerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this document.' });
+  }
+  return res.json({ document: doc });
+});
+
+app.patch('/api/documents/:documentId', async (req, res) => {
+  const parseResult = updateCommerceDocSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid document update.' });
+  }
+  const docs = await readCommerceDocuments();
+  const existing = docs.find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'Only the seller can edit this document.' });
+  }
+  if (!['draft', 'sent', 'rejected'].includes(existing.state)) {
+    return res.status(400).json({ error: 'This document can no longer be edited.' });
+  }
+  const lines = parseResult.data.lines ? buildDocLines(parseResult.data.lines) : existing.lines;
+  const totals = computeDocTotals(
+    lines,
+    parseResult.data.discountAmount ?? existing.discountAmount,
+    parseResult.data.taxAmount ?? existing.taxAmount,
+  );
+  const now = new Date().toISOString();
+  const nextVersion = existing.version + 1;
+  const updated: CommerceDocument = {
+    ...existing,
+    customerName: parseResult.data.customerName ?? existing.customerName,
+    customerPhone: parseResult.data.customerPhone ?? existing.customerPhone,
+    customerUserId: parseResult.data.customerUserId === undefined
+      ? existing.customerUserId
+      : parseResult.data.customerUserId,
+    chatId: parseResult.data.chatId === undefined ? existing.chatId : parseResult.data.chatId,
+    currency: parseResult.data.currency ?? existing.currency,
+    lines,
+    ...totals,
+    notes: parseResult.data.notes ?? existing.notes,
+    paymentTerms: parseResult.data.paymentTerms ?? existing.paymentTerms,
+    expiresAt: parseResult.data.expiresAt === undefined ? existing.expiresAt : parseResult.data.expiresAt,
+    dueAt: parseResult.data.dueAt === undefined ? existing.dueAt : parseResult.data.dueAt,
+    version: nextVersion,
+    versions: [
+      ...existing.versions,
+      {
+        version: nextVersion,
+        at: now,
+        byUserId: parseResult.data.userId,
+        snapshot: {
+          lines,
+          ...totals,
+          notes: parseResult.data.notes ?? existing.notes,
+          paymentTerms: parseResult.data.paymentTerms ?? existing.paymentTerms,
+        },
+      },
+    ].slice(-20),
+    updatedAt: now,
+  };
+  await saveCommerceDocument(updated);
+  io.to(`user:${updated.sellerUserId}`).emit('document:updated', { document: updated });
+  if (updated.customerUserId) {
+    io.to(`user:${updated.customerUserId}`).emit('document:updated', { document: updated });
+  }
+  return res.json({ document: updated });
+});
+
+app.post('/api/documents/:documentId/send', async (req, res) => {
+  const parseResult = commerceDocActionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const existing = (await readCommerceDocuments()).find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'Only the seller can send this document.' });
+  }
+  if (existing.kind === 'quotation' && existing.state === 'expired') {
+    return res.status(400).json({ error: 'Renew this expired quotation before sending.' });
+  }
+  const now = new Date().toISOString();
+  let next: CommerceDocument = {
+    ...existing,
+    state: 'sent',
+    chatId: parseResult.data.chatId || existing.chatId,
+    updatedAt: now,
+    history: [...existing.history, { state: 'sent', at: now, byUserId: parseResult.data.userId, note: parseResult.data.note || 'Sent' }],
+  };
+  await saveCommerceDocument(next);
+  const shared = await shareDocumentInChat(next, parseResult.data.userId, next.chatId);
+  next = shared.doc;
+  io.to(`user:${next.sellerUserId}`).emit('document:updated', { document: next });
+  if (next.customerUserId) io.to(`user:${next.customerUserId}`).emit('document:updated', { document: next });
+  return res.json({ document: next, message: shared.message });
+});
+
+app.post('/api/documents/:documentId/accept', async (req, res) => {
+  const parseResult = commerceDocActionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const docs = await expireQuotationsIfNeeded(await readCommerceDocuments());
+  const existing = docs.find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.customerUserId && existing.customerUserId !== parseResult.data.userId && existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You cannot accept this document.' });
+  }
+  if (existing.kind === 'quotation' && existing.state === 'expired') {
+    return res.status(400).json({ error: 'This quotation has expired. Ask for a renewal.' });
+  }
+  if (existing.state !== 'sent') {
+    return res.status(400).json({ error: 'Only a sent document can be accepted.' });
+  }
+  const now = new Date().toISOString();
+  const updated: CommerceDocument = {
+    ...existing,
+    state: 'accepted',
+    updatedAt: now,
+    history: [...existing.history, { state: 'accepted', at: now, byUserId: parseResult.data.userId, note: parseResult.data.note || 'Accepted' }],
+  };
+  await saveCommerceDocument(updated);
+  io.to(`user:${updated.sellerUserId}`).emit('document:updated', { document: updated });
+  if (updated.customerUserId) io.to(`user:${updated.customerUserId}`).emit('document:updated', { document: updated });
+  return res.json({ document: updated });
+});
+
+app.post('/api/documents/:documentId/reject', async (req, res) => {
+  const parseResult = commerceDocActionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const existing = (await readCommerceDocuments()).find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.customerUserId && existing.customerUserId !== parseResult.data.userId && existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You cannot reject this document.' });
+  }
+  if (existing.state !== 'sent') {
+    return res.status(400).json({ error: 'Only a sent document can be rejected.' });
+  }
+  const now = new Date().toISOString();
+  const updated: CommerceDocument = {
+    ...existing,
+    state: 'rejected',
+    updatedAt: now,
+    history: [...existing.history, { state: 'rejected', at: now, byUserId: parseResult.data.userId, note: parseResult.data.note || 'Rejected' }],
+  };
+  await saveCommerceDocument(updated);
+  io.to(`user:${updated.sellerUserId}`).emit('document:updated', { document: updated });
+  if (updated.customerUserId) io.to(`user:${updated.customerUserId}`).emit('document:updated', { document: updated });
+  return res.json({ document: updated });
+});
+
+app.post('/api/documents/:documentId/convert', async (req, res) => {
+  const parseResult = commerceDocActionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const existing = (await readCommerceDocuments()).find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'Only the seller can convert this quotation.' });
+  }
+  if (existing.kind !== 'quotation') {
+    return res.status(400).json({ error: 'Only quotations convert to invoices.' });
+  }
+  if (!['accepted', 'sent'].includes(existing.state)) {
+    return res.status(400).json({ error: 'Accept or send the quotation before converting.' });
+  }
+  if (existing.state === 'expired') {
+    return res.status(400).json({ error: 'Expired quotations cannot be converted.' });
+  }
+  const now = new Date().toISOString();
+  const number = await nextDocumentNumber('invoice', existing.sellerUserId);
+  const invoice: CommerceDocument = {
+    ...existing,
+    id: `doc${Date.now()}`,
+    kind: 'invoice',
+    number,
+    state: 'sent',
+    sourceQuotationId: existing.id,
+    dueAt: existing.dueAt || null,
+    expiresAt: null,
+    version: 1,
+    versions: [{
+      version: 1,
+      at: now,
+      byUserId: parseResult.data.userId,
+      snapshot: {
+        lines: existing.lines,
+        subtotal: existing.subtotal,
+        discountAmount: existing.discountAmount,
+        taxAmount: existing.taxAmount,
+        totalAmount: existing.totalAmount,
+        notes: existing.notes,
+        paymentTerms: existing.paymentTerms,
+      },
+    }],
+    history: [{ state: 'sent', at: now, byUserId: parseResult.data.userId, note: `Converted from ${existing.number}` }],
+    messageId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const quotation: CommerceDocument = {
+    ...existing,
+    state: 'converted',
+    updatedAt: now,
+    history: [...existing.history, { state: 'converted', at: now, byUserId: parseResult.data.userId, note: `Converted to ${invoice.number}` }],
+  };
+  await saveCommerceDocument(quotation);
+  await saveCommerceDocument(invoice);
+  const shared = await shareDocumentInChat(invoice, parseResult.data.userId, parseResult.data.chatId || invoice.chatId);
+  io.to(`user:${invoice.sellerUserId}`).emit('document:updated', { document: quotation });
+  io.to(`user:${invoice.sellerUserId}`).emit('document:updated', { document: shared.doc });
+  if (invoice.customerUserId) {
+    io.to(`user:${invoice.customerUserId}`).emit('document:updated', { document: shared.doc });
+  }
+  return res.status(201).json({ quotation, invoice: shared.doc, message: shared.message });
+});
+
+app.post('/api/documents/:documentId/mark-paid', async (req, res) => {
+  const parseResult = commerceDocActionSchema.safeParse(req.body);
+  if (!parseResult.success) return res.status(400).json({ error: 'Missing user' });
+  const existing = (await readCommerceDocuments()).find((entry) => entry.id === req.params.documentId);
+  if (!existing) return res.status(404).json({ error: 'Document not found' });
+  if (existing.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'Only the seller can mark this invoice paid.' });
+  }
+  if (existing.kind !== 'invoice') {
+    return res.status(400).json({ error: 'Only invoices can be marked paid.' });
+  }
+  if (existing.state === 'paid') {
+    return res.json({ document: existing });
+  }
+  if (!parseResult.data.paymentId && !parseResult.data.markCashReceived) {
+    return res.status(400).json({
+      error: 'Link a confirmed paymentId or explicitly mark cash received.',
+    });
+  }
+  const now = new Date().toISOString();
+  const updated: CommerceDocument = {
+    ...existing,
+    state: 'paid',
+    paymentId: parseResult.data.paymentId || existing.paymentId || `cash-${Date.now()}`,
+    updatedAt: now,
+    history: [
+      ...existing.history,
+      {
+        state: 'paid',
+        at: now,
+        byUserId: parseResult.data.userId,
+        note: parseResult.data.paymentId
+          ? `Payment ${parseResult.data.paymentId}`
+          : 'Cash received (authorised record)',
+      },
+    ],
+  };
+  await saveCommerceDocument(updated);
+  io.to(`user:${updated.sellerUserId}`).emit('document:updated', { document: updated });
+  if (updated.customerUserId) io.to(`user:${updated.customerUserId}`).emit('document:updated', { document: updated });
+  return res.json({ document: updated });
+});
+
+app.get('/api/broadcasts', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const campaigns = (await readBroadcastCampaigns()).filter((entry) => entry.sellerUserId === userId);
+  const optedIn = await resolveBroadcastAudience(userId, 'opted_in');
+  return res.json({
+    campaigns,
+    audiencePreview: {
+      opted_in: optedIn.length,
+      repeat_buyers: (await resolveBroadcastAudience(userId, 'repeat_buyers')).length,
+      all_customers: (await resolveBroadcastAudience(userId, 'all_customers')).length,
+    },
+  });
+});
+
+app.post('/api/broadcasts', async (req, res) => {
+  const parseResult = createBroadcastSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Write a broadcast message.' });
+  }
+  const data = parseResult.data;
+  if (data.segment === 'tag' && !data.tag) {
+    return res.status(400).json({ error: 'Choose a tag for this segment.' });
+  }
+  const audience = await resolveBroadcastAudience(data.userId, data.segment, data.tag);
+  if (!audience.length) {
+    return res.status(400).json({
+      error: 'No opted-in customers in this segment. Marketing requires opt-in.',
+    });
+  }
+  // Simple rate limit: max 5 campaigns / hour
+  const hourAgo = Date.now() - 60 * 60 * 1000;
+  const recent = (await readBroadcastCampaigns()).filter(
+    (entry) =>
+      entry.sellerUserId === data.userId
+      && new Date(entry.createdAt).getTime() >= hourAgo
+      && entry.status !== 'cancelled',
+  );
+  if (recent.length >= 5) {
+    return res.status(429).json({ error: 'Broadcast rate limit reached. Try again later.' });
+  }
+  const now = new Date().toISOString();
+  let campaign: BroadcastCampaign = {
+    id: `bc${Date.now()}`,
+    sellerUserId: data.userId,
+    businessId: data.businessId || null,
+    text: data.text,
+    segment: data.segment,
+    tag: data.tag || null,
+    status: data.scheduledAt && !data.sendNow ? 'draft' : 'draft',
+    audienceCount: audience.length,
+    sentCount: 0,
+    failedCount: 0,
+    scheduledAt: data.scheduledAt || null,
+    sentAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveBroadcastCampaign(campaign);
+  if (data.sendNow || !data.scheduledAt) {
+    campaign = await sendBroadcastCampaign(campaign);
+  } else {
+    io.to(`user:${data.userId}`).emit('broadcast:updated', { campaign });
+  }
+  return res.status(201).json({ campaign });
+});
+
+app.post('/api/broadcasts/:campaignId/cancel', async (req, res) => {
+  const userId = String(req.body?.userId || '');
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const campaign = (await readBroadcastCampaigns()).find((entry) => entry.id === req.params.campaignId);
+  if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+  if (campaign.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot cancel this campaign.' });
+  }
+  if (campaign.status === 'sent') {
+    return res.status(400).json({ error: 'Already sent campaigns cannot be cancelled.' });
+  }
+  const updated: BroadcastCampaign = {
+    ...campaign,
+    status: 'cancelled',
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBroadcastCampaign(updated);
+  io.to(`user:${userId}`).emit('broadcast:updated', { campaign: updated });
+  return res.json({ campaign: updated });
+});
+
+const rewriteWithTone = (text: string, tone: z.infer<typeof aiToneSchema>) => {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return cleaned;
+  if (tone === 'concise') {
+    return cleaned
+      .replace(/\b(just|really|very|actually|basically|kind of|sort of)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 280);
+  }
+  if (tone === 'polite') {
+    if (/please|thank/i.test(cleaned)) return cleaned;
+    return `Please ${cleaned.charAt(0).toLowerCase()}${cleaned.slice(1)}`.replace(/\.$/, '') + '. Thank you.';
+  }
+  if (tone === 'professional') {
+    return cleaned
+      .replace(/\b(hey|hi+|yeah|ok+|gonna|wanna)\b/gi, (match) => {
+        const map: Record<string, string> = {
+          hey: 'Hello', hi: 'Hello', yeah: 'Yes', ok: 'Understood', okay: 'Understood', gonna: 'going to', wanna: 'want to',
+        };
+        return map[match.toLowerCase()] || match;
+      })
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  if (tone === 'friendly') {
+    if (/!|😊|thanks/i.test(cleaned)) return cleaned;
+    return `${cleaned.replace(/\.$/, '')} — happy to help!`;
+  }
+  // apologetic
+  if (/sorry|apologis/i.test(cleaned)) return cleaned;
+  return `Sorry about that. ${cleaned}`;
+};
+
+const buildSuggestedReplies = (incomingText: string, tone?: z.infer<typeof aiToneSchema>) => {
+  const text = (incomingText || '').toLowerCase();
+  const picks: Array<{ text: string; tone: z.infer<typeof aiToneSchema>; reason: string }> = [];
+  const push = (body: string, reason: string, forcedTone: z.infer<typeof aiToneSchema> = tone || 'polite') => {
+    picks.push({ text: rewriteWithTone(body, forcedTone), tone: forcedTone, reason });
+  };
+
+  if (/late|delay|where.*order|hasn't arrived|not arrived/.test(text)) {
+    push('We apologise for the delay. Please share your order number so we can check this immediately.', 'delivery_delay', 'apologetic');
+    push('Thanks for flagging this. I am checking the fulfilment status now and will update you shortly.', 'delivery_delay', 'professional');
+  }
+  if (/price|how much|cost|quote/.test(text)) {
+    push('Thanks for your interest. I will share the current price and options for you now.', 'pricing', 'friendly');
+    push('Please let me know the quantity you need and I will send an accurate quote.', 'pricing', 'professional');
+  }
+  if (/available|in stock|do you have|still sell/.test(text)) {
+    push('Let me confirm stock for you and reply with what is available.', 'availability', 'concise');
+    push('Thanks for asking. I am checking availability and will confirm shortly.', 'availability', 'polite');
+  }
+  if (/refund|return|money back/.test(text)) {
+    push('I understand. Please share your order number and I will review the refund options with you.', 'refund', 'apologetic');
+    push('We can look at this carefully. Share the order details and your preferred resolution.', 'refund', 'professional');
+  }
+  if (/open|hours|when.*close|are you open/.test(text)) {
+    push('Our team will confirm today\'s hours and get back to you right away.', 'hours', 'friendly');
+  }
+  if (/thank|thanks|appreciate/.test(text)) {
+    push('You are welcome. Happy to help anytime.', 'thanks', 'friendly');
+  }
+  if (!picks.length) {
+    push('Thanks for your message. I will get back to you shortly.', 'generic', tone || 'polite');
+    push('Got it — let me check and reply soon.', 'generic', 'concise');
+    push('Thank you for reaching out. How can I best help with this?', 'generic', 'professional');
+  }
+
+  const unique = new Map<string, { text: string; tone: z.infer<typeof aiToneSchema>; reason: string }>();
+  for (const entry of picks) {
+    if (!unique.has(entry.text)) unique.set(entry.text, entry);
+  }
+  return Array.from(unique.values()).slice(0, 4).map((entry, index) => ({
+    id: `sug-${Date.now()}-${index}`,
+    text: entry.text,
+    tone: entry.tone,
+    reason: entry.reason,
+    source: 'template' as const,
+  }));
+};
+
+const scanScamSignals = (text: string) => {
+  const lower = text.toLowerCase();
+  const signals: Array<{ code: string; label: string; severity: 'low' | 'medium' | 'high' }> = [];
+  if (/(momo|mobile money).*(pin|otp|code)|send.*(pin|otp)|give me your (pin|otp)/i.test(lower)) {
+    signals.push({ code: 'pin_request', label: 'Asks for a PIN or OTP', severity: 'high' });
+  }
+  if (/prize|you have won|claim your reward|lottery/i.test(lower)) {
+    signals.push({ code: 'prize_scam', label: 'Unsolicited prize or reward claim', severity: 'high' });
+  }
+  if (/urgent|act now|within 10 minutes|immediately send money/i.test(lower)) {
+    signals.push({ code: 'urgency_pressure', label: 'High-pressure urgency language', severity: 'medium' });
+  }
+  if (/bit\.ly|tinyurl|t\.co\/|http:\/\//i.test(lower)) {
+    signals.push({ code: 'suspicious_link', label: 'Shortened or insecure link', severity: 'medium' });
+  }
+  if (/gift card|western union|send crypto|bitcoin only/i.test(lower)) {
+    signals.push({ code: 'unusual_payment', label: 'Unusual payment method request', severity: 'high' });
+  }
+  const severityRank = { low: 1, medium: 2, high: 3 };
+  const top = signals.sort((a, b) => severityRank[b.severity] - severityRank[a.severity])[0];
+  return {
+    risky: signals.length > 0,
+    severity: top?.severity || 'low',
+    signals,
+    advice: signals.length
+      ? 'Be careful. Never share MoMo PINs or OTPs. Verify the sender before sending money.'
+      : null,
+  };
+};
+
+app.post('/api/ai/suggest-replies', async (req, res) => {
+  const parseResult = suggestRepliesSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'chatId and userId are required.' });
+  }
+  const chat = (await readChats()).find((entry) => entry.id === parseResult.data.chatId);
+  if (!chat || !chat.participants.includes(parseResult.data.userId)) {
+    return res.status(403).json({ error: 'You cannot suggest replies for this chat.' });
+  }
+  const messages = (await readMessages())
+    .filter((entry) => entry.chatId === chat.id && !entry.deletedForEveryone)
+    .sort((a, b) => a.sentAt.localeCompare(b.sentAt));
+  const target = parseResult.data.messageId
+    ? messages.find((entry) => entry.id === parseResult.data.messageId)
+    : [...messages].reverse().find((entry) => entry.senderId !== parseResult.data.userId && entry.kind === 'text');
+  if (!target) {
+    return res.status(404).json({ error: 'No message found to suggest a reply for.' });
+  }
+  const suggestions = buildSuggestedReplies(target.text || '', parseResult.data.tone);
+  return res.json({
+    suggestions,
+    contextUsed: {
+      messageId: target.id,
+      preview: (target.text || '').slice(0, 180),
+      senderId: target.senderId,
+    },
+    autoSend: false,
+    notice: 'Suggestions are templates. Edit before sending. Nothing is sent automatically.',
+  });
+});
+
+app.post('/api/ai/rewrite', async (req, res) => {
+  const parseResult = rewriteMessageSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Add text to rewrite.' });
+  }
+  const tones: Array<z.infer<typeof aiToneSchema>> = parseResult.data.tone
+    ? [parseResult.data.tone]
+    : ['polite', 'concise', 'professional', 'friendly', 'apologetic'];
+  const variants = tones.map((tone, index) => ({
+    id: `rw-${Date.now()}-${index}`,
+    tone,
+    text: rewriteWithTone(parseResult.data.text, tone),
+    source: 'template' as const,
+  }));
+  return res.json({
+    variants,
+    autoSend: false,
+    notice: 'Rewrites keep your meaning but may need fact-checking before send.',
+  });
+});
+
+app.post('/api/ai/scam-check', async (req, res) => {
+  const parseResult = scamCheckSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Add message text to check.' });
+  }
+  const result = scanScamSignals(parseResult.data.text);
+  return res.json({
+    ...result,
+    disclaimer: 'This is a warning aid, not a guarantee that every scam can be detected.',
+  });
+});
+
+const buildChatSummary = (
+  messages: Message[],
+  viewerId: string,
+) => {
+  const textMessages = messages.filter(
+    (entry) =>
+      entry.kind === 'text'
+      && !entry.deletedForEveryone
+      && !(entry.deletedFor || []).includes(viewerId)
+      && (entry.text || '').trim(),
+  );
+  const questions: Array<{ messageId: string; text: string; sentAt: string; senderId: string }> = [];
+  const decisions: Array<{ messageId: string; text: string; sentAt: string; senderId: string }> = [];
+  const actions: Array<{ messageId: string; text: string; sentAt: string; senderId: string; suggested: true }> = [];
+  const highlights: Array<{ messageId: string; text: string; sentAt: string; senderId: string }> = [];
+
+  for (const message of textMessages) {
+    const text = message.text.trim();
+    const item = {
+      messageId: message.id,
+      text: text.slice(0, 220),
+      sentAt: message.sentAt,
+      senderId: message.senderId,
+    };
+    if (/\?/.test(text) || /^(who|what|when|where|why|how|can you|could you|please)\b/i.test(text)) {
+      questions.push(item);
+    }
+    if (/\b(agreed|we will|let's|lets|confirmed|decision|ship it|go ahead)\b/i.test(text)) {
+      decisions.push(item);
+    }
+    if (/\b(please|need you to|can you|could you|todo|follow up|send me|share)\b/i.test(text)) {
+      actions.push({ ...item, suggested: true });
+    }
+    if (
+      text.length >= 40
+      || /\b(order|payment|invoice|delivery|meeting|deadline|price)\b/i.test(text)
+    ) {
+      highlights.push(item);
+    }
+  }
+
+  const uniqueById = <T extends { messageId: string }>(items: T[]) => {
+    const seen = new Set<string>();
+    return items.filter((entry) => {
+      if (seen.has(entry.messageId)) return false;
+      seen.add(entry.messageId);
+      return true;
+    });
+  };
+
+  const overviewParts: string[] = [];
+  if (textMessages.length) {
+    overviewParts.push(`${textMessages.length} messages in scope.`);
+  }
+  if (questions.length) overviewParts.push(`${questions.length} open question(s).`);
+  if (decisions.length) overviewParts.push(`${decisions.length} possible decision(s).`);
+  if (actions.length) overviewParts.push(`${actions.length} possible follow-up(s).`);
+
+  return {
+    overview: overviewParts.join(' ') || 'No text messages in this range.',
+    questions: uniqueById(questions).slice(-8),
+    decisions: uniqueById(decisions).slice(-8),
+    actionSuggestions: uniqueById(actions).slice(-8),
+    highlights: uniqueById(highlights).slice(-10),
+    messageCount: textMessages.length,
+    method: 'extractive',
+    notice: 'This is an extractive summary of messages you can read, not a substitute for the chat. Action items are suggestions only.',
+  };
+};
+
+app.post('/api/ai/summarize', async (req, res) => {
+  const parseResult = summarizeChatSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'chatId and userId are required.' });
+  }
+  const { userId, chatId, scope } = parseResult.data;
+  const limit = parseResult.data.limit || (scope === 'unread' ? 120 : 80);
+  const chat = (await readChats()).find((entry) => entry.id === chatId);
+  if (!chat || !chat.participants.includes(userId)) {
+    return res.status(403).json({ error: 'You cannot summarise this chat.' });
+  }
+  let messages = (await readMessages())
+    .filter((entry) => entry.chatId === chatId)
+    .sort((a, b) => a.sentAt.localeCompare(b.sentAt));
+
+  if (scope === 'unread') {
+    const unread = messages.filter(
+      (entry) =>
+        entry.senderId !== userId
+        && entry.state !== 'read'
+        && !entry.deletedForEveryone,
+    );
+    messages = unread.length ? unread.slice(-limit) : messages.slice(-Math.min(40, limit));
+  } else if (scope === 'range') {
+    const since = parseResult.data.since ? new Date(parseResult.data.since).getTime() : 0;
+    const until = parseResult.data.until ? new Date(parseResult.data.until).getTime() : Date.now();
+    messages = messages
+      .filter((entry) => {
+        const at = new Date(entry.sentAt).getTime();
+        return at >= since && at <= until;
+      })
+      .slice(-limit);
+  } else {
+    messages = messages.slice(-limit);
+  }
+
+  // Drop disappearing messages past expiry for this viewer
+  const now = Date.now();
+  messages = messages.filter((entry) => !entry.expiresAt || new Date(entry.expiresAt).getTime() > now);
+
+  const summary = buildChatSummary(messages, userId);
+  return res.json({
+    chatId,
+    scope,
+    summary,
+    sourceMessageIds: [
+      ...summary.questions,
+      ...summary.decisions,
+      ...summary.actionSuggestions,
+      ...summary.highlights,
+    ].map((entry) => entry.messageId),
+  });
+});
+
+app.post('/api/ai/dictate', async (req, res) => {
+  const parseResult = dictateSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Provide dictated text or an audio URL.' });
+  }
+  const text = (parseResult.data.text || '').trim();
+  if (text) {
+    return res.json({
+      text,
+      autoSend: false,
+      source: 'on_device',
+      notice: 'Review and edit before sending. Dictation never sends automatically.',
+    });
+  }
+  if (parseResult.data.audioUrl) {
+    const hasProvider = Boolean(
+      process.env.SPEECH_TO_TEXT_API_KEY
+      || process.env.OPENAI_API_KEY
+      || process.env.GOOGLE_SPEECH_API_KEY,
+    );
+    if (!hasProvider) {
+      return res.status(503).json({
+        error: 'Server speech-to-text is not configured yet.',
+        needsProvider: true,
+        autoSend: false,
+        notice: 'Use on-device dictation, or type and edit the draft manually.',
+      });
+    }
+    // Provider wiring lands when keys are available; keep contract stable.
+    return res.status(501).json({
+      error: 'Speech provider is configured but not wired in this build.',
+      needsProvider: true,
+      autoSend: false,
+    });
+  }
+  return res.status(400).json({ error: 'Provide dictated text or an audio URL.' });
 });
 
 app.post('/api/catalog/:itemId/feature', async (req, res) => {
@@ -6761,8 +8390,44 @@ app.post('/api/messages', async (req, res) => {
     }
   }
 
+  let autoReply: { reply: Message; log: AutoReplyLog } | null = null;
+  if (!payload.anonymous && !message.automated && sendingAs === 'personal') {
+    try {
+      const result = await maybeSendBusinessAutoReply({
+        chat,
+        incoming: message,
+        senderId: payload.senderId,
+      });
+      if (result) autoReply = { reply: result.reply, log: result.log };
+    } catch {
+      // Never fail customer sends because automation failed.
+    }
+  }
+
+  let scamWarning: ReturnType<typeof scanScamSignals> | null = null;
+  if (!payload.anonymous && message.kind === 'text' && message.text) {
+    scamWarning = scanScamSignals(message.text);
+    if (scamWarning.risky) {
+      for (const participantId of chat.participants) {
+        if (participantId === payload.senderId) continue;
+        io.to(`user:${participantId}`).emit('message:scamWarning', {
+          chatId: chat.id,
+          messageId: message.id,
+          warning: scamWarning,
+        });
+      }
+    }
+  }
+
   return res.status(201).json({
     message: presentMessage(message, payload.senderId),
+    autoReply: autoReply
+      ? {
+          message: presentMessage(autoReply.reply, payload.senderId),
+          source: autoReply.log.source,
+        }
+      : null,
+    scamWarning: scamWarning?.risky ? scamWarning : null,
     anonymousRemaining: payload.anonymous
       ? Math.max(0, (await readAppConfig(getDb)).anonymousDailyLimit - 1 - anonymousUsed)
       : undefined,
