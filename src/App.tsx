@@ -37,6 +37,22 @@ type Message = {
   automated?: boolean;
   documentId?: string;
   documentKind?: 'quotation' | 'invoice';
+  transcript?: string;
+  transcriptStatus?: 'pending' | 'ready' | 'failed' | 'unavailable';
+  transcriptLanguage?: string;
+  transcriptUpdatedAt?: string;
+  transcriptNotice?: string;
+};
+
+type TranslateLanguage = 'en' | 'tw' | 'ga' | 'ee' | 'pcm';
+
+type MessageTranslation = {
+  translatedText: string;
+  targetLanguage: TranslateLanguage;
+  partial?: boolean;
+  needsProvider?: boolean;
+  notice?: string;
+  method?: string;
 };
 
 type Chat = {
@@ -122,11 +138,37 @@ type CommerceOrder = {
 
 type AiTone = 'polite' | 'concise' | 'professional' | 'friendly' | 'apologetic';
 
+type AiAssistantTask = 'draft' | 'rewrite' | 'summarise' | 'translate' | 'suggest_reply' | 'explain';
+
 type AiSuggestionChip = {
   id: string;
   text: string;
   tone?: AiTone;
   reason?: string;
+};
+
+type BusinessAiConfig = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  autoSend: boolean;
+  policyText: string;
+  deliveryPolicy: string;
+  refundPolicy: string;
+  faq: Array<{ question: string; answer: string }>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type BusinessAiAskResult = {
+  answer: string;
+  confidence?: string;
+  source?: string;
+  escalate?: boolean;
+  disclosure?: string;
+  notice?: string;
+  autoSend?: boolean;
 };
 
 type ScamSignal = {
@@ -403,7 +445,8 @@ type BusinessHubTab =
   | 'customers'
   | 'autoreplies'
   | 'documents'
-  | 'broadcasts';
+  | 'broadcasts'
+  | 'ai';
 
 type StatusItem = {
   id: string;
@@ -475,6 +518,21 @@ type UpdateGroup = {
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:4000';
 const AI_TONES: AiTone[] = ['polite', 'concise', 'professional', 'friendly', 'apologetic'];
+const AI_ASSISTANT_TASKS: Array<{ id: AiAssistantTask; label: string }> = [
+  { id: 'draft', label: 'Draft' },
+  { id: 'rewrite', label: 'Rewrite' },
+  { id: 'suggest_reply', label: 'Suggest reply' },
+  { id: 'summarise', label: 'Summarise' },
+  { id: 'translate', label: 'Translate' },
+  { id: 'explain', label: 'Explain' },
+];
+const TRANSLATE_LANGUAGES: Array<{ id: TranslateLanguage; label: string }> = [
+  { id: 'en', label: 'English' },
+  { id: 'tw', label: 'Twi' },
+  { id: 'ga', label: 'Ga' },
+  { id: 'ee', label: 'Ewe' },
+  { id: 'pcm', label: 'Pidgin' },
+];
 const DEVICE_STORAGE_KEY = 'zynkup-web-device-id';
 const SETTINGS_STORAGE_KEY = 'zynkup-web-app-settings';
 const FAVORITES_STORAGE_KEY = 'zynkup-web-favorite-chats';
@@ -637,6 +695,16 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   documentKind: message.documentKind === 'quotation' || message.documentKind === 'invoice'
     ? message.documentKind
     : undefined,
+  transcript: typeof message.transcript === 'string' ? message.transcript : undefined,
+  transcriptStatus:
+    message.transcriptStatus === 'pending'
+    || message.transcriptStatus === 'ready'
+    || message.transcriptStatus === 'failed'
+    || message.transcriptStatus === 'unavailable'
+      ? message.transcriptStatus
+      : undefined,
+  transcriptLanguage: typeof message.transcriptLanguage === 'string' ? message.transcriptLanguage : undefined,
+  transcriptUpdatedAt: typeof message.transcriptUpdatedAt === 'string' ? message.transcriptUpdatedAt : undefined,
 });
 
 const describeCallMessage = (message: Message) => {
@@ -824,6 +892,17 @@ function App() {
   const [aiTone, setAiTone] = useState<AiTone>('polite');
   const [aiSuggestionChips, setAiSuggestionChips] = useState<AiSuggestionChip[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
+  const [aiHelperVisible, setAiHelperVisible] = useState(false);
+  const [aiHelperTask, setAiHelperTask] = useState<AiAssistantTask>('draft');
+  const [aiHelperPrompt, setAiHelperPrompt] = useState('');
+  const [aiConsentToShareContext, setAiConsentToShareContext] = useState(false);
+  const [aiHelperNotice, setAiHelperNotice] = useState('');
+  const [aiHelperResult, setAiHelperResult] = useState('');
+  const [businessAiConfig, setBusinessAiConfig] = useState<BusinessAiConfig | null>(null);
+  const [businessAiFaqDraft, setBusinessAiFaqDraft] = useState({ question: '', answer: '' });
+  const [businessAiTestQuestion, setBusinessAiTestQuestion] = useState('');
+  const [businessAiAskResult, setBusinessAiAskResult] = useState<BusinessAiAskResult | null>(null);
+  const [businessAiBusy, setBusinessAiBusy] = useState(false);
   const [scamWarningsByKey, setScamWarningsByKey] = useState<Record<string, ScamWarningInfo>>({});
   const [summaryVisible, setSummaryVisible] = useState(false);
   const [summaryScope, setSummaryScope] = useState<SummarizeScope>('unread');
@@ -833,6 +912,11 @@ function App() {
   const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
   const [isDictating, setIsDictating] = useState(false);
   const [dictationNotice, setDictationNotice] = useState('');
+  const [transcribingMessageId, setTranscribingMessageId] = useState<string | null>(null);
+  const [translationsByMessageId, setTranslationsByMessageId] = useState<Record<string, MessageTranslation>>({});
+  const [translatePickerMessageId, setTranslatePickerMessageId] = useState<string | null>(null);
+  const [translateTargetLanguage, setTranslateTargetLanguage] = useState<TranslateLanguage>('en');
+  const [translatingMessageId, setTranslatingMessageId] = useState<string | null>(null);
   const [feedbackDraft, setFeedbackDraft] = useState('');
   const [catalogForm, setCatalogForm] = useState({
     title: '',
@@ -1750,6 +1834,14 @@ function App() {
       showToast(advice, 5000);
     });
 
+    socket.on('message:transcript', (payload: { message?: any }) => {
+      const nextMessage = payload?.message;
+      if (!nextMessage?.id || !nextMessage?.chatId) {
+        return;
+      }
+      reconcileIncomingMessage(nextMessage.chatId, nextMessage);
+    });
+
     socket.on('message:deleted', ({ message, scope, userId }) => {
       if (!message?.chatId) {
         return;
@@ -1876,6 +1968,9 @@ function App() {
       }
       setBusinessCustomers((current) => [customer, ...current.filter((entry) => entry.id !== customer.id)]);
       setSelectedCustomer((current) => (current?.id === customer.id ? customer : current));
+    });
+    socket.on('businessAi:updated', ({ config }: { config: BusinessAiConfig }) => {
+      if (config) setBusinessAiConfig(config);
     });
     socket.on('autoReply:updated', ({ config }: { config: AutoReplyConfig }) => {
       if (config) setAutoReplyConfig(config);
@@ -2656,70 +2751,330 @@ function App() {
     }
   };
 
-  const requestSuggestedReplies = async () => {
-    if (!currentUserId || !activeChat || aiBusy) return;
+  const runAssistantTask = async (
+    task: AiAssistantTask,
+    options: { text?: string; prompt?: string; messageId?: string } = {},
+  ) => {
+    if (!currentUserId || aiBusy) return;
+    const needsChatContext =
+      task === 'summarise' || task === 'suggest_reply' || Boolean(options.messageId);
+    if (needsChatContext && !activeChat) {
+      showToast('Open a chat to use this assistant task');
+      return;
+    }
+    if (needsChatContext && !aiConsentToShareContext) {
+      setAiHelperVisible(true);
+      showToast('Confirm consent to share chat context with the assistant');
+      return;
+    }
+
+    const text =
+      (options.text || '').trim() ||
+      (task === 'rewrite' || task === 'translate' || task === 'explain'
+        ? messageDraft.trim()
+        : '');
+    const prompt = (options.prompt || aiHelperPrompt).trim();
+
+    if (task === 'draft' && !prompt && !text) {
+      showToast('Describe what to draft');
+      return;
+    }
+    if ((task === 'rewrite' || task === 'translate' || task === 'explain') && !text) {
+      showToast(task === 'rewrite' ? 'Add text to rewrite' : task === 'translate' ? 'Add text to translate' : 'Add text to explain');
+      return;
+    }
+
     setAiBusy(true);
+    setAiHelperNotice('');
     try {
-      const response = await fetch(`${API_BASE_URL}/api/ai/suggest-replies`, {
+      const response = await fetch(`${API_BASE_URL}/api/ai/assistant`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: currentUserId,
-          chatId: activeChat.id,
+          task,
           tone: aiTone,
+          targetLanguage: translateTargetLanguage,
+          prompt: prompt || undefined,
+          text: text || undefined,
+          chatId: needsChatContext && activeChat ? activeChat.id : undefined,
+          messageId: options.messageId,
+          consentToShareContext: needsChatContext ? aiConsentToShareContext : false,
         }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showToast(payload.error || 'Could not suggest replies');
+        if (payload.requiresConsent) {
+          setAiHelperVisible(true);
+        }
+        showToast(payload.error || 'Assistant request failed');
         return;
       }
-      const suggestions = (payload.suggestions ?? []) as AiSuggestionChip[];
-      setAiSuggestionChips(suggestions);
-      if (!suggestions.length) {
-        showToast('No suggestions available');
-      } else if (payload.notice) {
-        showToast(payload.notice, 3500);
+
+      const notice =
+        typeof payload.notice === 'string'
+          ? payload.notice
+          : 'Draft only — review before sending. The assistant never sends for you.';
+      setAiHelperNotice(notice);
+
+      if (task === 'suggest_reply') {
+        const suggestions = (payload.suggestions ?? []) as AiSuggestionChip[];
+        setAiSuggestionChips(suggestions);
+        if (!suggestions.length) showToast('No suggestions available');
+        else showToast(notice, 3500);
+        return;
+      }
+
+      if (task === 'summarise') {
+        const summary = (payload.summary ?? null) as ChatSummary | null;
+        setChatSummary(summary);
+        setSummaryNotice(summary?.notice || notice);
+        setSummaryVisible(true);
+        setSummaryScope('recent');
+        if (notice) showToast(notice, 4000);
+        return;
+      }
+
+      const resultText =
+        typeof payload.result === 'string'
+          ? payload.result
+          : typeof payload.translatedText === 'string'
+            ? payload.translatedText
+            : '';
+
+      if (task === 'explain') {
+        setAiHelperResult(resultText);
+        setAiHelperVisible(true);
+        if (notice) showToast(notice, 4000);
+        return;
+      }
+
+      // draft / rewrite / translate — fill composer draft only, never auto-send
+      if (resultText) {
+        setMessageDraft(resultText);
+        setAiHelperResult(resultText);
+        setAiSuggestionChips([]);
+        showToast(notice, 3500);
+      } else {
+        showToast('No draft returned');
       }
     } catch {
-      showToast('Could not suggest replies');
+      showToast('Assistant request failed');
     } finally {
       setAiBusy(false);
     }
   };
 
+  const requestSuggestedReplies = async () => {
+    await runAssistantTask('suggest_reply');
+  };
+
   const requestRewrite = async () => {
-    const text = messageDraft.trim();
-    if (!currentUserId || !text || aiBusy) return;
-    setAiBusy(true);
+    await runAssistantTask('rewrite', { text: messageDraft });
+  };
+
+  const loadBusinessAiConfig = async (userId = currentUserId) => {
+    if (!userId) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/ai/rewrite`, {
+      const response = await fetch(
+        `${API_BASE_URL}/api/ai/business?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load business AI');
+        return;
+      }
+      setBusinessAiConfig(payload.config || null);
+    } catch {
+      showToast('Could not load business AI');
+    }
+  };
+
+  const saveBusinessAiConfig = async (
+    patch: Partial<{
+      enabled: boolean;
+      policyText: string;
+      deliveryPolicy: string;
+      refundPolicy: string;
+      faq: Array<{ question: string; answer: string }>;
+    }> = {},
+  ) => {
+    if (!currentUserId) return;
+    const base = businessAiConfig;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/business`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          businessId: base?.businessId ?? null,
+          enabled: base?.enabled,
+          policyText: base?.policyText,
+          deliveryPolicy: base?.deliveryPolicy,
+          refundPolicy: base?.refundPolicy,
+          faq: base?.faq || [],
+          ...patch,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save business AI');
+        return;
+      }
+      setBusinessAiConfig(payload.config || null);
+      if (typeof patch.enabled === 'boolean') {
+        showToast(patch.enabled ? 'Business AI enabled' : 'Business AI paused');
+      } else {
+        showToast('Business AI saved');
+      }
+    } catch {
+      showToast('Could not save business AI');
+    }
+  };
+
+  const askBusinessAi = async () => {
+    const question = businessAiTestQuestion.trim();
+    if (!currentUserId || !question || businessAiBusy) return;
+    setBusinessAiBusy(true);
+    setBusinessAiAskResult(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/business/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          sellerUserId: currentUserId,
+          businessId: businessAiConfig?.businessId ?? null,
+          question,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not ask business AI');
+        return;
+      }
+      setBusinessAiAskResult({
+        answer: typeof payload.answer === 'string' ? payload.answer : '',
+        confidence: typeof payload.confidence === 'string' ? payload.confidence : undefined,
+        source: typeof payload.source === 'string' ? payload.source : undefined,
+        escalate: Boolean(payload.escalate),
+        disclosure:
+          typeof payload.disclosure === 'string'
+            ? payload.disclosure
+            : 'Automated business assistant. Answers use approved catalogue/policy data only.',
+        notice: typeof payload.notice === 'string' ? payload.notice : undefined,
+        autoSend: false,
+      });
+    } catch {
+      showToast('Could not ask business AI');
+    } finally {
+      setBusinessAiBusy(false);
+    }
+  };
+
+  const mergeMessageTranscript = (chatId: string, serverMessage: any, notice?: string) => {
+    if (!chatId || !serverMessage?.id) return;
+    reconcileIncomingMessage(chatId, serverMessage);
+    if (notice) {
+      setMessagesByChat((current) => ({
+        ...current,
+        [chatId]: (current[chatId] ?? []).map((item) =>
+          item.id === serverMessage.id ? { ...item, transcriptNotice: notice } : item,
+        ),
+      }));
+    }
+  };
+
+  const requestTranscribe = async (message: Message) => {
+    if (!currentUserId || !activeChat || message.kind !== 'voice' || message.deletedForEveryone) return;
+    if (transcribingMessageId === message.id) return;
+    setTranscribingMessageId(message.id);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}/transcribe`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (payload.message) {
+        mergeMessageTranscript(
+          activeChat.id,
+          payload.message,
+          typeof payload.notice === 'string' ? payload.notice : undefined,
+        );
+      }
+      if (!response.ok && response.status !== 503) {
+        showToast(payload.error || 'Could not transcribe voice note');
+        return;
+      }
+      if (payload.notice) {
+        showToast(payload.notice, 4000);
+      } else if (payload.needsProvider) {
+        showToast('Speech transcription provider is not configured yet.', 4000);
+      } else if (payload.transcript) {
+        showToast('Transcript ready', 2200);
+      }
+    } catch {
+      showToast('Could not transcribe voice note');
+    } finally {
+      setTranscribingMessageId(null);
+    }
+  };
+
+  const requestTranslate = async (message: Message, targetLanguage: TranslateLanguage = translateTargetLanguage) => {
+    const text = (message.text || '').trim();
+    if (!currentUserId || !activeChat || !text || message.deletedForEveryone) return;
+    if (translatingMessageId === message.id) return;
+    setTranslatingMessageId(message.id);
+    setTranslatePickerMessageId(message.id);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/translate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: currentUserId,
           text,
-          tone: aiTone,
+          targetLanguage,
+          messageId: message.id,
+          chatId: activeChat.id,
         }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        showToast(payload.error || 'Could not rewrite');
+        showToast(payload.error || 'Could not translate');
         return;
       }
-      const variants = ((payload.variants ?? []) as Array<{ id: string; text: string; tone?: AiTone }>).map(
-        (entry) => ({ id: entry.id, text: entry.text, tone: entry.tone }),
-      );
-      setAiSuggestionChips(variants);
-      if (!variants.length) {
-        showToast('No rewrite variants returned');
-      } else if (payload.notice) {
-        showToast(payload.notice, 3500);
+      const translatedText =
+        typeof payload.translatedText === 'string' ? payload.translatedText : text;
+      const notice =
+        typeof payload.notice === 'string'
+          ? payload.notice
+          : payload.needsProvider
+            ? 'Full translation needs a provider. Common phrases can still use the built-in glossary.'
+            : payload.partial
+              ? 'Partial glossary translation. Review before relying on it.'
+              : undefined;
+      setTranslationsByMessageId((current) => ({
+        ...current,
+        [message.id]: {
+          translatedText,
+          targetLanguage,
+          partial: Boolean(payload.partial),
+          needsProvider: Boolean(payload.needsProvider),
+          notice,
+          method: typeof payload.method === 'string' ? payload.method : undefined,
+        },
+      }));
+      if (notice) {
+        showToast(notice, 4000);
       }
     } catch {
-      showToast('Could not rewrite');
+      showToast('Could not translate');
     } finally {
-      setAiBusy(false);
+      setTranslatingMessageId(null);
     }
   };
 
@@ -4037,6 +4392,15 @@ function App() {
           </div>
           <div className="desktop-chat-actions">
             <button
+              className={`summarise-header-button ${aiHelperVisible ? 'active-header-action' : ''}`}
+              disabled={!currentUserId}
+              onClick={() => setAiHelperVisible((current) => !current)}
+              title="AI helper"
+              type="button"
+            >
+              AI helper
+            </button>
+            <button
               className={`summarise-header-button ${summaryVisible ? 'active-header-action' : ''}`}
               disabled={!currentUserId || summaryBusy}
               onClick={() => {
@@ -4070,6 +4434,118 @@ function App() {
             <button onClick={() => setCallSheetVisible(true)} type="button">☎</button>
           </div>
         </header>
+
+        {aiHelperVisible ? (
+          <aside className="ai-helper-panel" aria-label="AI helper">
+            <div className="ai-helper-toolbar">
+              <strong>AI helper</strong>
+              <button onClick={() => setAiHelperVisible(false)} type="button">
+                Close
+              </button>
+            </div>
+            <p className="ai-helper-disclaimer" role="note">
+              Drafts only — never auto-sent. Review before sending.
+            </p>
+            <div className="ai-helper-tasks">
+              {AI_ASSISTANT_TASKS.map((entry) => (
+                <button
+                  className={aiHelperTask === entry.id ? 'active' : ''}
+                  key={entry.id}
+                  onClick={() => setAiHelperTask(entry.id)}
+                  type="button"
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+            <label className="ai-tone-select">
+              <span>Tone</span>
+              <select
+                aria-label="Assistant tone"
+                onChange={(event) => setAiTone(event.target.value as AiTone)}
+                value={aiTone}
+              >
+                {AI_TONES.map((tone) => (
+                  <option key={tone} value={tone}>
+                    {tone}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {(aiHelperTask === 'translate') ? (
+              <label className="ai-tone-select">
+                <span>Language</span>
+                <select
+                  aria-label="Translate target language"
+                  onChange={(event) => setTranslateTargetLanguage(event.target.value as TranslateLanguage)}
+                  value={translateTargetLanguage}
+                >
+                  {TRANSLATE_LANGUAGES.map((language) => (
+                    <option key={language.id} value={language.id}>
+                      {language.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
+            <textarea
+              onChange={(event) => setAiHelperPrompt(event.target.value)}
+              placeholder={
+                aiHelperTask === 'draft'
+                  ? 'Describe what to draft…'
+                  : aiHelperTask === 'rewrite' || aiHelperTask === 'translate' || aiHelperTask === 'explain'
+                    ? 'Optional override text (defaults to composer draft)'
+                    : 'Optional prompt / focus for this chat task'
+              }
+              rows={2}
+              value={aiHelperPrompt}
+            />
+            <label className="ai-consent-row">
+              <input
+                checked={aiConsentToShareContext}
+                onChange={(event) => setAiConsentToShareContext(event.target.checked)}
+                type="checkbox"
+              />
+              <span>I consent to share this chat context with the assistant</span>
+            </label>
+            <div className="ai-helper-actions">
+              <button
+                disabled={aiBusy || !currentUserId}
+                onClick={() =>
+                  void runAssistantTask(aiHelperTask, {
+                    prompt: aiHelperPrompt,
+                    text:
+                      aiHelperTask === 'rewrite' ||
+                      aiHelperTask === 'translate' ||
+                      aiHelperTask === 'explain'
+                        ? aiHelperPrompt.trim() || messageDraft
+                        : aiHelperPrompt,
+                  })
+                }
+                type="button"
+              >
+                {aiBusy ? 'Working…' : 'Run'}
+              </button>
+              {aiHelperResult ? (
+                <button
+                  onClick={() => {
+                    setMessageDraft(aiHelperResult);
+                    showToast('Filled draft — review before sending', 3000);
+                  }}
+                  type="button"
+                >
+                  Use as draft
+                </button>
+              ) : null}
+            </div>
+            {aiHelperNotice ? (
+              <p className="ai-helper-notice" role="status">
+                {aiHelperNotice}
+              </p>
+            ) : null}
+            {aiHelperResult ? <p className="ai-helper-result">{aiHelperResult}</p> : null}
+          </aside>
+        ) : null}
 
         {summaryVisible ? (
           <aside className="chat-summary-panel" aria-label="Chat summary">
@@ -4161,10 +4637,99 @@ function App() {
               {message.kind === 'voice' ? (
                 <div className="voice-note">
                   {message.audioUrl ? <audio controls src={message.audioUrl} /> : <span>Voice note {message.durationLabel}</span>}
+                  {!message.deletedForEveryone ? (
+                    <div className="message-ai-row">
+                      <button
+                        className="message-ai-button"
+                        disabled={!currentUserId || transcribingMessageId === message.id}
+                        onClick={() => void requestTranscribe(message)}
+                        type="button"
+                      >
+                        {transcribingMessageId === message.id
+                          ? 'Transcribing…'
+                          : message.transcript || message.transcriptStatus === 'ready'
+                            ? 'Re-transcribe'
+                            : 'Transcribe'}
+                      </button>
+                    </div>
+                  ) : null}
+                  {message.transcript ? (
+                    <p className="voice-transcript">{message.transcript}</p>
+                  ) : null}
+                  {message.transcriptStatus && message.transcriptStatus !== 'ready' ? (
+                    <small className="message-ai-notice">
+                      {message.transcriptStatus === 'pending'
+                        ? 'Transcript pending…'
+                        : message.transcriptStatus === 'failed'
+                          ? 'Transcription failed.'
+                          : 'Transcript unavailable.'}
+                    </small>
+                  ) : null}
+                  {message.transcriptNotice ? (
+                    <small className="message-ai-notice" role="note">{message.transcriptNotice}</small>
+                  ) : null}
                 </div>
               ) : null}
 
               {message.kind !== 'voice' ? <p>{message.text}</p> : null}
+              {!message.deletedForEveryone
+              && message.kind !== 'voice'
+              && (message.text || '').trim() ? (
+                <div className="message-ai-row">
+                  <button
+                    className="message-ai-button"
+                    disabled={!currentUserId || translatingMessageId === message.id}
+                    onClick={() => {
+                      setTranslatePickerMessageId(message.id);
+                      void requestTranslate(
+                        message,
+                        translationsByMessageId[message.id]?.targetLanguage || translateTargetLanguage,
+                      );
+                    }}
+                    type="button"
+                  >
+                    {translatingMessageId === message.id ? 'Translating…' : 'Translate'}
+                  </button>
+                  {translatePickerMessageId === message.id || translationsByMessageId[message.id] ? (
+                    <label className="translate-lang-select">
+                      <select
+                        aria-label="Target language"
+                        onChange={(event) => {
+                          const nextLanguage = event.target.value as TranslateLanguage;
+                          setTranslateTargetLanguage(nextLanguage);
+                          void requestTranslate(message, nextLanguage);
+                        }}
+                        value={
+                          translationsByMessageId[message.id]?.targetLanguage || translateTargetLanguage
+                        }
+                      >
+                        {TRANSLATE_LANGUAGES.map((language) => (
+                          <option key={language.id} value={language.id}>
+                            {language.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+              ) : null}
+              {(() => {
+                const translation = translationsByMessageId[message.id];
+                if (!translation) return null;
+                return (
+                  <div className="message-translation">
+                    <p>{translation.translatedText}</p>
+                    {(translation.notice || translation.partial || translation.needsProvider) ? (
+                      <small className="message-ai-notice" role="note">
+                        {translation.notice
+                          || (translation.needsProvider
+                            ? 'Full translation needs a provider.'
+                            : 'Partial translation. Review before relying on it.')}
+                      </small>
+                    ) : null}
+                  </div>
+                );
+              })()}
               {(() => {
                 const warning = scamWarningsByKey[`${activeChat.id}:${message.id}`];
                 if (!warning) return null;
@@ -4199,6 +4764,14 @@ function App() {
 
         <div className="ai-composer-bar">
           <button
+            className={aiHelperVisible ? 'active' : ''}
+            disabled={!currentUserId}
+            onClick={() => setAiHelperVisible((current) => !current)}
+            type="button"
+          >
+            AI helper
+          </button>
+          <button
             disabled={aiBusy || !currentUserId}
             onClick={() => void requestSuggestedReplies()}
             type="button"
@@ -4225,6 +4798,13 @@ function App() {
             type="button"
           >
             Rewrite
+          </button>
+          <button
+            disabled={aiBusy || !messageDraft.trim() || !currentUserId}
+            onClick={() => void runAssistantTask('translate', { text: messageDraft })}
+            type="button"
+          >
+            Translate draft
           </button>
         </div>
 
@@ -4504,6 +5084,7 @@ function App() {
         { id: 'documents', label: 'Documents' },
         { id: 'broadcasts', label: 'Broadcasts' },
         { id: 'autoreplies', label: 'Auto-replies' },
+        { id: 'ai', label: 'AI assistant' },
       ];
       const consentLabel = (consent: MarketingConsent) =>
         consent === 'opted_in' ? 'Opted in' : consent === 'opted_out' ? 'Opted out' : 'Unknown';
@@ -4554,6 +5135,10 @@ function App() {
                   if (tab.id === 'autoreplies') {
                     void loadAutoReplyConfig();
                     void loadAutoReplyLogs();
+                  }
+                  if (tab.id === 'ai') {
+                    void loadBusinessAiConfig();
+                    setBusinessAiAskResult(null);
                   }
                 }}
                 type="button"
@@ -5707,6 +6292,167 @@ function App() {
                   </div>
                 </div>
               ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'ai' ? (
+            <div className="business-panel">
+              <h3>Business AI assistant</h3>
+              <p>
+                Answers use approved catalogue and policy data only. Replies are drafts — never
+                auto-sent. Escalates when data is insufficient.
+              </p>
+              {renderSettingsToggle(
+                businessAiConfig?.enabled ? 'Enabled' : 'Paused',
+                Boolean(businessAiConfig?.enabled),
+                (value) => void saveBusinessAiConfig({ enabled: value }),
+                businessAiConfig?.enabled
+                  ? 'Customers can receive automated business answers'
+                  : 'Turn on to answer from approved policies and FAQ',
+              )}
+
+              <h3>Business info</h3>
+              <textarea
+                onBlur={() =>
+                  void saveBusinessAiConfig({ policyText: businessAiConfig?.policyText || '' })
+                }
+                onChange={(event) =>
+                  setBusinessAiConfig((current) =>
+                    current
+                      ? { ...current, policyText: event.target.value }
+                      : ({ policyText: event.target.value } as BusinessAiConfig),
+                  )
+                }
+                placeholder="Hours, location, general business info…"
+                value={businessAiConfig?.policyText || ''}
+              />
+
+              <h3>Delivery policy</h3>
+              <textarea
+                onBlur={() =>
+                  void saveBusinessAiConfig({
+                    deliveryPolicy: businessAiConfig?.deliveryPolicy || '',
+                  })
+                }
+                onChange={(event) =>
+                  setBusinessAiConfig((current) =>
+                    current
+                      ? { ...current, deliveryPolicy: event.target.value }
+                      : ({ deliveryPolicy: event.target.value } as BusinessAiConfig),
+                  )
+                }
+                placeholder="Shipping timing, areas, fees…"
+                value={businessAiConfig?.deliveryPolicy || ''}
+              />
+
+              <h3>Refund policy</h3>
+              <textarea
+                onBlur={() =>
+                  void saveBusinessAiConfig({ refundPolicy: businessAiConfig?.refundPolicy || '' })
+                }
+                onChange={(event) =>
+                  setBusinessAiConfig((current) =>
+                    current
+                      ? { ...current, refundPolicy: event.target.value }
+                      : ({ refundPolicy: event.target.value } as BusinessAiConfig),
+                  )
+                }
+                placeholder="Returns and refunds…"
+                value={businessAiConfig?.refundPolicy || ''}
+              />
+
+              <h3>FAQ</h3>
+              {(businessAiConfig?.faq || []).length ? null : <p>No FAQ entries yet.</p>}
+              {(businessAiConfig?.faq || []).map((entry, index) => (
+                <div className="business-product-row" key={`${entry.question}-${index}`}>
+                  <div>
+                    <strong>{entry.question}</strong>
+                    <small>{entry.answer}</small>
+                  </div>
+                  <div className="business-product-actions">
+                    <button
+                      onClick={() => {
+                        const nextFaq = (businessAiConfig?.faq || []).filter((_, i) => i !== index);
+                        void saveBusinessAiConfig({ faq: nextFaq });
+                      }}
+                      type="button"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <input
+                onChange={(event) =>
+                  setBusinessAiFaqDraft((current) => ({ ...current, question: event.target.value }))
+                }
+                placeholder="FAQ question"
+                value={businessAiFaqDraft.question}
+              />
+              <textarea
+                onChange={(event) =>
+                  setBusinessAiFaqDraft((current) => ({ ...current, answer: event.target.value }))
+                }
+                placeholder="Approved answer"
+                value={businessAiFaqDraft.answer}
+              />
+              <button
+                onClick={() => {
+                  const question = businessAiFaqDraft.question.trim();
+                  const answer = businessAiFaqDraft.answer.trim();
+                  if (question.length < 2 || answer.length < 2) {
+                    showToast('Add a question and answer');
+                    return;
+                  }
+                  const nextFaq = [...(businessAiConfig?.faq || []), { question, answer }];
+                  void saveBusinessAiConfig({ faq: nextFaq });
+                  setBusinessAiFaqDraft({ question: '', answer: '' });
+                }}
+                type="button"
+              >
+                Add FAQ
+              </button>
+
+              <h3>Test question</h3>
+              <input
+                onChange={(event) => setBusinessAiTestQuestion(event.target.value)}
+                placeholder="Ask as a customer would…"
+                value={businessAiTestQuestion}
+              />
+              <button
+                disabled={businessAiBusy || !businessAiTestQuestion.trim() || !currentUserId}
+                onClick={() => void askBusinessAi()}
+                type="button"
+              >
+                {businessAiBusy ? 'Asking…' : 'Ask'}
+              </button>
+              {businessAiAskResult ? (
+                <div className="business-ai-result" role="status">
+                  <p className="business-ai-disclosure">
+                    {businessAiAskResult.disclosure ||
+                      'Automated business assistant. Answers use approved catalogue/policy data only.'}
+                  </p>
+                  <p>{businessAiAskResult.answer}</p>
+                  {businessAiAskResult.escalate ? (
+                    <p className="business-ai-escalate" role="alert">
+                      Escalate to a human — approved data was insufficient or sensitive.
+                    </p>
+                  ) : null}
+                  {businessAiAskResult.notice ? (
+                    <small>{businessAiAskResult.notice}</small>
+                  ) : null}
+                  {businessAiAskResult.source || businessAiAskResult.confidence ? (
+                    <small>
+                      {[businessAiAskResult.source, businessAiAskResult.confidence]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </small>
+                  ) : null}
+                </div>
+              ) : null}
+              <button onClick={() => void loadBusinessAiConfig()} type="button">
+                Refresh
+              </button>
             </div>
           ) : null}
         </>
