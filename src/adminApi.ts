@@ -496,6 +496,23 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
     });
   });
 
+  app.get('/api/admin/customers', requireAdmin, async (_req, res) => {
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const customers = await db
+      .collection('businessCustomers')
+      .find({}, { projection: { _id: 0 } })
+      .sort({ updatedAt: -1 })
+      .limit(300)
+      .toArray();
+    return res.json({
+      customers,
+      active: customers.filter((item) => !item.deletedAt).length,
+      optedIn: customers.filter((item) => item.marketingConsent === 'opted_in' && !item.deletedAt).length,
+      optedOut: customers.filter((item) => item.marketingConsent === 'opted_out' && !item.deletedAt).length,
+    });
+  });
+
   app.get('/api/admin/announcements', requireAdmin, async (_req, res) => {
     const db = await deps.getDb();
     const announcements = db ? await db.collection('announcements').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray() : [];

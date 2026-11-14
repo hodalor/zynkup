@@ -218,6 +218,39 @@ type InventoryAlert = {
   reviewedByUserId?: string | null;
 };
 
+type MarketingConsent = 'unknown' | 'opted_in' | 'opted_out';
+
+type CustomerNote = {
+  id: string;
+  text: string;
+  byUserId: string;
+  createdAt: string;
+};
+
+type BusinessCustomer = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  customerUserId?: string | null;
+  displayName: string;
+  phone?: string;
+  tags: string[];
+  notes: CustomerNote[];
+  followUpAt?: string | null;
+  followUpNote?: string;
+  marketingConsent: MarketingConsent;
+  marketingConsentUpdatedAt?: string | null;
+  orderIds: string[];
+  lastOrderAt?: string | null;
+  orderCount: number;
+  totalSpent: number;
+  currency?: string;
+  chatId?: string | null;
+  deletedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type OrderState =
   | 'pending_payment'
   | 'paid'
@@ -464,6 +497,7 @@ const seedReceipts: SaleReceipt[] = [];
 const receiptCounters: Record<string, number> = {};
 const seedInventoryMovements: InventoryMovement[] = [];
 const seedInventoryAlerts: InventoryAlert[] = [];
+const seedBusinessCustomers: BusinessCustomer[] = [];
 
 const settingsMenu = [
   'Favorites',
@@ -682,6 +716,44 @@ const stockAdjustSchema = z.object({
 
 const inventoryAlertReviewSchema = z.object({
   userId: z.string().min(1),
+});
+
+const marketingConsentSchema = z.enum(['unknown', 'opted_in', 'opted_out']);
+
+const createCustomerSchema = z.object({
+  userId: z.string().min(1),
+  customerUserId: z.string().min(1).max(80).optional().nullable(),
+  displayName: z.string().trim().min(1).max(120),
+  phone: z.string().trim().max(40).optional(),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  tags: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
+  note: z.string().trim().min(1).max(1000).optional(),
+  followUpAt: z.string().min(1).max(40).optional().nullable(),
+  followUpNote: z.string().trim().max(240).optional(),
+  chatId: z.string().min(1).max(80).optional().nullable(),
+});
+
+const updateCustomerSchema = z.object({
+  userId: z.string().min(1),
+  displayName: z.string().trim().min(1).max(120).optional(),
+  phone: z.string().trim().max(40).optional(),
+  tags: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
+  followUpAt: z.string().min(1).max(40).nullable().optional(),
+  followUpNote: z.string().trim().max(240).optional(),
+  marketingConsent: marketingConsentSchema.optional(),
+  chatId: z.string().min(1).max(80).optional().nullable(),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+});
+
+const customerNoteSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().min(1).max(1000),
+});
+
+const customerPreferenceSchema = z.object({
+  userId: z.string().min(1),
+  customerId: z.string().min(1),
+  marketingConsent: z.enum(['opted_in', 'opted_out']),
 });
 
 const resolveCatalogStatus = (
@@ -3229,7 +3301,8 @@ const applyInventoryChange = async (params: {
   lowStockThreshold?: number;
 }) => {
   const { item, delta, kind, reason, byUserId, orderId, allowNegative, lowStockThreshold } = params;
-  if (item.trackStock === false) {
+  const tracksStock = item.trackStock !== false;
+  if (!tracksStock) {
     return { item, movement: null as InventoryMovement | null, alert: null as InventoryAlert | null };
   }
   const stockBefore = Number(item.stockQuantity || 0);
@@ -3242,7 +3315,7 @@ const applyInventoryChange = async (params: {
     ...item,
     stockQuantity: stockAfter,
     lowStockThreshold: lowStockThreshold ?? item.lowStockThreshold ?? 2,
-    status: resolveCatalogStatus(item.status, stockAfter, item.trackStock !== false),
+    status: resolveCatalogStatus(item.status, stockAfter, tracksStock),
     availabilityUpdatedAt: now,
     updatedAt: now,
   };
@@ -3265,6 +3338,154 @@ const applyInventoryChange = async (params: {
   io.emit('catalog:itemUpdated', next);
   const alert = await maybeCreateLowStockAlert(next);
   return { item: next, movement, alert };
+};
+
+const readBusinessCustomers = async () => {
+  const db = await getDb();
+  if (!db) return [...seedBusinessCustomers];
+  return db
+    .collection<BusinessCustomer>('businessCustomers')
+    .find({}, { projection: { _id: 0 }, sort: { updatedAt: -1 } })
+    .toArray();
+};
+
+const saveBusinessCustomer = async (customer: BusinessCustomer) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedBusinessCustomers.findIndex((entry) => entry.id === customer.id);
+    if (index >= 0) seedBusinessCustomers[index] = customer;
+    else seedBusinessCustomers.unshift(customer);
+    return customer;
+  }
+  await db.collection<BusinessCustomer>('businessCustomers').updateOne(
+    { id: customer.id },
+    { $set: customer },
+    { upsert: true },
+  );
+  return customer;
+};
+
+const canManageCustomers = async (
+  sellerUserId: string,
+  actorUserId: string,
+  businessId?: string | null,
+) => {
+  if (!sellerUserId || !actorUserId) return false;
+  if (sellerUserId === actorUserId) return true;
+  const businesses = await businessesForUser(actorUserId);
+  if (businessId) {
+    return businesses.some((business) => business.id === businessId);
+  }
+  return businesses.some((business) => business.ownerUserId === sellerUserId);
+};
+
+const customerPublicView = (customer: BusinessCustomer) => ({
+  ...customer,
+  notes: customer.notes.slice(0, 50),
+  orderIds: customer.orderIds.slice(0, 40),
+});
+
+const findMatchingCustomer = (
+  customers: BusinessCustomer[],
+  params: { sellerUserId: string; customerUserId?: string | null; phone?: string; businessId?: string | null },
+) => {
+  const active = customers.filter(
+    (entry) => entry.sellerUserId === params.sellerUserId && !entry.deletedAt,
+  );
+  if (params.customerUserId) {
+    const byUser = active.find((entry) => entry.customerUserId === params.customerUserId);
+    if (byUser) return byUser;
+  }
+  if (params.phone) {
+    const normalized = params.phone.replace(/\D/g, '');
+    if (normalized) {
+      const byPhone = active.find(
+        (entry) => (entry.phone || '').replace(/\D/g, '') === normalized,
+      );
+      if (byPhone) return byPhone;
+    }
+  }
+  return null;
+};
+
+const ensureCustomerFromOrder = async (order: CommerceOrder) => {
+  const [customers, users, allOrders] = await Promise.all([
+    readBusinessCustomers(),
+    readUsers(),
+    readOrders(),
+  ]);
+  const existing = findMatchingCustomer(customers, {
+    sellerUserId: order.sellerUserId,
+    customerUserId: order.buyerUserId,
+    businessId: order.businessId,
+  });
+  const now = new Date().toISOString();
+  const buyer = users.find((user) => user.id === order.buyerUserId);
+  const relatedOrders = allOrders.filter(
+    (entry) => entry.sellerUserId === order.sellerUserId && entry.buyerUserId === order.buyerUserId,
+  );
+  const paidOrders = relatedOrders.filter((entry) =>
+    ['paid', 'processing', 'dispatched', 'completed'].includes(entry.state),
+  );
+  const orderIds = relatedOrders
+    .slice()
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map((entry) => entry.id)
+    .slice(0, 40);
+  const totalSpent = Number(
+    paidOrders.reduce((sum, entry) => sum + Number(entry.totalAmount || 0), 0).toFixed(2),
+  );
+  const lastOrderAt = relatedOrders
+    .slice()
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]?.createdAt || order.createdAt;
+
+  if (existing) {
+    const next: BusinessCustomer = {
+      ...existing,
+      businessId: existing.businessId || order.businessId || null,
+      customerUserId: existing.customerUserId || order.buyerUserId,
+      displayName: existing.displayName || buyer?.name || 'Customer',
+      phone: existing.phone || buyer?.phone || '',
+      chatId: existing.chatId || order.chatId || null,
+      orderIds,
+      lastOrderAt,
+      orderCount: relatedOrders.length,
+      totalSpent,
+      currency: order.currency || existing.currency,
+      updatedAt: now,
+      deletedAt: null,
+    };
+    await saveBusinessCustomer(next);
+    io.to(`user:${order.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(next) });
+    return next;
+  }
+
+  const created: BusinessCustomer = {
+    id: `cust${Date.now()}`,
+    sellerUserId: order.sellerUserId,
+    businessId: order.businessId || null,
+    customerUserId: order.buyerUserId,
+    displayName: buyer?.name || 'Customer',
+    phone: buyer?.phone || '',
+    tags: [],
+    notes: [],
+    followUpAt: null,
+    followUpNote: '',
+    marketingConsent: 'unknown',
+    marketingConsentUpdatedAt: null,
+    orderIds,
+    lastOrderAt,
+    orderCount: relatedOrders.length || 1,
+    totalSpent,
+    currency: order.currency,
+    chatId: order.chatId || null,
+    deletedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveBusinessCustomer(created);
+  io.to(`user:${order.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(created) });
+  return created;
 };
 
 const persistCall = async (call: Call) => {
@@ -4637,8 +4858,8 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ error: 'You cannot order your own product.' });
   }
   const quantity = parseResult.data.quantity;
-  if (item.trackStock !== false && item.stockQuantity < quantity) {
-    return res.status(409).json({ error: `Only ${item.stockQuantity} left in stock.` });
+  if (item.trackStock !== false && availableStock(item) < quantity) {
+    return res.status(409).json({ error: `Only ${availableStock(item)} left in stock.` });
   }
   const selections = parseResult.data.variantSelections || [];
   for (const selection of selections) {
@@ -4674,6 +4895,7 @@ app.post('/api/orders', async (req, res) => {
     updatedAt: now,
   };
   await saveOrder(order);
+  void ensureCustomerFromOrder(order);
   io.to(`user:${order.sellerUserId}`).emit('order:created', { order });
   io.to(`user:${order.buyerUserId}`).emit('order:created', { order });
   void recordAdminEvent(getDb, {
@@ -4735,25 +4957,35 @@ app.patch('/api/orders/:orderId', async (req, res) => {
   let issuedReceipt: SaleReceipt | null = null;
   if (nextState === 'paid' && order.state === 'pending_payment') {
     const catalogItem = (await readCatalogItems()).find((entry) => entry.id === order.items[0]?.catalogItemId);
-    const shouldTrackStock = catalogItem ? catalogItem.trackStock !== false : false;
-    if (catalogItem && shouldTrackStock) {
+    if (catalogItem && catalogItem.trackStock !== false) {
       const qty = order.items[0]?.quantity || 1;
-      const nextStock = Math.max(0, (catalogItem.stockQuantity || 0) - qty);
-      const stockUpdated: CatalogItem = {
-        ...catalogItem,
-        stockQuantity: nextStock,
-        status: resolveCatalogStatus(catalogItem.status, nextStock, shouldTrackStock),
-        availabilityUpdatedAt: now,
-        updatedAt: now,
-      };
-      const db = await getDb();
-      if (!db) {
-        const index = seedCatalogItems.findIndex((entry) => entry.id === stockUpdated.id);
-        if (index >= 0) seedCatalogItems[index] = stockUpdated;
-      } else {
-        await collectionsFor(db).catalogItems.updateOne({ id: stockUpdated.id }, { $set: stockUpdated });
+      const alreadySold = (await (async () => {
+        const db = await getDb();
+        if (!db) {
+          return seedInventoryMovements.some(
+            (movement) => movement.orderId === order.id && movement.kind === 'sale',
+          );
+        }
+        const existing = await db.collection('inventoryMovements').findOne({ orderId: order.id, kind: 'sale' });
+        return Boolean(existing);
+      })());
+      if (!alreadySold) {
+        if (availableStock(catalogItem) < qty) {
+          return res.status(409).json({ error: `Only ${availableStock(catalogItem)} left in stock.` });
+        }
+        try {
+          await applyInventoryChange({
+            item: catalogItem,
+            delta: -qty,
+            kind: 'sale',
+            reason: `Sale for order ${order.id}`,
+            byUserId: parseResult.data.userId,
+            orderId: order.id,
+          });
+        } catch (error) {
+          return res.status(409).json({ error: error instanceof Error ? error.message : 'Stock update failed.' });
+        }
       }
-      io.emit('catalog:itemUpdated', stockUpdated);
     }
     const receiptResult = await issueSaleReceiptForOrder(
       updated,
@@ -4781,10 +5013,34 @@ app.patch('/api/orders/:orderId', async (req, res) => {
       io.to(`user:${order.sellerUserId}`).emit('receipt:created', { receipt: refundReceipt });
       io.to(`user:${order.buyerUserId}`).emit('receipt:created', { receipt: refundReceipt });
     }
+    const soldItem = (await readCatalogItems()).find((entry) => entry.id === order.items[0]?.catalogItemId);
+    if (soldItem && soldItem.trackStock !== false) {
+      const qty = order.items[0]?.quantity || 1;
+      const alreadyReturned = (await (async () => {
+        const db = await getDb();
+        if (!db) {
+          return seedInventoryMovements.some(
+            (movement) => movement.orderId === order.id && movement.kind === 'return',
+          );
+        }
+        return Boolean(await db.collection('inventoryMovements').findOne({ orderId: order.id, kind: 'return' }));
+      })());
+      if (!alreadyReturned) {
+        await applyInventoryChange({
+          item: soldItem,
+          delta: qty,
+          kind: 'return',
+          reason: `Return for refunded order ${order.id}`,
+          byUserId: parseResult.data.userId,
+          orderId: order.id,
+        }).catch(() => undefined);
+      }
+    }
     await saveOrder(finalOrder);
   } else {
     await saveOrder(finalOrder);
   }
+  void ensureCustomerFromOrder(finalOrder);
   io.to(`user:${finalOrder.sellerUserId}`).emit('order:updated', { order: finalOrder });
   io.to(`user:${finalOrder.buyerUserId}`).emit('order:updated', { order: finalOrder });
   return res.json({ order: finalOrder, receipt: issuedReceipt });
@@ -4903,44 +5159,428 @@ app.patch('/api/catalog/:itemId', async (req, res) => {
     return res.status(404).json({ error: 'Catalog item not found' });
   }
 
-  const nextStock = parseResult.data.stockQuantity ?? existing.stockQuantity;
   const nextTrack = parseResult.data.trackStock ?? existing.trackStock !== false;
-  const nextStatus = resolveCatalogStatus(
-    parseResult.data.status ?? existing.status,
-    nextStock,
-    nextTrack,
-  );
-  const stockChanged = parseResult.data.stockQuantity != null
-    || parseResult.data.trackStock != null
-    || parseResult.data.status != null;
-  const updated: CatalogItem = {
+  const stockDeltaRequested = parseResult.data.stockQuantity != null
+    ? Number(parseResult.data.stockQuantity) - Number(existing.stockQuantity || 0)
+    : 0;
+  let updated: CatalogItem = {
     ...existing,
     ...parseResult.data,
-    stockQuantity: nextStock,
     trackStock: nextTrack,
-    status: nextStatus,
     variants: parseResult.data.variants ?? existing.variants ?? [],
-    availabilityUpdatedAt: stockChanged
-      ? new Date().toISOString()
-      : (existing.availabilityUpdatedAt || existing.updatedAt),
-    isPublic: nextStatus === 'archived' || nextStatus === 'draft'
-      ? false
-      : (parseResult.data.isPublic == null ? existing.isPublic : Boolean(parseResult.data.isPublic)),
+    lowStockThreshold: parseResult.data.lowStockThreshold ?? existing.lowStockThreshold ?? 2,
+    costPrice: parseResult.data.costPrice === undefined ? existing.costPrice : parseResult.data.costPrice,
     updatedAt: new Date().toISOString(),
   };
-
-  const db = await getDb();
-  if (!db) {
-    const index = seedCatalogItems.findIndex((item) => item.id === updated.id);
-    if (index >= 0) {
-      seedCatalogItems[index] = updated;
+  if (stockDeltaRequested !== 0 && nextTrack) {
+    try {
+      const result = await applyInventoryChange({
+        item: existing,
+        delta: stockDeltaRequested,
+        kind: 'adjustment',
+        reason: 'Catalog stock edit',
+        byUserId: typeof req.body?.userId === 'string' ? req.body.userId : existing.sellerId,
+        lowStockThreshold: parseResult.data.lowStockThreshold,
+      });
+      updated = {
+        ...result.item,
+        ...parseResult.data,
+        stockQuantity: result.item.stockQuantity,
+        trackStock: nextTrack,
+        status: resolveCatalogStatus(
+          parseResult.data.status ?? result.item.status,
+          result.item.stockQuantity,
+          nextTrack,
+        ),
+        variants: parseResult.data.variants ?? result.item.variants ?? [],
+        isPublic: (parseResult.data.status ?? result.item.status) === 'archived'
+          || (parseResult.data.status ?? result.item.status) === 'draft'
+          ? false
+          : (parseResult.data.isPublic == null ? result.item.isPublic : Boolean(parseResult.data.isPublic)),
+        updatedAt: new Date().toISOString(),
+      };
+      await persistCatalogItemUpdate(updated);
+      io.emit('catalog:itemUpdated', updated);
+      return res.json({ item: updated, movement: result.movement, alert: result.alert });
+    } catch (error) {
+      return res.status(409).json({ error: error instanceof Error ? error.message : 'Stock update failed.' });
     }
-  } else {
-    await collectionsFor(db).catalogItems.updateOne({ id: updated.id }, { $set: updated });
   }
-
+  updated = {
+    ...updated,
+    stockQuantity: parseResult.data.stockQuantity ?? existing.stockQuantity,
+    status: resolveCatalogStatus(
+      parseResult.data.status ?? existing.status,
+      parseResult.data.stockQuantity ?? existing.stockQuantity,
+      nextTrack,
+    ),
+    availabilityUpdatedAt: parseResult.data.stockQuantity != null || parseResult.data.trackStock != null || parseResult.data.status != null
+      ? new Date().toISOString()
+      : (existing.availabilityUpdatedAt || existing.updatedAt),
+    isPublic: (parseResult.data.status ?? existing.status) === 'archived'
+      || (parseResult.data.status ?? existing.status) === 'draft'
+      ? false
+      : (parseResult.data.isPublic == null ? existing.isPublic : Boolean(parseResult.data.isPublic)),
+  };
+  await persistCatalogItemUpdate(updated);
+  if (parseResult.data.lowStockThreshold != null || parseResult.data.stockQuantity != null) {
+    await maybeCreateLowStockAlert(updated);
+  }
   io.emit('catalog:itemUpdated', updated);
   return res.json({ item: updated });
+});
+
+app.post('/api/catalog/:itemId/stock-adjust', async (req, res) => {
+  const parseResult = stockAdjustSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Enter a stock change and reason.' });
+  }
+  const item = (await readCatalogItems()).find((entry) => entry.id === req.params.itemId);
+  if (!item) return res.status(404).json({ error: 'Product not found' });
+  if (item.sellerId !== parseResult.data.userId) {
+    const business = item.businessId
+      ? (await readBusinesses()).find((entry) => entry.id === item.businessId)
+      : null;
+    const role = business ? businessRoleFor(business, parseResult.data.userId) : null;
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Only the seller or a manager can adjust stock.' });
+    }
+  }
+  try {
+    const result = await applyInventoryChange({
+      item,
+      delta: parseResult.data.delta,
+      kind: parseResult.data.delta > 0 ? 'receipt' : 'adjustment',
+      reason: parseResult.data.reason,
+      byUserId: parseResult.data.userId,
+      lowStockThreshold: parseResult.data.lowStockThreshold,
+    });
+    return res.json({ item: result.item, movement: result.movement, alert: result.alert });
+  } catch (error) {
+    return res.status(409).json({ error: error instanceof Error ? error.message : 'Stock update failed.' });
+  }
+});
+
+app.get('/api/catalog/:itemId/movements', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const item = (await readCatalogItems()).find((entry) => entry.id === req.params.itemId);
+  if (!item) return res.status(404).json({ error: 'Product not found' });
+  if (userId && item.sellerId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this inventory ledger.' });
+  }
+  const db = await getDb();
+  const movements = db
+    ? await db.collection('inventoryMovements').find({ catalogItemId: item.id }, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(100).toArray()
+    : seedInventoryMovements.filter((movement) => movement.catalogItemId === item.id);
+  return res.json({ movements });
+});
+
+app.get('/api/inventory/alerts', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const alerts = (await readInventoryAlerts()).filter((alert) => alert.sellerUserId === userId);
+  return res.json({
+    alerts,
+    open: alerts.filter((alert) => alert.state === 'open'),
+  });
+});
+
+app.post('/api/inventory/alerts/:alertId/review', async (req, res) => {
+  const parseResult = inventoryAlertReviewSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+  const alert = (await readInventoryAlerts()).find((entry) => entry.id === req.params.alertId);
+  if (!alert) return res.status(404).json({ error: 'Alert not found' });
+  if (alert.sellerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You cannot review this alert.' });
+  }
+  const updated: InventoryAlert = {
+    ...alert,
+    state: 'reviewed',
+    reviewedAt: new Date().toISOString(),
+    reviewedByUserId: parseResult.data.userId,
+  };
+  await saveInventoryAlert(updated);
+  return res.json({ alert: updated });
+});
+
+app.get('/api/customers', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  const tag = typeof req.query.tag === 'string' ? req.query.tag.trim().toLowerCase() : '';
+  const followUpDue = req.query.followUpDue === '1' || req.query.followUpDue === 'true';
+  const includeDeleted = req.query.includeDeleted === '1' || req.query.includeDeleted === 'true';
+  const now = Date.now();
+  let customers = (await readBusinessCustomers()).filter((entry) => entry.sellerUserId === userId);
+  if (!includeDeleted) customers = customers.filter((entry) => !entry.deletedAt);
+  if (tag) {
+    customers = customers.filter((entry) =>
+      entry.tags.some((value) => value.toLowerCase() === tag),
+    );
+  }
+  if (followUpDue) {
+    customers = customers.filter(
+      (entry) => entry.followUpAt && new Date(entry.followUpAt).getTime() <= now,
+    );
+  }
+  if (q) {
+    customers = customers.filter((entry) => {
+      const haystack = `${entry.displayName} ${entry.phone || ''} ${entry.tags.join(' ')} ${entry.notes.map((note) => note.text).join(' ')}`.toLowerCase();
+      return haystack.includes(q);
+    });
+  }
+  customers.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+  return res.json({
+    customers: customers.map(customerPublicView),
+    dueFollowUps: customers.filter(
+      (entry) => entry.followUpAt && new Date(entry.followUpAt).getTime() <= now,
+    ).length,
+    marketingEligible: customers.filter((entry) => entry.marketingConsent === 'opted_in').length,
+  });
+});
+
+app.post('/api/customers', async (req, res) => {
+  const parseResult = createCustomerSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Name is required for a customer record.' });
+  }
+  const actorUserId = parseResult.data.userId;
+  const customers = await readBusinessCustomers();
+  const matched = findMatchingCustomer(customers, {
+    sellerUserId: actorUserId,
+    customerUserId: parseResult.data.customerUserId,
+    phone: parseResult.data.phone,
+    businessId: parseResult.data.businessId,
+  });
+  const now = new Date().toISOString();
+  if (matched) {
+    const next: BusinessCustomer = {
+      ...matched,
+      displayName: parseResult.data.displayName || matched.displayName,
+      phone: parseResult.data.phone || matched.phone || '',
+      businessId: parseResult.data.businessId ?? matched.businessId ?? null,
+      customerUserId: parseResult.data.customerUserId || matched.customerUserId || null,
+      tags: parseResult.data.tags?.length
+        ? Array.from(new Set([...(matched.tags || []), ...parseResult.data.tags])).slice(0, 20)
+        : matched.tags,
+      followUpAt: parseResult.data.followUpAt === undefined ? matched.followUpAt : parseResult.data.followUpAt,
+      followUpNote: parseResult.data.followUpNote ?? matched.followUpNote,
+      chatId: parseResult.data.chatId ?? matched.chatId ?? null,
+      deletedAt: null,
+      updatedAt: now,
+    };
+    if (parseResult.data.note) {
+      next.notes = [
+        {
+          id: `note${Date.now()}`,
+          text: parseResult.data.note,
+          byUserId: actorUserId,
+          createdAt: now,
+        },
+        ...matched.notes,
+      ].slice(0, 100);
+    }
+    await saveBusinessCustomer(next);
+    io.to(`user:${actorUserId}`).emit('customer:updated', { customer: customerPublicView(next) });
+    return res.json({ customer: customerPublicView(next), existing: true });
+  }
+
+  const created: BusinessCustomer = {
+    id: `cust${Date.now()}`,
+    sellerUserId: actorUserId,
+    businessId: parseResult.data.businessId || null,
+    customerUserId: parseResult.data.customerUserId || null,
+    displayName: parseResult.data.displayName,
+    phone: parseResult.data.phone || '',
+    tags: parseResult.data.tags || [],
+    notes: parseResult.data.note
+      ? [{ id: `note${Date.now()}`, text: parseResult.data.note, byUserId: actorUserId, createdAt: now }]
+      : [],
+    followUpAt: parseResult.data.followUpAt || null,
+    followUpNote: parseResult.data.followUpNote || '',
+    marketingConsent: 'unknown',
+    marketingConsentUpdatedAt: null,
+    orderIds: [],
+    lastOrderAt: null,
+    orderCount: 0,
+    totalSpent: 0,
+    currency: '',
+    chatId: parseResult.data.chatId || null,
+    deletedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveBusinessCustomer(created);
+  io.to(`user:${actorUserId}`).emit('customer:updated', { customer: customerPublicView(created) });
+  return res.status(201).json({ customer: customerPublicView(created) });
+});
+
+app.get('/api/customers/:customerId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const customer = (await readBusinessCustomers()).find((entry) => entry.id === req.params.customerId);
+  if (!customer || customer.deletedAt) return res.status(404).json({ error: 'Customer not found' });
+  if (userId && !(await canManageCustomers(customer.sellerUserId, userId, customer.businessId))) {
+    return res.status(403).json({ error: 'You cannot view this customer record.' });
+  }
+  const orders = customer.customerUserId
+    ? (await readOrders()).filter(
+      (order) =>
+        order.sellerUserId === customer.sellerUserId
+        && order.buyerUserId === customer.customerUserId,
+    )
+    : (await readOrders()).filter((order) => customer.orderIds.includes(order.id));
+  return res.json({
+    customer: customerPublicView(customer),
+    orders: orders
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 40)
+      .map((order) => ({
+        id: order.id,
+        state: order.state,
+        totalAmount: order.totalAmount,
+        currency: order.currency,
+        createdAt: order.createdAt,
+        itemTitle: order.items[0]?.title || 'Order',
+      })),
+  });
+});
+
+app.patch('/api/customers/:customerId', async (req, res) => {
+  const parseResult = updateCustomerSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid customer update.' });
+  }
+  const customer = (await readBusinessCustomers()).find((entry) => entry.id === req.params.customerId);
+  if (!customer || customer.deletedAt) return res.status(404).json({ error: 'Customer not found' });
+  if (!(await canManageCustomers(customer.sellerUserId, parseResult.data.userId, customer.businessId))) {
+    return res.status(403).json({ error: 'You cannot edit this customer record.' });
+  }
+  // Staff cannot invent marketing opt-in; only opted_out / unknown (or keep existing opted_in).
+  let nextConsent = customer.marketingConsent;
+  let consentAt = customer.marketingConsentUpdatedAt || null;
+  if (parseResult.data.marketingConsent) {
+    if (parseResult.data.marketingConsent === 'opted_in' && customer.marketingConsent !== 'opted_in') {
+      return res.status(400).json({
+        error: 'Customers must opt in themselves. You can only record opted out or unknown here.',
+      });
+    }
+    nextConsent = parseResult.data.marketingConsent;
+    consentAt = new Date().toISOString();
+  }
+  const now = new Date().toISOString();
+  const updated: BusinessCustomer = {
+    ...customer,
+    displayName: parseResult.data.displayName ?? customer.displayName,
+    phone: parseResult.data.phone ?? customer.phone,
+    tags: parseResult.data.tags ?? customer.tags,
+    followUpAt: parseResult.data.followUpAt === undefined ? customer.followUpAt : parseResult.data.followUpAt,
+    followUpNote: parseResult.data.followUpNote ?? customer.followUpNote,
+    marketingConsent: nextConsent,
+    marketingConsentUpdatedAt: consentAt,
+    chatId: parseResult.data.chatId === undefined ? customer.chatId : parseResult.data.chatId,
+    businessId: parseResult.data.businessId === undefined ? customer.businessId : parseResult.data.businessId,
+    updatedAt: now,
+  };
+  await saveBusinessCustomer(updated);
+  io.to(`user:${customer.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(updated) });
+  return res.json({ customer: customerPublicView(updated) });
+});
+
+app.post('/api/customers/:customerId/notes', async (req, res) => {
+  const parseResult = customerNoteSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Write a short note.' });
+  }
+  const customer = (await readBusinessCustomers()).find((entry) => entry.id === req.params.customerId);
+  if (!customer || customer.deletedAt) return res.status(404).json({ error: 'Customer not found' });
+  if (!(await canManageCustomers(customer.sellerUserId, parseResult.data.userId, customer.businessId))) {
+    return res.status(403).json({ error: 'You cannot add notes to this customer.' });
+  }
+  const now = new Date().toISOString();
+  const note: CustomerNote = {
+    id: `note${Date.now()}`,
+    text: parseResult.data.text,
+    byUserId: parseResult.data.userId,
+    createdAt: now,
+  };
+  const updated: BusinessCustomer = {
+    ...customer,
+    notes: [note, ...customer.notes].slice(0, 100),
+    updatedAt: now,
+  };
+  await saveBusinessCustomer(updated);
+  io.to(`user:${customer.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(updated) });
+  return res.status(201).json({ customer: customerPublicView(updated), note });
+});
+
+app.delete('/api/customers/:customerId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : String(req.body?.userId || '');
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const customer = (await readBusinessCustomers()).find((entry) => entry.id === req.params.customerId);
+  if (!customer || customer.deletedAt) return res.status(404).json({ error: 'Customer not found' });
+  if (customer.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'Only the business owner can delete customer records.' });
+  }
+  const now = new Date().toISOString();
+  const updated: BusinessCustomer = {
+    ...customer,
+    deletedAt: now,
+    updatedAt: now,
+    followUpAt: null,
+  };
+  await saveBusinessCustomer(updated);
+  io.to(`user:${customer.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(updated) });
+  return res.json({ customer: customerPublicView(updated), deleted: true });
+});
+
+app.get('/api/me/customer-preferences', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const records = (await readBusinessCustomers()).filter(
+    (entry) => entry.customerUserId === userId && !entry.deletedAt,
+  );
+  return res.json({
+    preferences: records.map((entry) => ({
+      customerId: entry.id,
+      sellerUserId: entry.sellerUserId,
+      businessId: entry.businessId || null,
+      marketingConsent: entry.marketingConsent,
+      marketingConsentUpdatedAt: entry.marketingConsentUpdatedAt || null,
+      displayNameOnSellerSide: entry.displayName,
+    })),
+  });
+});
+
+app.patch('/api/me/customer-preferences', async (req, res) => {
+  const parseResult = customerPreferenceSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose opt in or opt out.' });
+  }
+  const customer = (await readBusinessCustomers()).find((entry) => entry.id === parseResult.data.customerId);
+  if (!customer || customer.deletedAt) return res.status(404).json({ error: 'Record not found' });
+  if (customer.customerUserId !== parseResult.data.userId) {
+    return res.status(403).json({ error: 'You can only change your own marketing preferences.' });
+  }
+  const now = new Date().toISOString();
+  const updated: BusinessCustomer = {
+    ...customer,
+    marketingConsent: parseResult.data.marketingConsent,
+    marketingConsentUpdatedAt: now,
+    updatedAt: now,
+  };
+  await saveBusinessCustomer(updated);
+  io.to(`user:${customer.sellerUserId}`).emit('customer:updated', { customer: customerPublicView(updated) });
+  return res.json({
+    preference: {
+      customerId: updated.id,
+      sellerUserId: updated.sellerUserId,
+      marketingConsent: updated.marketingConsent,
+      marketingConsentUpdatedAt: updated.marketingConsentUpdatedAt,
+    },
+  });
 });
 
 app.post('/api/catalog/:itemId/feature', async (req, res) => {
