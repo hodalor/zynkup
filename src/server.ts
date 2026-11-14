@@ -84,6 +84,8 @@ type Message = {
   durationSeconds?: number;
   deliveredAt?: string;
   readAt?: string;
+  /** Set when the sender edits text/emoji within the edit window. */
+  editedAt?: string;
   replyToMessageId?: string;
   replyPreview?: string;
   catalogItemId?: string;
@@ -841,6 +843,13 @@ const clearChatUnreadSchema = z.object({
 const deleteMessageSchema = z.object({
   userId: z.string().min(1),
   scope: z.enum(['me', 'everyone']).default('me'),
+});
+
+/** WhatsApp-style edit: sender only, text/emoji, within 15 minutes of sentAt. */
+const MESSAGE_EDIT_WINDOW_MS = 15 * 60 * 1000;
+const editMessageSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().min(1).max(4000),
 });
 
 const revealAuthorSchema = z.object({
@@ -9865,6 +9874,83 @@ app.post('/api/chats/:chatId/read', async (req, res) => {
   return res.json({
     chat: { ...chat, unreadCount: chat.unreadByUser?.[parseResult.data.userId] ?? 0 },
   });
+});
+
+app.patch('/api/messages/:messageId', async (req, res) => {
+  const parseResult = editMessageSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid edit payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+
+  const { userId, text } = parseResult.data;
+  const messages = await readMessages();
+  const current = messages.find((item) => item.id === req.params.messageId);
+  if (!current) {
+    return res.status(404).json({ error: 'Message not found' });
+  }
+
+  if (current.senderId !== userId) {
+    return res.status(403).json({ error: 'Only the original sender can edit this message' });
+  }
+  if (current.deletedForEveryone) {
+    return res.status(403).json({ error: 'Deleted messages cannot be edited' });
+  }
+  if (current.kind !== 'text' && current.kind !== 'emoji') {
+    return res.status(403).json({ error: 'Only text and emoji messages can be edited' });
+  }
+
+  const sentAtMs = Date.parse(current.sentAt);
+  if (!Number.isFinite(sentAtMs) || Date.now() - sentAtMs > MESSAGE_EDIT_WINDOW_MS) {
+    return res.status(403).json({
+      error: 'Messages can only be edited within 15 minutes of sending',
+    });
+  }
+
+  const editedAt = new Date().toISOString();
+  const nextMessage: Message = {
+    ...current,
+    text: text.trim(),
+    editedAt,
+    // clientRef must stay stable for idempotent client reconciliation
+    clientRef: current.clientRef,
+  };
+
+  await saveMessageUpdate(nextMessage);
+
+  const chat = (await readChats()).find((item) => item.id === nextMessage.chatId);
+  if (chat) {
+    const chatMessages = messages
+      .map((entry) => (entry.id === nextMessage.id ? nextMessage : entry))
+      .filter((entry) => entry.chatId === chat.id)
+      .sort((a, b) => a.sentAt.localeCompare(b.sentAt));
+    const latest = chatMessages[chatMessages.length - 1];
+    if (latest?.id === nextMessage.id) {
+      const preview = nextMessage.anonymous ? 'Anonymous message' : nextMessage.text;
+      // Refresh list preview without bumping unread counts.
+      await updateChatAfterMessage(chat.id, preview, chat.updatedAt);
+      const refreshed = (await readChats()).find((item) => item.id === chat.id);
+      if (refreshed) {
+        for (const participantId of refreshed.participants) {
+          io.emit('chat:updated', {
+            ...refreshed,
+            unreadCount: refreshed.unreadByUser?.[participantId] ?? 0,
+            viewerUserId: participantId,
+          });
+        }
+      }
+    }
+
+    for (const participantId of chat.participants) {
+      io.to(`user:${participantId}`).emit('message:updated', {
+        message: presentMessage(nextMessage, participantId),
+      });
+    }
+  }
+
+  return res.json({ message: presentMessage(nextMessage, userId) });
 });
 
 app.delete('/api/messages/:messageId', async (req, res) => {
