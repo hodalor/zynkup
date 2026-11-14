@@ -130,12 +130,14 @@ const CAN_USE_NATIVE_WEBRTC = Boolean(
 );
 
 const AnimatedText = Animated.createAnimatedComponent(Text);
-const tabs = ['Chats', 'Calls', 'Status', 'Pay', 'Business'];
+const tabs = ['Chats', 'Explore', 'Pay', 'Business', 'Profile'];
 const SETTINGS_STORAGE_KEY = 'zynkup-mobile-app-settings';
 const FAVORITES_STORAGE_KEY = 'zynkup-mobile-favorite-chats';
 const MUTED_CHATS_STORAGE_KEY = 'zynkup-mobile-muted-chats';
 const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-mobile-archived-chats';
+const LOCKED_CHATS_STORAGE_KEY = 'zynkup-mobile-locked-chats';
 const APP_LOCK_PIN_KEY = 'zynkup-mobile-app-lock-pin';
+const DISMISSED_CARDS_KEY = 'zynkup-mobile-dismissed-cards';
 const ACCOUNT_STORAGE_KEY = 'zynkup-mobile-account';
 const OUTBOX_STORAGE_KEY = 'zynkup-mobile-outbox';
 const SEEN_STATUS_KEY = 'zynkup-seen-statuses';
@@ -154,6 +156,9 @@ const DEFAULT_APP_SETTINGS = {
   profilePhotoPrivacy: 'everyone',
   aboutPrivacy: 'everyone',
   statusPrivacy: 'contacts',
+  typingPrivacy: 'everyone',
+  callPrivacy: 'everyone',
+  groupInvitePrivacy: 'everyone',
   readReceiptsEnabled: true,
   appLockEnabled: false,
 };
@@ -162,7 +167,7 @@ const SETTINGS_MENU = [
   { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, broadcast', icon: '⌂' },
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations', icon: '▤' },
   { id: 'account', title: 'Account', subtitle: 'Security, phone number, delete account', icon: '◎' },
-  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, status', icon: '◌' },
+  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, lock, block, disappearing', icon: '◌' },
   { id: 'chats', title: 'Chats', subtitle: 'Theme, media, enter is send', icon: '◫' },
   { id: 'notifications', title: 'Notifications', subtitle: 'Message alerts and previews', icon: '◉' },
   { id: 'storage', title: 'Storage and data', subtitle: 'Network usage and cache', icon: '▦' },
@@ -171,10 +176,10 @@ const SETTINGS_MENU = [
 const emojiOptions = ['😀', '😂', '🤣', '😍', '🔥', '🙏', '🎉', '❤️'];
 const tabBadges = {
   Chats: 0,
-  Calls: 0,
-  Status: 0,
+  Explore: 0,
   Pay: 0,
   Business: 0,
+  Profile: 0,
 };
 const statusBackgroundOptions = ['#10233e', '#1f2937', '#14532d', '#7c2d12', '#581c87'];
 const statusFontOptions = ['System', 'serif', 'monospace'];
@@ -456,6 +461,25 @@ function AppContent() {
   const lightContentBottomInset = 12;
   const [activeView, setActiveView] = useState('Chats');
   const [chatMode, setChatMode] = useState('personal');
+  const [businesses, setBusinesses] = useState([]);
+  const [activeBusinessId, setActiveBusinessId] = useState('');
+  const [identitySheetVisible, setIdentitySheetVisible] = useState(false);
+  const [businessDraft, setBusinessDraft] = useState({
+    name: '',
+    description: '',
+    location: '',
+    hours: '',
+    contactButtonLabel: 'Chat',
+    showPhone: false,
+    logoUrl: '',
+    verificationNote: '',
+  });
+  const [publicBusinessView, setPublicBusinessView] = useState(null);
+  const [publicBusinessCatalog, setPublicBusinessCatalog] = useState([]);
+  const [businessReportDraft, setBusinessReportDraft] = useState('');
+  const [staffDraft, setStaffDraft] = useState({ phone: '', role: 'sales' });
+  const [dismissedCards, setDismissedCards] = useState([]);
+  const identityDraftsRef = useRef({});
   const [chatScreen, setChatScreen] = useState('list');
   const [selectedChatId, setSelectedChatId] = useState('');
   const [currentUserId, setCurrentUserId] = useState('');
@@ -480,12 +504,17 @@ function AppContent() {
     countryCode: '',
     currency: '',
     photoUri: '',
+    blockedUserIds: [],
   });
   const [settingsPanel, setSettingsPanel] = useState('');
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
   const [favoriteChatIds, setFavoriteChatIds] = useState([]);
   const [mutedChatIds, setMutedChatIds] = useState([]);
   const [archivedChatIds, setArchivedChatIds] = useState([]);
+  const [lockedChatIds, setLockedChatIds] = useState([]);
+  const [unlockChatId, setUnlockChatId] = useState('');
+  const [unlockPin, setUnlockPin] = useState('');
+  const lockedChatIdsRef = useRef([]);
   const [chatSearchQuery, setChatSearchQuery] = useState('');
   const [showArchivedChats, setShowArchivedChats] = useState(false);
   const [replyTarget, setReplyTarget] = useState(null);
@@ -508,9 +537,14 @@ function AppContent() {
     stockQuantity: '1',
     location: '',
     condition: 'New',
+    status: 'active',
+    trackStock: true,
+    variantName: '',
+    variantOptions: '',
   });
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory, setCatalogCategory] = useState('All');
+  const [catalogStatusFilter, setCatalogStatusFilter] = useState('All');
   const [marketCategory, setMarketCategory] = useState('All');
   const [marketPrice, setMarketPrice] = useState('Any');
   const [marketRegion, setMarketRegion] = useState('All');
@@ -576,6 +610,7 @@ function AppContent() {
   const [chatListTab, setChatListTab] = useState('recent');
   const [chatRequests, setChatRequests] = useState([]);
   const [mutualUserIds, setMutualUserIds] = useState([]);
+  const mutualUserIdsRef = useRef([]);
   const [mutualPrivacyReady, setMutualPrivacyReady] = useState(false);
   const [chatActionChat, setChatActionChat] = useState(null);
   const [phoneLocked, setPhoneLocked] = useState(AppState.currentState !== 'active');
@@ -713,7 +748,11 @@ function AppContent() {
   const [cameraPermissionGranted, setCameraPermissionGranted] = useState(false);
 
   const activeChat = chatItems.find((chat) => chat.id === selectedChatId) ?? chatItems[0] ?? chats[0];
-  const messages = messagesByChat[selectedChatId] ?? [];
+  const messages = (messagesByChat[selectedChatId] ?? []).filter((message) => {
+    if (!message?.expiresAt) return true;
+    const expires = new Date(message.expiresAt).getTime();
+    return !Number.isFinite(expires) || expires > Date.now();
+  });
   const activeStatusGroup = activeStatusGroupIndex === null ? null : updatesFeed[activeStatusGroupIndex] ?? null;
   const visibleStatusItems = (activeStatusGroup?.items ?? []).filter((item) => {
     if (!statusStillLive(item)) return false;
@@ -743,16 +782,22 @@ function AppContent() {
       if (item.sellerId && currentUserId && item.sellerId !== currentUserId) {
         return false;
       }
+      const status = item.status || (item.takenDown ? 'archived' : 'active');
+      const matchesStatus = catalogStatusFilter === 'All' || status === catalogStatusFilter;
       const matchesCategory = catalogCategory === 'All' || item.category === catalogCategory;
       const query = catalogSearch.trim().toLowerCase();
+      const variantText = (item.variants || [])
+        .map((variant) => `${variant.name} ${(variant.options || []).join(' ')}`)
+        .join(' ');
       const matchesSearch =
         !query ||
         item.title.toLowerCase().includes(query) ||
         item.description.toLowerCase().includes(query) ||
-        item.seller.toLowerCase().includes(query);
-      return matchesCategory && matchesSearch;
+        (item.seller || '').toLowerCase().includes(query) ||
+        variantText.toLowerCase().includes(query);
+      return matchesStatus && matchesCategory && matchesSearch;
     });
-  }, [catalogCategory, catalogItems, catalogSearch, currentUserId]);
+  }, [catalogCategory, catalogItems, catalogSearch, catalogStatusFilter, currentUserId]);
 
   const filteredCountryOptions = useMemo(() => {
     const query = countrySearch.trim().toLowerCase();
@@ -766,7 +811,11 @@ function AppContent() {
 
   const visibleChatItems = useMemo(() => {
     const query = chatSearchQuery.trim().toLowerCase();
+    const activeSpace = activeBusinessId || 'personal';
     const scoped = chatItems.filter((chat) => {
+      if ((chat.space || 'personal') !== activeSpace) {
+        return false;
+      }
       const archived = archivedChatIds.includes(chat.id);
       if (showArchivedChats ? !archived : archived) {
         return false;
@@ -779,7 +828,7 @@ function AppContent() {
     const favorites = scoped.filter((chat) => favoriteChatIds.includes(chat.id));
     const rest = scoped.filter((chat) => !favoriteChatIds.includes(chat.id));
     return [...favorites, ...rest];
-  }, [archivedChatIds, chatItems, chatSearchQuery, favoriteChatIds, showArchivedChats]);
+  }, [activeBusinessId, archivedChatIds, chatItems, chatSearchQuery, favoriteChatIds, showArchivedChats]);
 
   const payQuickContacts = useMemo(() => {
     const merged = [
@@ -911,6 +960,97 @@ function AppContent() {
     showToast(exists ? 'Chat unmuted' : 'Chat muted', 'success', 1400);
   };
 
+  const persistLockedChats = async (nextLocked) => {
+    lockedChatIdsRef.current = nextLocked;
+    setLockedChatIds(nextLocked);
+    await AsyncStorage.setItem(LOCKED_CHATS_STORAGE_KEY, JSON.stringify(nextLocked)).catch(() => undefined);
+  };
+
+  const toggleLockChat = (chatId) => {
+    if (!appLockPin) {
+      showToast('Set a PIN in Profile before locking a chat.', 'error', 3600);
+      setActiveView('Profile');
+      setSettingsPanel('account');
+      return;
+    }
+    const next = lockedChatIds.includes(chatId)
+      ? lockedChatIds.filter((id) => id !== chatId)
+      : [...lockedChatIds, chatId];
+    void persistLockedChats(next);
+    showToast(next.includes(chatId) ? 'Chat locked. The PIN opens it.' : 'Chat unlocked.', 'success', 2200);
+  };
+
+  const setChatDisappear = async (chatId, disappearAfterSeconds) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chats/${encodeURIComponent(chatId)}/disappear`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, disappearAfterSeconds }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update disappearing messages.', 'error');
+        return;
+      }
+      setChatItems((current) => current.map((chat) => (
+        chat.id === chatId
+          ? { ...chat, disappearAfterSeconds: Number(payload.chat?.disappearAfterSeconds || 0) }
+          : chat
+      )));
+      const label = disappearAfterSeconds === 0
+        ? 'Off'
+        : disappearAfterSeconds === 86400
+          ? '24 hours'
+          : disappearAfterSeconds === 604800
+            ? '7 days'
+            : '90 days';
+      showToast(`Disappearing messages: ${label}`, 'success', 2200);
+    } catch {
+      showToast('Could not update disappearing messages.', 'error');
+    }
+  };
+
+  const blockUser = async (targetUserId) => {
+    if (!targetUserId || targetUserId === currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/users/block`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, targetUserId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not block this person.', 'error');
+        return;
+      }
+      setProfile((current) => ({ ...current, blockedUserIds: payload.blockedUserIds || [] }));
+      setPeerProfileVisible(false);
+      setChatScreen('list');
+      showToast('Blocked. They can no longer message or call you.', 'success', 3200);
+    } catch {
+      showToast('Could not block this person.', 'error');
+    }
+  };
+
+  const unblockUser = async (targetUserId) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/users/unblock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, targetUserId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not unblock this person.', 'error');
+        return;
+      }
+      setProfile((current) => ({ ...current, blockedUserIds: payload.blockedUserIds || [] }));
+      showToast('Unblocked.', 'success', 1800);
+    } catch {
+      showToast('Could not unblock this person.', 'error');
+    }
+  };
+
   const toggleArchiveChat = (chatId) => {
     const exists = archivedChatIds.includes(chatId);
     const next = exists ? archivedChatIds.filter((id) => id !== chatId) : [chatId, ...archivedChatIds];
@@ -944,6 +1084,8 @@ function AppContent() {
       receiptState: message.state,
       senderId: message.senderId,
       anonymous: Boolean(message.anonymous) || message.senderId === 'anonymous',
+      actorName: message.actorName || '',
+      expiresAt: message.expiresAt || '',
       replyToMessageId: message.replyToMessageId,
       replyPreview: message.replyPreview,
       deletedForEveryone: deleted,
@@ -1121,6 +1263,15 @@ function AppContent() {
     if (!peer) {
       return chat?.presence || 'offline';
     }
+    const seePresence = (() => {
+      const privacy = peer.lastSeenPrivacy || 'everyone';
+      if (privacy === 'nobody') return false;
+      if (privacy === 'contacts') return isMutualContact(chat?.peerUserId);
+      return true;
+    })();
+    if (!seePresence) {
+      return 'offline';
+    }
     if (peer.presence === 'online' || peer.presence === 'typing') {
       return peer.presence === 'typing' ? 'typing…' : 'online';
     }
@@ -1164,6 +1315,9 @@ function AppContent() {
           profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
           aboutPrivacy: nextSettings.aboutPrivacy,
           statusPrivacy: nextSettings.statusPrivacy,
+          typingPrivacy: nextSettings.typingPrivacy,
+          callPrivacy: nextSettings.callPrivacy,
+          groupInvitePrivacy: nextSettings.groupInvitePrivacy,
           readReceiptsEnabled: nextSettings.readReceiptsEnabled,
           appLockEnabled: nextSettings.appLockEnabled,
           ...(pinToSave.length === 4 ? { pin: pinToSave } : {}),
@@ -2166,6 +2320,8 @@ function AppContent() {
       selfChat: isSelf,
       participants: chat.participants ?? [],
       adminIds: chat.adminIds ?? [],
+      space: chat.space && chat.space !== 'personal' ? chat.space : 'personal',
+      disappearAfterSeconds: Number(chat.disappearAfterSeconds || 0),
     };
   };
 
@@ -2288,6 +2444,9 @@ function AppContent() {
     setCurrentUserId(nextCurrentUserId);
     setCurrentDeviceId(payload.currentDeviceId ?? null);
     setUsersById(nextUsersById);
+    setBusinesses(payload.businesses ?? []);
+    setActiveBusinessId(payload.profile?.activeBusinessId || '');
+    setChatMode(payload.profile?.activeBusinessId ? 'business' : 'personal');
     setProfile((current) => ({
       ...current,
       name: payload.profile?.name ?? current.name,
@@ -2297,6 +2456,7 @@ function AppContent() {
       countryCode: payload.profile?.countryCode ?? current.countryCode,
       currency: payload.profile?.currency || currencyForPhone(payload.profile?.phone, payload.profile?.countryCode),
       photoUri: payload.profile?.photoUri || current.photoUri,
+      blockedUserIds: payload.profile?.blockedUserIds ?? current.blockedUserIds ?? [],
     }));
     if (payload.profile) {
       setAppSettings((current) => {
@@ -2306,6 +2466,9 @@ function AppContent() {
           profilePhotoPrivacy: payload.profile.profilePhotoPrivacy ?? current.profilePhotoPrivacy,
           aboutPrivacy: payload.profile.aboutPrivacy ?? current.aboutPrivacy,
           statusPrivacy: payload.profile.statusPrivacy ?? current.statusPrivacy,
+          typingPrivacy: payload.profile.typingPrivacy ?? current.typingPrivacy,
+          callPrivacy: payload.profile.callPrivacy ?? current.callPrivacy,
+          groupInvitePrivacy: payload.profile.groupInvitePrivacy ?? current.groupInvitePrivacy,
           readReceiptsEnabled:
             payload.profile.readReceiptsEnabled == null
               ? current.readReceiptsEnabled
@@ -2382,11 +2545,14 @@ function AppContent() {
     setUpdatesFeed(payload.updatesFeed ?? []);
     setChatRequests(payload.chatRequests ?? []);
     setMutualPrivacyReady(Array.isArray(payload.mutualUserIds));
-    setMutualUserIds(Array.isArray(payload.mutualUserIds) ? payload.mutualUserIds : []);
+    const nextMutual = Array.isArray(payload.mutualUserIds) ? payload.mutualUserIds : [];
+    mutualUserIdsRef.current = nextMutual;
+    setMutualUserIds(nextMutual);
     setCatalogItems(
       (payload.catalogItems ?? []).map((item) => ({
         id: item.id,
         sellerId: item.sellerId,
+        businessId: item.businessId || null,
         title: item.title,
         price: `${item.currency ?? 'GHS'} ${item.price}`,
         priceAmount: item.price,
@@ -2396,6 +2562,10 @@ function AppContent() {
         seller: payload.users?.find((user) => user.id === item.sellerId)?.name ?? 'Seller',
         description: item.description,
         stockQuantity: item.stockQuantity ?? 0,
+        trackStock: item.trackStock !== false,
+        status: item.status || (item.takenDown ? 'archived' : 'active'),
+        variants: item.variants || [],
+        availabilityUpdatedAt: item.availabilityUpdatedAt || item.updatedAt || '',
         createdAt: item.createdAt || '',
         location: item.location || '',
         condition: item.condition || 'New',
@@ -2801,8 +2971,9 @@ function AppContent() {
           !viewingChat &&
           !mutedChatIdsRef.current.includes(message.chatId)
         ) {
-          const senderName = usersByIdRef.current[message.senderId]?.name || 'New message';
-          const preview = settings.showNotificationPreview
+          const lockedChat = lockedChatIdsRef.current.includes(message.chatId);
+          const senderName = lockedChat ? 'ZynkUp' : (usersByIdRef.current[message.senderId]?.name || 'New message');
+          const preview = settings.showNotificationPreview && !lockedChat
             ? (message.text || (message.kind === 'image' ? 'Photo' : message.kind === 'voice' ? 'Voice message' : 'New message'))
             : 'New message';
           if (appIsForeground && !uiLocked) {
@@ -2845,20 +3016,30 @@ function AppContent() {
       if (!updatedProfile?.id) {
         return;
       }
+      const allows = (privacy) => {
+        if (!privacy || privacy === 'everyone') return true;
+        if (privacy === 'nobody') return false;
+        return mutualUserIdsRef.current.includes(updatedProfile.id);
+      };
+      const seePhoto = allows(updatedProfile.profilePhotoPrivacy || 'everyone');
+      const seeAbout = allows(updatedProfile.aboutPrivacy || 'everyone');
       setUsersById((current) => ({
         ...current,
         [updatedProfile.id]: {
           ...(current[updatedProfile.id] ?? { id: updatedProfile.id, avatar: 'CT' }),
           name: updatedProfile.name || current[updatedProfile.id]?.name,
-          about: updatedProfile.about ?? current[updatedProfile.id]?.about,
+          about: seeAbout ? (updatedProfile.about ?? current[updatedProfile.id]?.about) : '',
           phone: updatedProfile.phone || current[updatedProfile.id]?.phone,
-          photoUri: updatedProfile.photoUri || '',
+          photoUri: seePhoto ? (updatedProfile.photoUri || '') : '',
+          lastSeenPrivacy: updatedProfile.lastSeenPrivacy || current[updatedProfile.id]?.lastSeenPrivacy || 'everyone',
+          profilePhotoPrivacy: updatedProfile.profilePhotoPrivacy || 'everyone',
+          aboutPrivacy: updatedProfile.aboutPrivacy || 'everyone',
         },
       }));
       setChatItems((current) =>
         current.map((chat) =>
           chat.peerUserId === updatedProfile.id
-            ? { ...chat, name: updatedProfile.name || chat.name, photoUri: updatedProfile.photoUri || '' }
+            ? { ...chat, name: updatedProfile.name || chat.name, photoUri: seePhoto ? (updatedProfile.photoUri || '') : '' }
             : chat,
         ),
       );
@@ -2867,21 +3048,28 @@ function AppContent() {
       if (!userId) {
         return;
       }
-      setUsersById((current) => ({
-        ...current,
-        [userId]: {
-          ...(current[userId] ?? { id: userId, name: 'Contact', avatar: 'CT' }),
-          presence,
-          lastSeenAt: lastSeenAt ?? current[userId]?.lastSeenAt,
-        },
-      }));
-      setChatItems((current) =>
-        current.map((chat) =>
-          chat.peerUserId === userId
-            ? { ...chat, presence, lastSeenAt: lastSeenAt ?? chat.lastSeenAt }
-            : chat,
-        ),
-      );
+      setUsersById((current) => {
+        const existing = current[userId] ?? { id: userId, name: 'Contact', avatar: 'CT' };
+        const privacy = existing.lastSeenPrivacy || 'everyone';
+        const allowed = privacy === 'everyone' || (privacy === 'contacts' && mutualUserIdsRef.current.includes(userId));
+        const nextPresence = allowed ? presence : 'offline';
+        const nextSeen = allowed ? (lastSeenAt ?? existing.lastSeenAt) : undefined;
+        setChatItems((chats) =>
+          chats.map((chat) =>
+            chat.peerUserId === userId
+              ? { ...chat, presence: nextPresence, lastSeenAt: nextSeen }
+              : chat,
+          ),
+        );
+        return {
+          ...current,
+          [userId]: {
+            ...existing,
+            presence: nextPresence,
+            lastSeenAt: nextSeen,
+          },
+        };
+      });
     });
     socket.on('chat:deleted', ({ chatId }) => {
       if (!chatId) return;
@@ -2969,6 +3157,7 @@ function AppContent() {
           {
             id: item.id,
             sellerId: item.sellerId,
+            businessId: item.businessId || null,
             title: item.title,
             price: `${item.currency || accountCurrency} ${item.price}`,
             priceAmount: item.price,
@@ -2978,6 +3167,10 @@ function AppContent() {
             seller: usersByIdRef.current[item.sellerId]?.name || 'Seller',
             description: item.description,
             stockQuantity: item.stockQuantity ?? 0,
+            trackStock: item.trackStock !== false,
+            status: item.status || 'active',
+            variants: item.variants || [],
+            availabilityUpdatedAt: item.availabilityUpdatedAt || item.updatedAt || '',
             imageUri: item.imageUrls?.[0] ?? null,
             imageUris: item.imageUrls ?? [],
           },
@@ -2999,6 +3192,10 @@ function AppContent() {
                 category: item.category ?? entry.category,
                 description: item.description ?? entry.description,
                 stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
+                trackStock: item.trackStock ?? entry.trackStock,
+                status: item.status ?? entry.status,
+                variants: item.variants ?? entry.variants,
+                availabilityUpdatedAt: item.availabilityUpdatedAt ?? entry.availabilityUpdatedAt,
                 imageUri: item.imageUrls?.[0] ?? entry.imageUri,
                 imageUris: item.imageUrls ?? entry.imageUris,
               }
@@ -3147,12 +3344,14 @@ function AppContent() {
   useEffect(() => {
     void (async () => {
       try {
-        const [storedSettings, storedFavorites, storedMuted, storedArchived, storedPin] = await Promise.all([
+        const [storedSettings, storedFavorites, storedMuted, storedArchived, storedLocked, storedPin, storedCards] = await Promise.all([
           AsyncStorage.getItem(SETTINGS_STORAGE_KEY),
           AsyncStorage.getItem(FAVORITES_STORAGE_KEY),
           AsyncStorage.getItem(MUTED_CHATS_STORAGE_KEY),
           AsyncStorage.getItem(ARCHIVED_CHATS_STORAGE_KEY),
+          AsyncStorage.getItem(LOCKED_CHATS_STORAGE_KEY),
           AsyncStorage.getItem(APP_LOCK_PIN_KEY),
+          AsyncStorage.getItem(DISMISSED_CARDS_KEY),
         ]);
         let nextSettings = { ...DEFAULT_APP_SETTINGS };
         if (storedSettings) {
@@ -3179,10 +3378,23 @@ function AppContent() {
             setArchivedChatIds(parsed);
           }
         }
-        if (storedPin && storedPin.length === 4) {
+        if (storedLocked) {
+          const parsed = JSON.parse(storedLocked);
+          if (Array.isArray(parsed)) {
+            lockedChatIdsRef.current = parsed;
+            setLockedChatIds(parsed);
+          }
+        }
+        if (storedPin && /^\d{4,6}$/.test(storedPin)) {
           setAppLockPin(storedPin);
         }
-        if (nextSettings.appLockEnabled && storedPin && storedPin.length === 4) {
+        if (storedCards) {
+          const parsed = JSON.parse(storedCards);
+          if (Array.isArray(parsed)) {
+            setDismissedCards(parsed);
+          }
+        }
+        if (nextSettings.appLockEnabled && storedPin && /^\d{4,6}$/.test(storedPin)) {
           setAppUnlocked(false);
         }
       } catch {
@@ -3449,6 +3661,8 @@ function AppContent() {
   navigationStateRef.current = {
     chatScreen,
     activeView,
+    chatListTab,
+    settingsPanel,
     chatMenuVisible,
     peerProfileVisible,
     avatarPrompt,
@@ -3563,8 +3777,16 @@ function AppContent() {
       if (state.incomingCall || state.activeCall) {
         return true;
       }
+      if (state.settingsPanel) {
+        setSettingsPanel('');
+        return true;
+      }
       if (state.chatScreen === 'detail') {
         setChatScreen('list');
+        return true;
+      }
+      if (state.activeView === 'Chats' && state.chatListTab === 'calls') {
+        setChatListTab('recent');
         return true;
       }
       if (state.activeView !== 'Chats') {
@@ -3873,8 +4095,307 @@ function AppContent() {
     void flushOutbox();
   };
 
+  const activeBusiness = businesses.find((item) => item.id === activeBusinessId) || null;
+  const identityLabel = activeBusiness?.name || 'Personal';
+
+  const openChat = (chatId) => {
+    if (lockedChatIds.includes(chatId)) {
+      setUnlockPin('');
+      setUnlockChatId(chatId);
+      return;
+    }
+    if (selectedChatId && selectedChatId !== chatId) {
+      identityDraftsRef.current[selectedChatId] = messageDraft;
+    }
+    setSelectedChatId(chatId);
+    setMessageDraft(identityDraftsRef.current[chatId] || '');
+    setChatScreen('detail');
+  };
+
+  const confirmChatUnlock = () => {
+    if (unlockPin !== appLockPin) {
+      showToast('That PIN is not right.', 'error', 1800);
+      setUnlockPin('');
+      return;
+    }
+    const chatId = unlockChatId;
+    setUnlockChatId('');
+    setUnlockPin('');
+    if (selectedChatId && selectedChatId !== chatId) {
+      identityDraftsRef.current[selectedChatId] = messageDraft;
+    }
+    setSelectedChatId(chatId);
+    setMessageDraft(identityDraftsRef.current[chatId] || '');
+    setChatScreen('detail');
+  };
+
+  const switchIdentity = async (businessId) => {
+    if (selectedChatId) {
+      identityDraftsRef.current[selectedChatId] = messageDraft;
+    }
+    setIdentitySheetVisible(false);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/identity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, businessId: businessId || '' }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not switch.', 'error');
+        return;
+      }
+      setActiveBusinessId(businessId || '');
+      setChatMode(businessId ? 'business' : 'personal');
+      setChatScreen('list');
+      showToast(businessId ? 'Switched to this business.' : 'Switched to Personal.', 'success', 1600);
+    } catch {
+      showToast('Could not switch. Check the connection.', 'error');
+    }
+  };
+
+  const createBusinessProfile = async (nameInput, descriptionInput, userId = currentUserId) => {
+    const name = (nameInput ?? businessDraft.name).trim();
+    const description = (descriptionInput ?? businessDraft.description).trim();
+    if (name.length < 2) {
+      showToast('Enter the business name.', 'error');
+      return null;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/businesses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, name, description }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create the business.', 'error');
+        return null;
+      }
+      setBusinesses((current) => [payload.business, ...current.filter((item) => item.id !== payload.business.id)]);
+      setActiveBusinessId(payload.business.id);
+      setChatMode('business');
+      setBusinessDraft({
+        name: '',
+        description: '',
+        location: '',
+        hours: '',
+        contactButtonLabel: 'Chat',
+        showPhone: false,
+        logoUrl: '',
+        verificationNote: '',
+      });
+      setIdentitySheetVisible(false);
+      setProfile((current) => ({
+        ...current,
+        businessName: payload.business.name,
+        businessDescription: payload.business.description || current.businessDescription,
+      }));
+      showToast(`${payload.business.name} is ready as a draft. Open Storefront to publish.`, 'success', 4200);
+      return payload.business;
+    } catch {
+      showToast('Could not create the business.', 'error');
+      return null;
+    }
+  };
+
+  const openBusinessStorefrontEditor = () => {
+    if (!activeBusiness) {
+      showToast('Create or switch to a business first.', 'error');
+      return;
+    }
+    setBusinessDraft({
+      name: activeBusiness.name || '',
+      description: activeBusiness.description || '',
+      location: activeBusiness.location || '',
+      hours: activeBusiness.hours || '',
+      contactButtonLabel: activeBusiness.contactButtonLabel || 'Chat',
+      showPhone: Boolean(activeBusiness.showPhone),
+      logoUrl: activeBusiness.logoUrl || '',
+      verificationNote: activeBusiness.verificationNote || '',
+    });
+    setBusinessPanel('profile');
+  };
+
+  const saveBusinessStorefront = async (extra = {}) => {
+    if (!activeBusiness || !currentUserId) {
+      showToast('Switch to a business first.', 'error');
+      return null;
+    }
+    const name = (extra.name ?? businessDraft.name).trim();
+    if (name.length < 2) {
+      showToast('Enter the business name.', 'error');
+      return null;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/businesses/${encodeURIComponent(activeBusiness.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          name,
+          description: (extra.description ?? businessDraft.description).trim(),
+          location: (extra.location ?? businessDraft.location).trim(),
+          hours: (extra.hours ?? businessDraft.hours).trim(),
+          contactButtonLabel: (extra.contactButtonLabel ?? businessDraft.contactButtonLabel).trim() || 'Chat',
+          showPhone: extra.showPhone ?? businessDraft.showPhone,
+          logoUrl: (extra.logoUrl ?? businessDraft.logoUrl).trim(),
+          visibility: extra.visibility,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save the storefront.', 'error');
+        return null;
+      }
+      setBusinesses((current) => current.map((item) => (item.id === payload.business.id ? payload.business : item)));
+      setProfile((current) => ({
+        ...current,
+        businessName: payload.business.name,
+        businessDescription: payload.business.description || current.businessDescription,
+      }));
+      showToast(
+        payload.business.visibility === 'published' ? 'Storefront is public.' : 'Storefront saved.',
+        'success',
+      );
+      return payload.business;
+    } catch {
+      showToast('Could not save the storefront.', 'error');
+      return null;
+    }
+  };
+
+  const requestBusinessVerification = async () => {
+    if (!activeBusiness || !currentUserId) {
+      showToast('Switch to a business first.', 'error');
+      return;
+    }
+    if (activeBusiness.ownerUserId !== currentUserId) {
+      showToast('Only the owner can request verification.', 'error');
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/businesses/${encodeURIComponent(activeBusiness.id)}/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          note: businessDraft.verificationNote.trim(),
+          evidenceUrls: [],
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not submit verification.', 'error');
+        return;
+      }
+      setBusinesses((current) => current.map((item) => (item.id === payload.business.id ? payload.business : item)));
+      showToast('Verification submitted. We will review it soon.', 'success', 4200);
+    } catch {
+      showToast('Could not submit verification.', 'error');
+    }
+  };
+
+  const openPublicBusiness = async (businessId, ownerUserId) => {
+    try {
+      let response;
+      if (businessId) {
+        response = await fetch(
+          `${API_BASE_URL}/api/businesses/${encodeURIComponent(businessId)}?userId=${encodeURIComponent(currentUserId || '')}`,
+        );
+      } else if (ownerUserId) {
+        response = await fetch(
+          `${API_BASE_URL}/api/businesses/owner/${encodeURIComponent(ownerUserId)}/public?userId=${encodeURIComponent(currentUserId || '')}`,
+        );
+      } else {
+        return;
+      }
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'This business is not public yet.', 'error');
+        return;
+      }
+      setPublicBusinessView(payload.business);
+      setPublicBusinessCatalog(payload.catalogItems || []);
+      setBusinessReportDraft('');
+    } catch {
+      showToast('Could not open this business.', 'error');
+    }
+  };
+
+  const reportPublicBusiness = async () => {
+    if (!publicBusinessView?.id || !currentUserId) return;
+    const reason = businessReportDraft.trim();
+    if (reason.length < 4) {
+      showToast('Tell us why you are reporting this business.', 'error');
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/businesses/${encodeURIComponent(publicBusinessView.id)}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, reason }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not send the report.', 'error');
+        return;
+      }
+      setBusinessReportDraft('');
+      showToast('Report sent. Thanks for helping keep ZynkUp safe.', 'success');
+    } catch {
+      showToast('Could not send the report.', 'error');
+    }
+  };
+
+  const addBusinessStaff = async () => {
+    if (!activeBusiness) {
+      showToast('Switch to a business first.', 'error');
+      return;
+    }
+    const phone = staffDraft.phone.trim();
+    if (phone.length < 7) {
+      showToast('Enter the staff phone number.', 'error');
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/businesses/${encodeURIComponent(activeBusiness.id)}/staff`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          phone,
+          countryCode: profile.countryCode || '',
+          role: staffDraft.role,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not add that person.', 'error');
+        return;
+      }
+      setBusinesses((current) => current.map((item) => (item.id === payload.business.id ? payload.business : item)));
+      setStaffDraft({ phone: '', role: 'sales' });
+      showToast('Staff member added. They only see this business, not your personal chats.', 'success', 4200);
+    } catch {
+      showToast('Could not add that person.', 'error');
+    }
+  };
+
   const sendMessage = () => {
     if (!messageDraft.trim() || !selectedChatId) {
+      return;
+    }
+    const chatSpace = activeChat?.space || 'personal';
+    const activeSpace = activeBusinessId || 'personal';
+    if (chatSpace !== activeSpace) {
+      showToast(
+        chatSpace === 'personal'
+          ? 'This chat is personal. Switch to Personal before you reply.'
+          : 'Switch to this business before you reply.',
+        'error',
+        3600,
+      );
       return;
     }
 
@@ -3890,6 +4411,7 @@ function AppContent() {
       time: 'Now',
       receiptState: 'pending',
       anonymous: Boolean(anonymousCompose && activeChat?.kind === 'group'),
+      actorName: activeBusiness?.name || '',
       replyToMessageId: replyTarget?.id,
       replyPreview: replyTarget?.text?.slice(0, 140),
     };
@@ -3904,6 +4426,7 @@ function AppContent() {
       text,
       mediaUrls: [],
       anonymous: Boolean(anonymousCompose && activeChat?.kind === 'group'),
+      businessId: activeBusinessId || undefined,
       replyToMessageId: replyTarget?.id,
       replyPreview: replyTarget?.text?.slice(0, 140),
     });
@@ -3937,21 +4460,34 @@ function AppContent() {
       return;
     }
 
+    const variantOptions = catalogForm.variantOptions
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const variants = catalogForm.variantName.trim() && variantOptions.length
+      ? [{ id: `v${Date.now()}`, name: catalogForm.variantName.trim(), options: variantOptions }]
+      : [];
+
     try {
       const response = await fetch(`${API_BASE_URL}/api/catalog`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sellerId: currentUserId,
+          businessId: activeBusinessId || undefined,
           title: catalogForm.title.trim(),
           price: Number.parseFloat(catalogForm.price) || 0,
           currency: accountCurrency,
           category: catalogForm.category,
           description: catalogForm.description.trim() || 'New item from your business catalog.',
           stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
+          trackStock: catalogForm.trackStock,
+          status: catalogForm.status,
+          variants,
           location: catalogForm.location.trim(),
           condition: catalogForm.condition,
           imageUrls: uploadedImageUrls,
+          isPublic: catalogForm.status === 'active',
         }),
       });
       if (!response.ok) {
@@ -3959,7 +4495,7 @@ function AppContent() {
         showToast(getBackendErrorMessage(payload, 'Could not save catalog item.'), 'error', 3600);
         return;
       }
-      showToast('Catalog item published.', 'success');
+      showToast(catalogForm.status === 'draft' ? 'Product saved as draft.' : 'Catalog item published.', 'success');
       setCatalogForm({
         title: '',
         price: '',
@@ -3968,10 +4504,56 @@ function AppContent() {
         stockQuantity: '1',
         location: '',
         condition: 'New',
+        status: 'active',
+        trackStock: true,
+        variantName: '',
+        variantOptions: '',
       });
       setCatalogImageUris([]);
     } catch {
       showToast('Network error while saving catalog item.', 'error');
+    }
+  };
+
+  const setCatalogItemStatus = async (item, status) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update product status.', 'error');
+        return;
+      }
+      if (payload.item) {
+        setCatalogItems((current) =>
+          current.map((entry) =>
+            entry.id === payload.item.id
+              ? {
+                  ...entry,
+                  status: payload.item.status,
+                  isPublic: payload.item.isPublic == null ? entry.isPublic : Boolean(payload.item.isPublic),
+                  stockQuantity: payload.item.stockQuantity ?? entry.stockQuantity,
+                  availabilityUpdatedAt: payload.item.availabilityUpdatedAt,
+                }
+              : entry,
+          ),
+        );
+      }
+      showToast(
+        status === 'archived'
+          ? 'Product archived.'
+          : status === 'draft'
+            ? 'Product moved to draft.'
+            : status === 'out_of_stock'
+              ? 'Marked out of stock.'
+              : 'Product is active.',
+        'success',
+      );
+    } catch {
+      showToast('Could not update product status.', 'error');
     }
   };
 
@@ -4002,6 +4584,10 @@ function AppContent() {
                   category: item.category ?? entry.category,
                   description: item.description ?? entry.description,
                   stockQuantity: item.stockQuantity ?? entry.stockQuantity ?? 0,
+                  status: item.status ?? entry.status,
+                  trackStock: item.trackStock ?? entry.trackStock,
+                  variants: item.variants ?? entry.variants,
+                  availabilityUpdatedAt: item.availabilityUpdatedAt ?? entry.availabilityUpdatedAt,
                   imageUri: item.imageUrls?.[0] ?? entry.imageUri,
                   imageUris: item.imageUrls ?? entry.imageUris,
                 }
@@ -4082,14 +4668,15 @@ function AppContent() {
   };
 
   const ensureDirectChatId = async (peerUserId) => {
-    const existing = chatItems.find((chat) => chat.peerUserId === peerUserId);
+    const space = activeBusinessId || 'personal';
+    const existing = chatItems.find((chat) => chat.peerUserId === peerUserId && (chat.space || 'personal') === space);
     if (existing) {
       return existing.id;
     }
     const response = await fetch(`${API_BASE_URL}/api/chats`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUserId, peerUserId }),
+      body: JSON.stringify({ userId: currentUserId, peerUserId, businessId: activeBusinessId || undefined }),
     });
     if (!response.ok) {
       return '';
@@ -4168,6 +4755,7 @@ function AppContent() {
         text: `${item.title} · ${item.price}`,
         catalogItemId: liveItem.id,
         assets: liveItem.imageUri ? [{ kind: 'image', url: liveItem.imageUri, caption: liveItem.title }] : [],
+        businessId: activeBusinessId || undefined,
         audience,
       }),
     });
@@ -4202,6 +4790,15 @@ function AppContent() {
   };
 
   const payForCatalogItem = async (item, sellerId) => {
+    const status = item.status || 'active';
+    if (status === 'archived' || status === 'draft') {
+      showToast('This product is not available to buy.', 'error');
+      return;
+    }
+    if (status === 'out_of_stock' || (item.trackStock !== false && Number(item.stockQuantity) <= 0)) {
+      showToast('This product is out of stock.', 'error');
+      return;
+    }
     const amount = Number(item.priceAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
       showToast('This product has no price yet.', 'error');
@@ -4526,6 +5123,7 @@ function AppContent() {
           backgroundColor: statusComposerMode === 'text' ? statusBackgroundColor : undefined,
           fontFamily: statusComposerMode === 'text' ? statusFontFamily : undefined,
           fontSize: statusComposerMode === 'text' ? statusFontSize : undefined,
+          businessId: activeBusinessId || undefined,
           audience: statusAudience,
         }),
       });
@@ -5138,8 +5736,17 @@ function AppContent() {
       const registeredName = authForm.name.trim().split(/\s+/)[0] || 'there';
       setEntryCelebrationName(registeredName);
       setEntryCelebrationVisible(true);
-      setChatMode(accountType === 'business' ? 'business' : 'personal');
-      setActiveView(accountType === 'business' ? 'Business' : 'Chats');
+      if (accountType === 'business') {
+        await createBusinessProfile(
+          authForm.name.trim(),
+          'Sell products, accept payments, and manage customers.',
+          bootstrapPayload.currentUserId,
+        );
+        setActiveView('Business');
+      } else {
+        setChatMode('personal');
+        setActiveView('Chats');
+      }
       pinHoldingRef.current = false;
       setAuthVisible(false);
       setAuthRequired(false);
@@ -5861,6 +6468,9 @@ function AppContent() {
         {!message.mine && activeChat?.kind === 'group' ? (
           <Text style={styles.groupSenderName}>{message.anonymous ? 'Anonymous' : displayNameFor(message.senderId, 'Member')}</Text>
         ) : null}
+        {message.actorName ? (
+          <Text style={styles.groupSenderName}>Sent as {message.actorName}</Text>
+        ) : null}
         {message.mine && message.anonymous ? (
           <Text style={styles.groupSenderName}>Anonymous</Text>
         ) : null}
@@ -6097,7 +6707,7 @@ function AppContent() {
       return;
     }
     setAvatarPrompt(null);
-    setActiveView('Status');
+    setActiveView('Explore');
     openStatusViewer(index);
   };
 
@@ -6309,6 +6919,15 @@ function AppContent() {
         </View>
       ) : null}
 
+      <Pressable style={styles.identityComposer} onPress={() => setIdentitySheetVisible(true)}>
+        <Text style={styles.identityComposerText}>
+          {(activeChat?.space || 'personal') === (activeBusinessId || 'personal')
+            ? `Sending as ${identityLabel}`
+            : (activeChat?.space || 'personal') === 'personal'
+              ? 'This chat is personal. Switch to Personal to reply.'
+              : 'This chat belongs to a business. Switch to it to reply.'}
+        </Text>
+      </Pressable>
       {activeChat?.kind === 'group' ? (
         <Pressable
           style={[styles.anonymousToggle, anonymousCompose ? styles.anonymousToggleOn : null]}
@@ -6349,6 +6968,180 @@ function AppContent() {
     );
   };
 
+  const dismissHomeCard = (cardId) => {
+    const next = [...new Set([...dismissedCards, cardId])];
+    setDismissedCards(next);
+    void AsyncStorage.setItem(DISMISSED_CARDS_KEY, JSON.stringify(next)).catch(() => undefined);
+  };
+
+  const buildHomeCards = (mode) => {
+    const unreadChats = visibleChatItems.filter((chat) => Number(chat.unread || 0) > 0);
+    const unreadCount = unreadChats.reduce((sum, chat) => sum + Number(chat.unread || 0), 0);
+    const pendingRequests = chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId);
+    const missedCalls = calls.filter((call) => call.state === 'missed' || call.state === 'declined');
+    const pendingPayments = payHistoryItems.filter((item) => /pending|awaiting|queued/i.test(String(item.status || '')));
+    const lowStockItems = filteredCatalogItems.filter((item) => {
+      const stock = Number(item.stockQuantity ?? 0);
+      return stock > 0 && stock <= 2;
+    });
+    const cards = [];
+
+    if (mode === 'personal') {
+      if (unreadCount > 0) {
+        cards.push({
+          id: 'personal-unread',
+          title: unreadCount === 1 ? '1 unread chat' : `${unreadCount} unread messages`,
+          body: unreadChats[0]?.name ? `Latest in ${displayNameFor(unreadChats[0].peerUserId, unreadChats[0].name)}` : 'Open Chats to catch up',
+          action: () => {
+            setChatListTab('recent');
+            if (unreadChats[0]?.id) openChat(unreadChats[0].id);
+          },
+          dismissible: false,
+        });
+      }
+      if (pendingRequests.length) {
+        cards.push({
+          id: 'personal-requests',
+          title: pendingRequests.length === 1 ? '1 chat request' : `${pendingRequests.length} chat requests`,
+          body: 'Someone wants to message you',
+          action: () => setChatListTab('requests'),
+          dismissible: false,
+        });
+      }
+      if (missedCalls.length) {
+        cards.push({
+          id: 'personal-missed-calls',
+          title: missedCalls.length === 1 ? '1 missed call' : `${missedCalls.length} missed calls`,
+          body: missedCalls[0]?.name ? `Last from ${missedCalls[0].name}` : 'Review your call list',
+          action: () => setChatListTab('calls'),
+          dismissible: true,
+        });
+      }
+      if (pendingPayments.length) {
+        cards.push({
+          id: 'personal-pending-pay',
+          title: pendingPayments.length === 1 ? '1 payment waiting' : `${pendingPayments.length} payments waiting`,
+          body: 'Open Pay to check the status',
+          action: () => setActiveView('Pay'),
+          dismissible: true,
+        });
+      }
+      if (!cards.length) {
+        cards.push({
+          id: 'personal-quiet',
+          title: 'You are caught up',
+          body: activeBusinessId ? 'Switch to Business for shop tasks' : 'Start a chat or explore status',
+          action: () => {
+            if (activeBusinessId) {
+              setActiveView('Business');
+              return;
+            }
+            setActiveView('Explore');
+          },
+          dismissible: true,
+        });
+      }
+    }
+
+    if (mode === 'business') {
+      if (!businesses.length) {
+        cards.push({
+          id: 'business-create',
+          title: 'Create your first business',
+          body: 'Keep shop work separate from personal chats',
+          action: () => setIdentitySheetVisible(true),
+          dismissible: false,
+        });
+      } else {
+        if (lowStockItems.length) {
+          cards.push({
+            id: 'business-low-stock',
+            title: lowStockItems.length === 1 ? '1 product is low on stock' : `${lowStockItems.length} products are low on stock`,
+            body: lowStockItems[0]?.title || 'Open your catalog',
+            action: () => setBusinessPanel('catalog'),
+            dismissible: false,
+          });
+        }
+        if (!filteredCatalogItems.length) {
+          cards.push({
+            id: 'business-empty-catalog',
+            title: 'Add your first product',
+            body: 'Customers can browse once the catalog is live',
+            action: () => setBusinessPanel('catalog'),
+            dismissible: true,
+          });
+        }
+        if (pendingPayments.length) {
+          cards.push({
+            id: 'business-pending-pay',
+            title: pendingPayments.length === 1 ? '1 payment needs attention' : `${pendingPayments.length} payments need attention`,
+            body: 'Open receipts to follow up',
+            action: () => setBusinessPanel('receipts'),
+            dismissible: false,
+          });
+        }
+        if (contactItems.filter((contact) => contact.registered || contact.linkedUserId).length === 0) {
+          cards.push({
+            id: 'business-customers',
+            title: 'Find customers on ZynkUp',
+            body: 'Sync contacts to see who already joined',
+            action: () => {
+              void syncPhoneContacts(currentUserId);
+              setBusinessPanel('customers');
+            },
+            dismissible: true,
+          });
+        }
+        if (!cards.length) {
+          cards.push({
+            id: 'business-quiet',
+            title: 'Shop looks clear',
+            body: 'Catalog, customers, and receipts are ready when you need them',
+            action: () => setBusinessPanel('catalog'),
+            dismissible: true,
+          });
+        }
+      }
+    }
+
+    return cards
+      .filter((card) => !card.dismissible || !dismissedCards.includes(card.id))
+      .slice(0, 3);
+  };
+
+  const renderHomeCards = (mode) => {
+    const cards = buildHomeCards(mode);
+    if (!cards.length) {
+      return null;
+    }
+    return (
+      <View style={styles.homeCardsWrap}>
+        <Text style={styles.homeCardsLabel}>{mode === 'business' ? 'Needs attention' : 'For you'}</Text>
+        {cards.map((card) => (
+          <Pressable key={card.id} style={styles.homeCard} onPress={card.action}>
+            <View style={styles.homeCardCopy}>
+              <Text style={styles.homeCardTitle}>{card.title}</Text>
+              <Text style={styles.homeCardBody}>{card.body}</Text>
+            </View>
+            {card.dismissible ? (
+              <Pressable
+                style={styles.homeCardDismiss}
+                onPress={(event) => {
+                  event?.stopPropagation?.();
+                  dismissHomeCard(card.id);
+                }}
+              >
+                <Text style={styles.homeCardDismissText}>Hide</Text>
+              </Pressable>
+            ) : (
+              <Text style={styles.homeCardChevron}>›</Text>
+            )}
+          </Pressable>
+        ))}
+      </View>
+    );
+  };
+
   const renderChatList = () => {
     const recentChats = visibleChatItems.slice(0, 4);
     const earlierChats = visibleChatItems.slice(4);
@@ -6366,10 +7159,7 @@ function AppContent() {
         </View>
         <Pressable
           style={styles.chatHomeCopy}
-          onPress={() => {
-            setSelectedChatId(chat.id);
-            setChatScreen('detail');
-          }}
+          onPress={() => openChat(chat.id)}
           onLongPress={() => setChatActionChat(chat)}
         >
           <View style={styles.chatHomeCopyInner}>
@@ -6380,6 +7170,7 @@ function AppContent() {
               ) : null}
               <Text numberOfLines={1} style={styles.chatHomeName}>{displayNameFor(chat.peerUserId, chat.name)}</Text>
               {mutedChatIds.includes(chat.id) ? <Text style={styles.chatHomeMuteIcon}>🔕</Text> : null}
+              {lockedChatIds.includes(chat.id) ? <Text style={styles.chatHomeMuteIcon}>🔒</Text> : null}
               {/(store|shop|business|biz|kitchen|board)/i.test(chat.name) ? (
                 <Text style={styles.chatHomeBadge}>BIZ</Text>
               ) : null}
@@ -6388,7 +7179,7 @@ function AppContent() {
           </View>
           <View style={styles.chatHomeBottomRow}>
             <Text numberOfLines={1} style={styles.chatHomePreview}>
-              {peerTypingByChat[chat.id] ? 'typing…' : (/^-?\d+(?:\.\d+)?\s*,/.test(chat.preview || '') ? 'Shared location' : chat.preview)}
+              {lockedChatIds.includes(chat.id) ? 'Locked' : (peerTypingByChat[chat.id] ? 'typing…' : (/^-?\d+(?:\.\d+)?\s*,/.test(chat.preview || '') ? 'Shared location' : chat.preview))}
             </Text>
             {chat.unread > 0 ? (
               <View style={styles.chatHomeUnread}>
@@ -6408,9 +7199,14 @@ function AppContent() {
     return (
       <View style={styles.lightScreen}>
         <View style={styles.lightHeader}>
-          <Text style={styles.appWordmark}>
-            Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
-          </Text>
+          <View>
+            <Text style={styles.appWordmark}>
+              Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
+            </Text>
+            <Pressable onPress={() => setIdentitySheetVisible(true)}>
+              <Text style={styles.identityChipText}>{identityLabel}</Text>
+            </Pressable>
+          </View>
           <View style={styles.lightHeaderActions}>
             <Pressable
               style={styles.lightHeaderAction}
@@ -6429,7 +7225,7 @@ function AppContent() {
             >
               <Text style={styles.lightHeaderActionText}>+</Text>
             </Pressable>
-            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
               <Text style={styles.lightHeaderActionText}>⌁</Text>
             </Pressable>
           </View>
@@ -6442,7 +7238,8 @@ function AppContent() {
         ) : null}
         <View style={styles.modeSwitch}>
           {[
-            ['recent', 'Recent'],
+            ['recent', 'Messages'],
+            ['calls', 'Calls'],
             ['requests', `Requests${chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId).length ? ` ${chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId).length}` : ''}`],
           ].map(([id, label]) => (
             <Pressable key={id} style={[styles.modeSwitchButton, chatListTab === id ? styles.modeSwitchButtonActive : null]} onPress={() => setChatListTab(id)}>
@@ -6451,7 +7248,9 @@ function AppContent() {
           ))}
         </View>
 
-        {chatSearchOpen ? (
+        {chatListTab === 'calls' ? renderCalls() : null}
+
+        {chatListTab !== 'calls' && chatSearchOpen ? (
           <TextInput
             value={chatSearchQuery}
             onChangeText={setChatSearchQuery}
@@ -6462,7 +7261,7 @@ function AppContent() {
           />
         ) : null}
 
-        {archivedChatIds.length ? (
+        {chatListTab !== 'calls' && archivedChatIds.length ? (
           <Pressable style={styles.archiveRow} onPress={() => setShowArchivedChats((current) => !current)}>
             <Text style={styles.archiveIcon}>▦</Text>
             <Text style={styles.archiveText}>
@@ -6471,12 +7270,13 @@ function AppContent() {
           </Pressable>
         ) : null}
 
-        <View style={styles.chatListShell}>
+        {chatListTab === 'calls' ? null : <View style={styles.chatListShell}>
           <ScrollView
             style={styles.lightScroll}
             contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset + 72 }]}
             showsVerticalScrollIndicator={false}
           >
+            {chatListTab === 'recent' ? renderHomeCards(activeBusinessId ? 'business' : 'personal') : null}
             {chatListTab === 'requests' ? (
               <View>
                 <Text style={styles.lightSectionLabel}>CHAT REQUESTS</Text>
@@ -6542,14 +7342,13 @@ function AppContent() {
           >
             <Text style={styles.chatFabText}>+</Text>
           </Pressable>
-        </View>
+        </View>}
       </View>
     );
   };
 
   const renderCalls = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
-      <Text style={styles.secondaryTitle}>Calls</Text>
       {calls.length ? null : (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>No calls yet</Text>
@@ -6620,7 +7419,7 @@ function AppContent() {
         <Text style={styles.payWordmark}>
           Zynk<Text style={styles.appWordmarkAccent}>Up</Text> Pay
         </Text>
-        <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+        <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
           <Text style={styles.lightHeaderActionText}>◔</Text>
         </Pressable>
       </View>
@@ -6727,10 +7526,13 @@ function AppContent() {
     return (
       <View style={styles.lightScreen}>
         <View style={styles.lightHeader}>
-          <Text style={styles.appWordmark}>
-            Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
-          </Text>
-          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+          <View>
+            <Text style={styles.appWordmark}>
+              Expl<Text style={styles.appWordmarkAccent}>ore</Text>
+            </Text>
+            <Text style={styles.identityChipText}>Status and marketplace</Text>
+          </View>
+          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
             <Text style={styles.lightHeaderActionText}>◌</Text>
           </Pressable>
         </View>
@@ -6860,7 +7662,10 @@ function AppContent() {
                 ))}
               </ScrollView>
               <View style={styles.marketGrid}>
-                {catalogItems.filter((item) => item.isPublic && !item.takenDown).filter((item) => {
+                {catalogItems.filter((item) => {
+                  const status = item.status || 'active';
+                  return item.isPublic && !item.takenDown && status !== 'archived' && status !== 'draft';
+                }).filter((item) => {
                   if (marketCategory !== 'All' && item.category !== marketCategory) return false;
                   const amount = Number(item.priceAmount || 0);
                   if (marketPrice === 'Under 500' && amount >= 500) return false;
@@ -6903,7 +7708,6 @@ function AppContent() {
     const customerCount = registeredCustomers.length;
     const orderCount = payHistoryItems.length;
     const catalogCount = filteredCatalogItems.length;
-    const lowStockItem = filteredCatalogItems.find((item) => Number(item.stockQuantity ?? 0) > 0 && Number(item.stockQuantity) <= 2);
 
     return (
       <View style={styles.lightScreen}>
@@ -6911,7 +7715,7 @@ function AppContent() {
           <Text style={styles.businessModeTitle}>
             Business <Text style={styles.appWordmarkAccent}>Mode</Text>
           </Text>
-          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Settings')}>
+          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
             <Text style={styles.lightHeaderActionText}>≋</Text>
           </Pressable>
         </View>
@@ -6921,18 +7725,49 @@ function AppContent() {
           contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}
           showsVerticalScrollIndicator={false}
         >
-          {lowStockItem ? (
-            <View style={styles.businessAlertCard}>
-              <Text style={styles.businessAlertText}>
-                Low stock: {lowStockItem.title} ({lowStockItem.stockQuantity} left)
-              </Text>
+          <Pressable style={styles.identityComposer} onPress={() => setIdentitySheetVisible(true)}>
+            <Text style={styles.identityComposerText}>
+              {activeBusiness ? `Working as ${activeBusiness.name}` : 'Personal mode. Create or switch to a business.'}
+            </Text>
+          </Pressable>
+
+          {renderHomeCards('business')}
+
+          {!businesses.length ? (
+            <View style={styles.businessHeroCard}>
+              <Text style={styles.businessHeroTitle}>Create a business</Text>
+              <Text style={styles.businessHeroMeta}>Your personal chats stay separate.</Text>
+              <TextInput
+                value={businessDraft.name}
+                onChangeText={(value) => setBusinessDraft((current) => ({ ...current, name: value }))}
+                placeholder="Business name"
+                placeholderTextColor="#9aa3b2"
+                style={styles.chatSearchInput}
+              />
+              <TextInput
+                value={businessDraft.description}
+                onChangeText={(value) => setBusinessDraft((current) => ({ ...current, description: value }))}
+                placeholder="What you sell"
+                placeholderTextColor="#9aa3b2"
+                style={styles.chatSearchInput}
+              />
+              <Pressable style={styles.authDarkButton} onPress={() => void createBusinessProfile()}>
+                <Text style={styles.authDarkButtonText}>Create business</Text>
+              </Pressable>
             </View>
           ) : null}
 
           <View style={styles.businessHeroCard}>
-            <Text numberOfLines={1} style={styles.businessHeroTitle}>{businessName}</Text>
+            <Text numberOfLines={1} style={styles.businessHeroTitle}>
+              {activeBusiness?.name || businessName}
+              {(activeBusiness?.verificationStatus || '') === 'approved' ? ' ✓' : ''}
+            </Text>
             <Text style={styles.businessHeroMeta}>
-              {accountCountry?.name ? `${accountCurrency} · ${accountCountry.name}` : accountCurrency}
+              {activeBusiness
+                ? `${(activeBusiness.visibility || 'draft') === 'published' ? 'Public storefront' : 'Draft'} · ${(activeBusiness.verificationStatus || 'unverified') === 'approved' ? 'Verified' : (activeBusiness.verificationStatus || 'unverified') === 'pending' ? 'Verification pending' : 'Not verified'}`
+                : accountCountry?.name
+                  ? `${accountCurrency} · ${accountCountry.name}`
+                  : accountCurrency}
             </Text>
             <View style={styles.businessStatsRow}>
               <View style={styles.businessStatCard}>
@@ -6948,9 +7783,55 @@ function AppContent() {
                 <Text style={styles.businessStatLabel}>Customers</Text>
               </View>
             </View>
+            {activeBusiness ? (
+              <Pressable style={[styles.authDarkButton, { marginTop: 12 }]} onPress={openBusinessStorefrontEditor}>
+                <Text style={styles.authDarkButtonText}>Edit storefront</Text>
+              </Pressable>
+            ) : null}
           </View>
 
+          {activeBusiness && activeBusiness.ownerUserId === currentUserId ? (
+            <View style={styles.businessHeroCard}>
+              <Text style={styles.businessHeroTitle}>Staff</Text>
+              <Text style={styles.businessHeroMeta}>Staff see this business only. They cannot open your personal chats.</Text>
+              {(activeBusiness.members || []).map((member) => (
+                <Text key={member.userId} style={styles.businessHeroMeta}>
+                  {member.userId === currentUserId ? 'You' : (usersById[member.userId]?.name || member.userId)} · {member.role}
+                </Text>
+              ))}
+              <TextInput
+                value={staffDraft.phone}
+                onChangeText={(value) => setStaffDraft((current) => ({ ...current, phone: value }))}
+                placeholder="Staff phone number"
+                placeholderTextColor="#9aa3b2"
+                keyboardType="phone-pad"
+                style={styles.chatSearchInput}
+              />
+              <View style={styles.modeSwitch}>
+                {['manager', 'sales', 'support'].map((role) => (
+                  <Pressable
+                    key={role}
+                    style={[styles.modeSwitchButton, staffDraft.role === role ? styles.modeSwitchButtonActive : null]}
+                    onPress={() => setStaffDraft((current) => ({ ...current, role }))}
+                  >
+                    <Text style={[styles.modeSwitchText, staffDraft.role === role ? styles.modeSwitchTextActive : null]}>{role}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Pressable style={styles.authDarkButton} onPress={() => void addBusinessStaff()}>
+                <Text style={styles.authDarkButtonText}>Add staff</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
           <View style={styles.businessGrid}>
+            <Pressable style={styles.businessGridCard} onPress={openBusinessStorefrontEditor}>
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◎</Text></View>
+              <Text style={styles.businessGridTitle}>Storefront</Text>
+              <Text style={styles.businessGridMeta}>
+                {(activeBusiness?.visibility || 'draft') === 'published' ? 'Public profile' : 'Draft · publish'}
+              </Text>
+            </Pressable>
             <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('catalog')}>
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>▤</Text></View>
               <Text style={styles.businessGridTitle}>My catalog</Text>
@@ -6977,6 +7858,16 @@ function AppContent() {
               <Text style={styles.businessGridTitle}>Broadcast</Text>
               <Text style={styles.businessGridMeta}>Send to all customers</Text>
             </Pressable>
+            {activeBusiness && (activeBusiness.visibility || 'draft') === 'published' ? (
+              <Pressable
+                style={styles.businessGridCard}
+                onPress={() => void openPublicBusiness(activeBusiness.id)}
+              >
+                <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◇</Text></View>
+                <Text style={styles.businessGridTitle}>Preview</Text>
+                <Text style={styles.businessGridMeta}>See public page</Text>
+              </Pressable>
+            ) : null}
           </View>
         </ScrollView>
       </View>
@@ -7128,7 +8019,7 @@ function AppContent() {
             'App lock',
             appSettings.appLockEnabled,
             (value) => updateAppSetting('appLockEnabled', value, { syncProfile: true }),
-            'Require PIN when opening ZynkUp',
+            'Require PIN when opening ZynkUp. The same PIN unlocks a locked chat. It does not stop screenshots.',
           )}
           <TextInput
             value={accountPinDraft}
@@ -7136,7 +8027,7 @@ function AppContent() {
             placeholder="Set 4–6 digit PIN"
             placeholderTextColor="#7d8b92"
             keyboardType="number-pad"
-            maxLength={4}
+            maxLength={6}
             secureTextEntry
             style={styles.input}
           />
@@ -7150,7 +8041,7 @@ function AppContent() {
               void saveProfileToServer(
                 {},
                 {},
-                { pin: accountPinDraft.trim().length === 4 ? accountPinDraft.trim() : undefined },
+                { pin: /^\d{4,6}$/.test(accountPinDraft.trim()) ? accountPinDraft.trim() : undefined },
               );
               setAccountPinDraft('');
             }}
@@ -7175,11 +8066,14 @@ function AppContent() {
     }
 
     if (settingsPanel === 'privacy') {
+      const blockedIds = profile.blockedUserIds || [];
       return (
         <ScrollView style={styles.settingsPanelScroll}>
+          <Text style={styles.settingsSectionCaption}>Who can see</Text>
           {renderPrivacyChoice('Last seen & online', 'lastSeenPrivacy')}
           {renderPrivacyChoice('Profile photo', 'profilePhotoPrivacy')}
           {renderPrivacyChoice('About', 'aboutPrivacy')}
+          {renderPrivacyChoice('Typing indicator', 'typingPrivacy')}
           <View style={styles.settingsChoiceBlock}>
             <Text style={styles.settingsToggleLabel}>Status</Text>
             <View style={styles.settingsChoiceRow}>
@@ -7204,11 +8098,44 @@ function AppContent() {
               ))}
             </View>
           </View>
+          <Text style={styles.settingsSectionCaption}>Who can reach you</Text>
+          {renderPrivacyChoice('Calls', 'callPrivacy')}
+          {renderPrivacyChoice('Group invites', 'groupInvitePrivacy')}
           {renderSettingsToggle(
             'Read receipts',
             appSettings.readReceiptsEnabled,
             (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
-            'If off, you won\'t send or see blue ticks in real time',
+            'If off, you will not send or see blue ticks. Delivered ticks still work.',
+          )}
+          <Text style={styles.settingsSectionCaption}>Locked chats</Text>
+          <Text style={styles.cardBody}>
+            Locked chats need your PIN. Notifications hide the message text. This does not stop screenshots.
+          </Text>
+          {lockedChatIds.length ? lockedChatIds.map((chatId) => {
+            const chat = chatItems.find((item) => item.id === chatId);
+            return (
+              <Pressable key={chatId} style={styles.settingsListRow} onPress={() => toggleLockChat(chatId)}>
+                <View style={styles.settingsListCopy}>
+                  <Text style={styles.settingsListTitle}>{chat?.name || 'Locked chat'}</Text>
+                  <Text style={styles.settingsListSubtitle}>Tap to unlock</Text>
+                </View>
+                <Text style={styles.settingsListChevron}>🔒</Text>
+              </Pressable>
+            );
+          }) : (
+            <Text style={styles.cardBody}>No locked chats yet. Long-press a chat to lock it.</Text>
+          )}
+          <Text style={styles.settingsSectionCaption}>Blocked</Text>
+          {blockedIds.length ? blockedIds.map((userId) => (
+            <Pressable key={userId} style={styles.settingsListRow} onPress={() => void unblockUser(userId)}>
+              <View style={styles.settingsListCopy}>
+                <Text style={styles.settingsListTitle}>{displayNameFor(userId, usersById[userId]?.name || 'Blocked user')}</Text>
+                <Text style={styles.settingsListSubtitle}>Tap to unblock</Text>
+              </View>
+              <Text style={styles.settingsListChevron}>›</Text>
+            </Pressable>
+          )) : (
+            <Text style={styles.cardBody}>Nobody is blocked. Open a chat profile to block someone.</Text>
           )}
         </ScrollView>
       );
@@ -7337,7 +8264,7 @@ function AppContent() {
 
   const renderSettings = () => (
     <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
-      <Text style={styles.secondaryTitle}>Settings</Text>
+      <Text style={styles.secondaryTitle}>Profile</Text>
       <Pressable style={styles.profileHero} onPress={() => setSettingsPanel('account')}>
         {profile.photoUri ? (
           <Image source={{ uri: profile.photoUri }} style={styles.profileImage} />
@@ -8032,11 +8959,10 @@ function AppContent() {
       ) : (
         <View style={styles.screen}>
           {activeView === 'Chats' ? renderChatList() : null}
-          {activeView === 'Calls' ? renderCalls() : null}
-          {activeView === 'Status' ? renderStatus() : null}
+          {activeView === 'Explore' ? renderStatus() : null}
           {activeView === 'Pay' ? renderPay() : null}
           {activeView === 'Business' ? renderBusiness() : null}
-          {activeView === 'Settings' ? renderSettings() : null}
+          {activeView === 'Profile' ? renderSettings() : null}
 
           <View style={[styles.bottomNav, { paddingBottom: Math.max(insets.bottom, 28) + 22 }]}>
             {tabs.map((tab) => (
@@ -8050,7 +8976,7 @@ function AppContent() {
               >
                 <View style={styles.bottomNavIconWrap}>
                   <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
-                    {tab === 'Chats' ? '◫' : tab === 'Calls' ? '☎' : tab === 'Status' ? '◉' : tab === 'Pay' ? '▭' : '⌂'}
+                    {tab === 'Chats' ? '◫' : tab === 'Explore' ? '◉' : tab === 'Pay' ? '▭' : tab === 'Business' ? '⌂' : '◎'}
                   </Text>
                   {tabBadges[tab] ? (
                     <View style={styles.bottomNavBadge}>
@@ -8058,7 +8984,7 @@ function AppContent() {
                     </View>
                   ) : null}
                 </View>
-                <Text style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
+                <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
               </Pressable>
             ))}
           </View>
@@ -8066,6 +8992,40 @@ function AppContent() {
       )}
 
       {renderAttachmentSheet()}
+      <Modal
+        transparent
+        animationType="fade"
+        visible={identitySheetVisible}
+        onRequestClose={() => setIdentitySheetVisible(false)}
+      >
+        <Pressable style={styles.dialogOverlay} onPress={() => setIdentitySheetVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Who are you using?</Text>
+            <Text style={styles.cardBody}>Personal chats stay separate from each business.</Text>
+            <Pressable style={styles.settingsListRow} onPress={() => void switchIdentity('')}>
+              <Text style={styles.settingsListTitle}>Personal{activeBusinessId ? '' : ' · active'}</Text>
+            </Pressable>
+            {businesses.map((business) => (
+              <Pressable key={business.id} style={styles.settingsListRow} onPress={() => void switchIdentity(business.id)}>
+                <Text style={styles.settingsListTitle}>
+                  {business.name}{business.id === activeBusinessId ? ' · active' : ''}
+                </Text>
+                <Text style={styles.businessHeroMeta}>{business.members?.find((member) => member.userId === currentUserId)?.role || 'business'}</Text>
+              </Pressable>
+            ))}
+            <TextInput
+              value={businessDraft.name}
+              onChangeText={(value) => setBusinessDraft((current) => ({ ...current, name: value }))}
+              placeholder="New business name"
+              placeholderTextColor="#9aa3b2"
+              style={styles.chatSearchInput}
+            />
+            <Pressable style={styles.authDarkButton} onPress={() => void createBusinessProfile()}>
+              <Text style={styles.authDarkButtonText}>Create business</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
       {renderCallSheet()}
       {renderMediaViewer()}
       <Modal
@@ -8742,18 +9702,125 @@ function AppContent() {
           <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset }]}>
             <View style={styles.statusComposerHeader}>
               <Text style={styles.statusComposerTitle}>
-                {businessPanel === 'catalog'
-                  ? 'My catalog'
-                  : businessPanel === 'customers'
-                    ? 'Customers'
-                    : businessPanel === 'receipts'
-                      ? 'Receipts'
-                      : 'Broadcast'}
+                {businessPanel === 'profile'
+                  ? 'Storefront'
+                  : businessPanel === 'catalog'
+                    ? 'My catalog'
+                    : businessPanel === 'customers'
+                      ? 'Customers'
+                      : businessPanel === 'receipts'
+                        ? 'Receipts'
+                        : 'Broadcast'}
               </Text>
               <Pressable onPress={() => setBusinessPanel('')}>
                 <Text style={styles.storyClose}>Close</Text>
               </Pressable>
             </View>
+
+            {businessPanel === 'profile' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.cardBody}>
+                  {(activeBusiness?.visibility || 'draft') === 'published'
+                    ? 'Your storefront is public. Anyone on ZynkUp can open it.'
+                    : 'This storefront is a draft. Publish when you are ready for customers to find you.'}
+                </Text>
+                <TextInput
+                  value={businessDraft.name}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, name: value }))}
+                  placeholder="Business name"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={businessDraft.description}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, description: value }))}
+                  placeholder="What you sell"
+                  placeholderTextColor="#7d8b92"
+                  multiline
+                  style={styles.textArea}
+                />
+                <TextInput
+                  value={businessDraft.location}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, location: value }))}
+                  placeholder="Location / city"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={businessDraft.hours}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, hours: value }))}
+                  placeholder="Hours (e.g. Mon–Sat 9–6)"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={businessDraft.contactButtonLabel}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, contactButtonLabel: value }))}
+                  placeholder="Contact button label"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={businessDraft.logoUrl}
+                  onChangeText={(value) => setBusinessDraft((current) => ({ ...current, logoUrl: value }))}
+                  placeholder="Logo URL (https)"
+                  placeholderTextColor="#7d8b92"
+                  autoCapitalize="none"
+                  style={styles.input}
+                />
+                {renderSettingsToggle(
+                  'Show phone on storefront',
+                  businessDraft.showPhone,
+                  (value) => setBusinessDraft((current) => ({ ...current, showPhone: value })),
+                  'Only when published. Customers can call or message you.',
+                )}
+                <Pressable style={styles.sendButtonWide} onPress={() => void saveBusinessStorefront()}>
+                  <Text style={styles.sendButtonText}>Save storefront</Text>
+                </Pressable>
+                {(activeBusiness?.visibility || 'draft') !== 'published' ? (
+                  <Pressable
+                    style={[styles.sendButtonWide, { marginTop: 10 }]}
+                    onPress={() => void saveBusinessStorefront({ visibility: 'published' })}
+                  >
+                    <Text style={styles.sendButtonText}>Publish storefront</Text>
+                  </Pressable>
+                ) : (
+                  <Pressable
+                    style={[styles.ghostButton, { marginTop: 10 }]}
+                    onPress={() => void saveBusinessStorefront({ visibility: 'draft' })}
+                  >
+                    <Text style={styles.ghostButtonText}>Unpublish (back to draft)</Text>
+                  </Pressable>
+                )}
+                <Text style={[styles.lightSectionLabel, { marginTop: 18 }]}>VERIFICATION</Text>
+                <Text style={styles.cardBody}>
+                  {(activeBusiness?.verificationStatus || 'unverified') === 'approved'
+                    ? 'Verified. Customers see a checkmark on your storefront.'
+                    : (activeBusiness?.verificationStatus || '') === 'pending'
+                      ? 'Pending review. We will update this after checking your details.'
+                      : (activeBusiness?.verificationStatus || '') === 'rejected'
+                        ? `Not approved${activeBusiness?.verificationReviewNote ? `: ${activeBusiness.verificationReviewNote}` : '.'}`
+                        : 'Request a verified badge so customers know you are a real business.'}
+                </Text>
+                {(activeBusiness?.verificationStatus || 'unverified') !== 'approved' ? (
+                  <>
+                    <TextInput
+                      value={businessDraft.verificationNote}
+                      onChangeText={(value) => setBusinessDraft((current) => ({ ...current, verificationNote: value }))}
+                      placeholder="Business registration, location, or proof note"
+                      placeholderTextColor="#7d8b92"
+                      multiline
+                      style={styles.textArea}
+                    />
+                    <Pressable style={styles.ghostButton} onPress={() => void requestBusinessVerification()}>
+                      <Text style={styles.ghostButtonText}>
+                        {(activeBusiness?.verificationStatus || '') === 'pending' ? 'Resubmit verification' : 'Request verification'}
+                      </Text>
+                    </Pressable>
+                  </>
+                ) : null}
+              </ScrollView>
+            ) : null}
 
             {businessPanel === 'catalog' ? (
               <ScrollView style={styles.businessPanelScroll}>
@@ -8764,6 +9831,17 @@ function AppContent() {
                   placeholderTextColor="#7d8b92"
                   style={styles.input}
                 />
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                  {['All', 'active', 'draft', 'out_of_stock', 'archived'].map((status) => (
+                    <Pressable
+                      key={status}
+                      style={[styles.marketFilterChip, catalogStatusFilter === status ? styles.marketFilterChipOn : null]}
+                      onPress={() => setCatalogStatusFilter(status)}
+                    >
+                      <Text style={styles.marketFilterText}>{status === 'out_of_stock' ? 'Out of stock' : status}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
                 <Pressable style={styles.ghostButton} onPress={() => pickMultipleImages('catalog')}>
                   <Text style={styles.ghostButtonText}>
                     {catalogImageUris.length ? `${catalogImageUris.length} image(s) selected` : 'Add product images'}
@@ -8799,6 +9877,12 @@ function AppContent() {
                   keyboardType="number-pad"
                   style={styles.input}
                 />
+                {renderSettingsToggle(
+                  'Track stock',
+                  catalogForm.trackStock,
+                  (value) => setCatalogForm((current) => ({ ...current, trackStock: value })),
+                  'Turn off if you do not count units for this product.',
+                )}
                 <TextInput
                   value={catalogForm.description}
                   onChangeText={(value) => setCatalogForm((current) => ({ ...current, description: value }))}
@@ -8814,6 +9898,20 @@ function AppContent() {
                   placeholderTextColor="#7d8b92"
                   style={styles.input}
                 />
+                <TextInput
+                  value={catalogForm.variantName}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, variantName: value }))}
+                  placeholder="Variant name (e.g. Storage, Colour)"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={catalogForm.variantOptions}
+                  onChangeText={(value) => setCatalogForm((current) => ({ ...current, variantOptions: value }))}
+                  placeholder="Options, comma-separated (e.g. 64GB, 128GB)"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
                   {PRODUCT_CATEGORIES.filter((category) => category !== 'All').map((category) => (
                     <Pressable key={category} style={[styles.marketFilterChip, catalogForm.category === category ? styles.marketFilterChipOn : null]} onPress={() => setCatalogForm((current) => ({ ...current, category }))}>
@@ -8825,11 +9923,16 @@ function AppContent() {
                       <Text style={styles.marketFilterText}>{condition}</Text>
                     </Pressable>
                   ))}
+                  {['active', 'draft'].map((status) => (
+                    <Pressable key={status} style={[styles.marketFilterChip, catalogForm.status === status ? styles.marketFilterChipOn : null]} onPress={() => setCatalogForm((current) => ({ ...current, status }))}>
+                      <Text style={styles.marketFilterText}>{status}</Text>
+                    </Pressable>
+                  ))}
                 </ScrollView>
                 <Pressable style={styles.sendButtonWide} onPress={() => void addCatalogItem()}>
-                  <Text style={styles.sendButtonText}>Publish product</Text>
+                  <Text style={styles.sendButtonText}>{catalogForm.status === 'draft' ? 'Save draft' : 'Publish product'}</Text>
                 </Pressable>
-                <Text style={styles.lightSectionLabel}>LIVE PRODUCTS</Text>
+                <Text style={styles.lightSectionLabel}>CATALOGUE</Text>
                 {filteredCatalogItems.map((item) => (
                   <View key={item.id} style={styles.catalogManageRow}>
                     {item.imageUri ? (
@@ -8841,7 +9944,20 @@ function AppContent() {
                     )}
                     <View style={styles.catalogManageCopy}>
                       <Text style={styles.sheetOptionTitle}>{item.title}</Text>
-                      <Text style={styles.sheetOptionBody}>{item.price} · Stock {item.stockQuantity ?? 0}</Text>
+                      <Text style={styles.sheetOptionBody}>
+                        {item.price} · {item.status || 'active'}
+                        {item.trackStock === false ? ' · Stock not tracked' : ` · Stock ${item.stockQuantity ?? 0}`}
+                      </Text>
+                      {(item.variants || []).length ? (
+                        <Text style={styles.sheetOptionBody}>
+                          {(item.variants || []).map((variant) => `${variant.name}: ${(variant.options || []).join(', ')}`).join(' · ')}
+                        </Text>
+                      ) : null}
+                      {item.availabilityUpdatedAt ? (
+                        <Text style={styles.sheetOptionBody}>
+                          Availability updated {new Date(item.availabilityUpdatedAt).toLocaleString()}
+                        </Text>
+                      ) : null}
                       <View style={styles.stockControls}>
                         <Pressable
                           style={styles.stockButton}
@@ -8860,6 +9976,16 @@ function AppContent() {
                         <Pressable style={styles.catalogChip} onPress={() => void setCatalogVisibility(item, !item.isPublic)}>
                           <Text style={styles.catalogChipText}>{item.isPublic ? 'Public' : 'Make public'}</Text>
                         </Pressable>
+                        {(item.status || 'active') !== 'active' ? (
+                          <Pressable style={styles.catalogChip} onPress={() => void setCatalogItemStatus(item, 'active')}>
+                            <Text style={styles.catalogChipText}>Activate</Text>
+                          </Pressable>
+                        ) : null}
+                        {(item.status || 'active') !== 'archived' ? (
+                          <Pressable style={styles.catalogChip} onPress={() => void setCatalogItemStatus(item, 'archived')}>
+                            <Text style={styles.catalogChipText}>Archive</Text>
+                          </Pressable>
+                        ) : null}
                         <Pressable style={styles.catalogChip} onPress={() => void postCatalogToStatus(item, 'contacts')}>
                           <Text style={styles.catalogChipText}>Post to status</Text>
                         </Pressable>
@@ -9321,6 +10447,30 @@ function AppContent() {
         <Pressable style={styles.dialogOverlay} onPress={() => setChatMenuVisible(false)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
             <Text style={styles.dialogTitle}>{activeChat?.name || 'Chat'}</Text>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleLockChat(activeChat.id); if (lockedChatIds.includes(activeChat?.id)) setChatScreen('list'); }}>
+              <Text style={styles.sheetOptionTitle}>{lockedChatIds.includes(activeChat?.id) ? 'Unlock chat' : 'Lock chat'}</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                const current = Number(activeChat?.disappearAfterSeconds || 0);
+                const next = current === 0 ? 86400 : current === 86400 ? 604800 : current === 604800 ? 7776000 : 0;
+                setChatMenuVisible(false);
+                void setChatDisappear(activeChat.id, next);
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>
+                Disappearing · {
+                  Number(activeChat?.disappearAfterSeconds || 0) === 0
+                    ? 'Off'
+                    : Number(activeChat?.disappearAfterSeconds) === 86400
+                      ? '24 hours'
+                      : Number(activeChat?.disappearAfterSeconds) === 604800
+                        ? '7 days'
+                        : '90 days'
+                }
+              </Text>
+            </Pressable>
             <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleMuteChat(activeChat.id); }}>
               <Text style={styles.sheetOptionTitle}>{mutedChatIds.includes(activeChat?.id) ? 'Unmute' : 'Mute'}</Text>
             </Pressable>
@@ -9353,6 +10503,99 @@ function AppContent() {
           </Pressable>
         </Pressable>
       </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={Boolean(publicBusinessView)}
+        onRequestClose={() => {
+          setPublicBusinessView(null);
+          setPublicBusinessCatalog([]);
+        }}
+      >
+        <View style={styles.peerProfileScreen}>
+          <Pressable
+            style={styles.viewerClose}
+            onPress={() => {
+              setPublicBusinessView(null);
+              setPublicBusinessCatalog([]);
+            }}
+          >
+            <Text style={styles.viewerCloseText}>Close</Text>
+          </Pressable>
+          {publicBusinessView?.logoUrl ? (
+            <Image source={{ uri: publicBusinessView.logoUrl }} style={{ width: 96, height: 96, borderRadius: 48, marginBottom: 12 }} />
+          ) : (
+            renderPersonAvatar({ userId: publicBusinessView?.ownerUserId, name: publicBusinessView?.name, size: 96 })
+          )}
+          <Text style={styles.peerProfileName}>
+            {publicBusinessView?.name || 'Business'}
+            {publicBusinessView?.verified ? ' ✓' : ''}
+          </Text>
+          <Text style={styles.peerProfileMeta}>
+            {publicBusinessView?.verified ? 'Verified business' : 'Business on ZynkUp'}
+            {publicBusinessView?.location ? ` · ${publicBusinessView.location}` : ''}
+          </Text>
+          {publicBusinessView?.hours ? <Text style={styles.peerProfileMeta}>{publicBusinessView.hours}</Text> : null}
+          <Text style={styles.peerProfileMeta}>{publicBusinessView?.description || 'No description yet.'}</Text>
+          {publicBusinessView?.showPhone && publicBusinessView?.phone ? (
+            <Text style={styles.peerProfileMeta}>{publicBusinessView.phone}</Text>
+          ) : null}
+          <View style={[styles.catalogActionRow, { paddingHorizontal: 20, marginTop: 8 }]}>
+            {publicBusinessView?.ownerUserId && publicBusinessView.ownerUserId !== currentUserId ? (
+              <Pressable
+                style={styles.sendButtonWide}
+                onPress={() => {
+                  const ownerId = publicBusinessView.ownerUserId;
+                  setPublicBusinessView(null);
+                  setPublicBusinessCatalog([]);
+                  void createDirectChat(ownerId);
+                }}
+              >
+                <Text style={styles.sendButtonText}>{publicBusinessView?.contactButtonLabel || 'Chat'}</Text>
+              </Pressable>
+            ) : null}
+          </View>
+          <ScrollView style={styles.peerCatalogList}>
+            <Text style={styles.peerProfileName}>Products</Text>
+            {publicBusinessCatalog.length ? null : (
+              <Text style={styles.peerProfileMeta}>No public products yet.</Text>
+            )}
+            {publicBusinessCatalog.map((item) => (
+              <View key={item.id} style={styles.peerCatalogCard}>
+                {(item.imageUri || item.imageUrls?.[0]) ? (
+                  <Image source={{ uri: item.imageUri || item.imageUrls[0] }} style={styles.peerCatalogImage} />
+                ) : null}
+                <Text style={styles.sheetOptionTitle}>{item.title}</Text>
+                <Text style={styles.sheetOptionBody}>
+                  {item.currency ? `${item.currency} ${item.price}` : item.price}
+                  {(item.status || 'active') === 'out_of_stock' ? ' · Out of stock' : ''}
+                </Text>
+                {(item.variants || []).length ? (
+                  <Text style={styles.sheetOptionBody}>
+                    {(item.variants || []).map((variant) => `${variant.name}: ${(variant.options || []).join(', ')}`).join(' · ')}
+                  </Text>
+                ) : null}
+              </View>
+            ))}
+            {publicBusinessView?.ownerUserId && publicBusinessView.ownerUserId !== currentUserId ? (
+              <View style={{ marginTop: 16, marginBottom: 28 }}>
+                <Text style={styles.lightSectionLabel}>REPORT</Text>
+                <TextInput
+                  value={businessReportDraft}
+                  onChangeText={setBusinessReportDraft}
+                  placeholder="Why are you reporting this business?"
+                  placeholderTextColor="#7d8b92"
+                  multiline
+                  style={styles.textArea}
+                />
+                <Pressable style={styles.ghostButton} onPress={() => void reportPublicBusiness()}>
+                  <Text style={styles.ghostButtonText}>Report business</Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </ScrollView>
+        </View>
+      </Modal>
       <Modal transparent animationType="slide" visible={peerProfileVisible} onRequestClose={() => setPeerProfileVisible(false)}>
         <View style={styles.peerProfileScreen}>
           <Pressable style={styles.viewerClose} onPress={() => setPeerProfileVisible(false)}>
@@ -9372,6 +10615,14 @@ function AppContent() {
           <Text style={styles.peerProfileMeta}>{getPresenceLabel(activeChat)}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.about || 'No about yet'}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.phone || ''}</Text>
+          {activeChat?.peerUserId ? (
+            <Pressable
+              style={[styles.ghostButton, { marginHorizontal: 20, marginBottom: 12 }]}
+              onPress={() => void openPublicBusiness(null, activeChat.peerUserId)}
+            >
+              <Text style={styles.ghostButtonText}>View business storefront</Text>
+            </Pressable>
+          ) : null}
           <ScrollView style={styles.peerCatalogList}>
             <Text style={styles.peerProfileName}>Catalog</Text>
             {catalogItems.filter((item) => item.sellerId === activeChat?.peerUserId && item.isPublic).length ? null : (
@@ -9396,6 +10647,39 @@ function AppContent() {
               </View>
             ))}
           </ScrollView>
+          {activeChat?.peerUserId ? (
+            <Pressable
+              style={[styles.sendButtonWide, { marginHorizontal: 20, marginBottom: 24 }]}
+              onPress={() => {
+                const targetUserId = activeChat.peerUserId;
+                const alreadyBlocked = (profile.blockedUserIds || []).includes(targetUserId);
+                Alert.alert(
+                  alreadyBlocked ? 'Unblock this person?' : 'Block this person?',
+                  alreadyBlocked
+                    ? 'They will be able to message and call you again.'
+                    : 'They will not be able to message or call you. Your personal chats stay on this phone.',
+                  [
+                    { text: 'Cancel', style: 'cancel' },
+                    {
+                      text: alreadyBlocked ? 'Unblock' : 'Block',
+                      style: alreadyBlocked ? 'default' : 'destructive',
+                      onPress: () => {
+                        if (alreadyBlocked) {
+                          void unblockUser(targetUserId);
+                          return;
+                        }
+                        void blockUser(targetUserId);
+                      },
+                    },
+                  ],
+                );
+              }}
+            >
+              <Text style={styles.sendButtonText}>
+                {(profile.blockedUserIds || []).includes(activeChat.peerUserId) ? 'Unblock' : 'Block'}
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       </Modal>
       <Modal transparent animationType="fade" visible={Boolean(avatarPrompt)} onRequestClose={() => setAvatarPrompt(null)}>
@@ -9445,10 +10729,34 @@ function AppContent() {
       >
         {renderAuthGate(true)}
       </Modal>
+      <Modal transparent animationType="fade" visible={Boolean(unlockChatId)} onRequestClose={() => setUnlockChatId('')}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setUnlockChatId('')}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Unlock chat</Text>
+            <Text style={styles.sheetOptionBody}>Enter the PIN from Profile.</Text>
+            <TextInput
+              value={unlockPin}
+              onChangeText={setUnlockPin}
+              keyboardType="number-pad"
+              maxLength={6}
+              secureTextEntry
+              placeholder="PIN"
+              placeholderTextColor="#7d8b92"
+              style={styles.input}
+            />
+            <Pressable style={styles.sendButtonWide} onPress={confirmChatUnlock}>
+              <Text style={styles.sendButtonText}>Open</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
       <Modal transparent animationType="fade" visible={Boolean(chatActionChat)} onRequestClose={() => setChatActionChat(null)}>
         <Pressable style={styles.dialogOverlay} onPress={() => setChatActionChat(null)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
             <Text style={styles.dialogTitle}>{chatActionChat?.name || 'Chat'}</Text>
+            <Pressable style={styles.sheetOption} onPress={() => { toggleLockChat(chatActionChat.id); setChatActionChat(null); }}>
+              <Text style={styles.sheetOptionTitle}>{lockedChatIds.includes(chatActionChat?.id) ? 'Unlock chat' : 'Lock chat'}</Text>
+            </Pressable>
             <Pressable style={styles.sheetOption} onPress={() => { toggleFavoriteChat(chatActionChat.id); setChatActionChat(null); }}>
               <Text style={styles.sheetOptionTitle}>{favoriteChatIds.includes(chatActionChat?.id) ? 'Unpin' : 'Pin'}</Text>
             </Pressable>
@@ -9502,7 +10810,7 @@ function AppContent() {
               placeholder="••••"
               placeholderTextColor="#7d8b92"
               keyboardType="number-pad"
-              maxLength={4}
+              maxLength={6}
               secureTextEntry
               style={styles.input}
             />
@@ -10090,6 +11398,76 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     marginTop: 8,
     marginBottom: 14,
+  },
+  identityChipText: {
+    color: '#128C7E',
+    fontSize: 13,
+    fontWeight: '700',
+    marginTop: 2,
+  },
+  identityComposer: {
+    marginHorizontal: 12,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    backgroundColor: '#e7f6f3',
+  },
+  identityComposerText: {
+    color: '#0f6f64',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  homeCardsWrap: {
+    marginBottom: 18,
+  },
+  homeCardsLabel: {
+    color: '#7f8591',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    marginBottom: 10,
+    textTransform: 'uppercase',
+  },
+  homeCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#eceff3',
+  },
+  homeCardCopy: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  homeCardTitle: {
+    color: '#101828',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  homeCardBody: {
+    color: '#667085',
+    fontSize: 13,
+    marginTop: 4,
+    lineHeight: 18,
+  },
+  homeCardChevron: {
+    color: '#98a2b3',
+    fontSize: 22,
+    fontWeight: '400',
+  },
+  homeCardDismiss: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  homeCardDismissText: {
+    color: '#98a2b3',
+    fontSize: 12,
+    fontWeight: '700',
   },
   modeSwitch: {
     marginHorizontal: 22,
