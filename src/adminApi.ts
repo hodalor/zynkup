@@ -474,6 +474,28 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
     return res.json({ ok: true, decision });
   });
 
+  app.get('/api/admin/orders', requireAdmin, async (_req, res) => {
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const orders = await db.collection('orders').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(200).toArray();
+    return res.json({
+      orders,
+      pendingPayment: orders.filter((item) => item.state === 'pending_payment').length,
+      open: orders.filter((item) => !['completed', 'cancelled', 'refunded'].includes(String(item.state))).length,
+    });
+  });
+
+  app.get('/api/admin/receipts', requireAdmin, async (_req, res) => {
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const receipts = await db.collection('saleReceipts').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(200).toArray();
+    return res.json({
+      receipts,
+      issued: receipts.filter((item) => item.state === 'issued').length,
+      refunded: receipts.filter((item) => item.state === 'refunded').length,
+    });
+  });
+
   app.get('/api/admin/announcements', requireAdmin, async (_req, res) => {
     const db = await deps.getDb();
     const announcements = db ? await db.collection('announcements').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).toArray() : [];

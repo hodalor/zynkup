@@ -50,6 +50,7 @@ type Message = {
   replyToMessageId?: string;
   replyPreview?: string;
   catalogItemId?: string;
+  receiptId?: string;
   deletedForEveryone?: boolean;
   deletedFor?: string[];
   anonymous?: boolean;
@@ -169,7 +170,10 @@ type CatalogItem = {
   description: string;
   imageUrls: string[];
   stockQuantity: number;
+  reservedQuantity?: number;
   trackStock?: boolean;
+  costPrice?: number | null;
+  lowStockThreshold?: number;
   status?: CatalogProductStatus;
   variants?: CatalogVariant[];
   availabilityUpdatedAt?: string;
@@ -179,6 +183,103 @@ type CatalogItem = {
   takenDown?: boolean;
   boostedUntil?: string | null;
   boostText?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type InventoryMovementKind = 'sale' | 'return' | 'receipt' | 'adjustment' | 'reservation' | 'release';
+
+type InventoryMovement = {
+  id: string;
+  catalogItemId: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  kind: InventoryMovementKind;
+  quantityDelta: number;
+  stockBefore: number;
+  stockAfter: number;
+  reason: string;
+  orderId?: string | null;
+  byUserId: string;
+  createdAt: string;
+};
+
+type InventoryAlert = {
+  id: string;
+  catalogItemId: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  title: string;
+  stockQuantity: number;
+  lowStockThreshold: number;
+  state: 'open' | 'reviewed';
+  createdAt: string;
+  reviewedAt?: string | null;
+  reviewedByUserId?: string | null;
+};
+
+type OrderState =
+  | 'pending_payment'
+  | 'paid'
+  | 'processing'
+  | 'dispatched'
+  | 'completed'
+  | 'cancelled'
+  | 'refunded';
+
+type OrderItemSnapshot = {
+  catalogItemId: string;
+  title: string;
+  price: number;
+  currency: string;
+  quantity: number;
+  variantSelections?: Array<{ name: string; option: string }>;
+  imageUrl?: string;
+};
+
+type CommerceOrder = {
+  id: string;
+  buyerUserId: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  statusId?: string | null;
+  chatId?: string | null;
+  paymentId?: string | null;
+  receiptId?: string | null;
+  clientRequestId?: string | null;
+  items: OrderItemSnapshot[];
+  totalAmount: number;
+  currency: string;
+  state: OrderState;
+  history: Array<{ state: OrderState; at: string; byUserId: string; note?: string }>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SaleReceiptState = 'issued' | 'voided' | 'refunded';
+
+type SaleReceipt = {
+  id: string;
+  receiptNumber: string;
+  orderId: string;
+  paymentId?: string | null;
+  buyerUserId: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  businessName: string;
+  sellerName: string;
+  buyerName: string;
+  items: OrderItemSnapshot[];
+  subtotal: number;
+  discount: number;
+  tax: number;
+  totalAmount: number;
+  currency: string;
+  paymentMethod: string;
+  paymentReference: string;
+  state: SaleReceiptState;
+  linkedReceiptId?: string | null;
+  issuedAt: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -358,6 +459,11 @@ const seedChatRequests: ChatRequest[] = [];
 const seedCalls: Call[] = [];
 const seedStatuses: StatusPost[] = [];
 const seedCatalogItems: CatalogItem[] = [];
+const seedOrders: CommerceOrder[] = [];
+const seedReceipts: SaleReceipt[] = [];
+const receiptCounters: Record<string, number> = {};
+const seedInventoryMovements: InventoryMovement[] = [];
+const seedInventoryAlerts: InventoryAlert[] = [];
 
 const settingsMenu = [
   'Favorites',
@@ -539,6 +645,8 @@ const createCatalogItemSchema = z.object({
   imageUrls: z.array(z.string().url()).min(1).max(8),
   stockQuantity: z.number().int().nonnegative().default(0),
   trackStock: z.boolean().optional(),
+  costPrice: z.number().nonnegative().nullable().optional(),
+  lowStockThreshold: z.number().int().nonnegative().max(9999).optional(),
   status: z.enum(['draft', 'active', 'archived', 'out_of_stock']).optional(),
   variants: z.array(catalogVariantSchema).max(8).optional(),
   isPublic: z.boolean().optional(),
@@ -555,12 +663,25 @@ const updateCatalogItemSchema = z.object({
   imageUrls: z.array(z.string().url()).min(1).max(8).optional(),
   stockQuantity: z.number().int().nonnegative().optional(),
   trackStock: z.boolean().optional(),
+  costPrice: z.number().nonnegative().nullable().optional(),
+  lowStockThreshold: z.number().int().nonnegative().max(9999).optional(),
   status: z.enum(['draft', 'active', 'archived', 'out_of_stock']).optional(),
   variants: z.array(catalogVariantSchema).max(8).optional(),
   isPublic: z.boolean().optional(),
   location: z.string().max(80).optional(),
   condition: z.enum(['New', 'Used']).optional(),
   takenDown: z.boolean().optional(),
+});
+
+const stockAdjustSchema = z.object({
+  userId: z.string().min(1),
+  delta: z.number().int().refine((value) => value !== 0, 'Delta cannot be zero'),
+  reason: z.string().trim().min(2).max(200).default('Manual adjustment'),
+  lowStockThreshold: z.number().int().nonnegative().max(9999).optional(),
+});
+
+const inventoryAlertReviewSchema = z.object({
+  userId: z.string().min(1),
 });
 
 const resolveCatalogStatus = (
@@ -581,8 +702,61 @@ const paymentIntentSchema = z.object({
   phone: z.string().min(6).max(30).optional(),
   note: z.string().max(160).optional(),
   userId: z.string().min(1).optional(),
+  orderId: z.string().min(1).max(80).optional(),
   provider: z.enum(['mtn_momo', 'vodafone_cash', 'airteltigo']).default('mtn_momo'),
 });
+
+const createOrderSchema = z.object({
+  buyerUserId: z.string().min(1),
+  catalogItemId: z.string().min(1),
+  quantity: z.number().int().positive().max(99).default(1),
+  variantSelections: z.array(z.object({
+    name: z.string().trim().min(1).max(40),
+    option: z.string().trim().min(1).max(40),
+  })).max(8).optional(),
+  statusId: z.string().max(80).optional(),
+  chatId: z.string().max(80).optional(),
+  clientRequestId: z.string().trim().min(8).max(80).optional(),
+});
+
+const updateOrderSchema = z.object({
+  userId: z.string().min(1),
+  state: z.enum(['pending_payment', 'paid', 'processing', 'dispatched', 'completed', 'cancelled', 'refunded']),
+  note: z.string().trim().max(200).optional(),
+});
+
+const ORDER_TRANSITIONS: Record<OrderState, OrderState[]> = {
+  pending_payment: ['paid', 'cancelled'],
+  paid: ['processing', 'cancelled', 'refunded'],
+  processing: ['dispatched', 'cancelled', 'refunded'],
+  dispatched: ['completed', 'refunded'],
+  completed: ['refunded'],
+  cancelled: [],
+  refunded: [],
+};
+
+const canTransitionOrder = (
+  order: CommerceOrder,
+  nextState: OrderState,
+  actorUserId: string,
+): string | null => {
+  const isBuyer = order.buyerUserId === actorUserId;
+  const isSeller = order.sellerUserId === actorUserId;
+  if (!isBuyer && !isSeller) return 'You cannot update this order.';
+  if (order.state === nextState) return 'Order is already in that state.';
+  if (!(ORDER_TRANSITIONS[order.state] || []).includes(nextState)) {
+    return `Cannot move an order from ${order.state} to ${nextState}.`;
+  }
+  if (isBuyer && !isSeller) {
+    if (nextState === 'cancelled' && order.state === 'pending_payment') return null;
+    return 'Buyers can only cancel unpaid orders.';
+  }
+  // Seller (or seller who is also buyer in edge cases) manages fulfilment.
+  if (nextState === 'paid' || nextState === 'processing' || nextState === 'dispatched' || nextState === 'completed' || nextState === 'refunded' || nextState === 'cancelled') {
+    return null;
+  }
+  return 'That order status change is not allowed.';
+};
 
 const updateReceiptSchema = z.object({
   state: z.enum(['delivered', 'read']),
@@ -2798,6 +2972,301 @@ const persistCatalogItem = async (item: CatalogItem) => {
   return item;
 };
 
+const readOrders = async () => {
+  const db = await getDb();
+  if (!db) {
+    return [...seedOrders];
+  }
+  await seedDatabaseIfNeeded();
+  return db.collection<CommerceOrder>('orders').find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } }).toArray();
+};
+
+const saveOrder = async (order: CommerceOrder) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedOrders.findIndex((item) => item.id === order.id);
+    if (index >= 0) seedOrders[index] = order;
+    else seedOrders.unshift(order);
+    return order;
+  }
+  await seedDatabaseIfNeeded();
+  await db.collection<CommerceOrder>('orders').updateOne({ id: order.id }, { $set: order }, { upsert: true });
+  return order;
+};
+
+const readSaleReceipts = async () => {
+  const db = await getDb();
+  if (!db) return [...seedReceipts];
+  await seedDatabaseIfNeeded();
+  return db.collection<SaleReceipt>('saleReceipts').find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } }).toArray();
+};
+
+const saveSaleReceipt = async (receipt: SaleReceipt) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedReceipts.findIndex((item) => item.id === receipt.id);
+    if (index >= 0) seedReceipts[index] = receipt;
+    else seedReceipts.unshift(receipt);
+    return receipt;
+  }
+  await seedDatabaseIfNeeded();
+  await db.collection<SaleReceipt>('saleReceipts').updateOne({ id: receipt.id }, { $set: receipt }, { upsert: true });
+  return receipt;
+};
+
+const nextReceiptNumber = async (businessKey: string) => {
+  const db = await getDb();
+  const year = new Date().getFullYear();
+  const key = `${businessKey}-${year}`;
+  if (!db) {
+    receiptCounters[key] = (receiptCounters[key] || 0) + 1;
+    return `R-${year}-${String(receiptCounters[key]).padStart(5, '0')}`;
+  }
+  const result = await db.collection('receiptCounters').findOneAndUpdate(
+    { id: key },
+    { $inc: { seq: 1 }, $setOnInsert: { id: key, createdAt: new Date().toISOString() } },
+    { upsert: true, returnDocument: 'after' },
+  );
+  const seq = Number((result as { seq?: number } | null)?.seq || 1);
+  return `R-${year}-${String(seq).padStart(5, '0')}`;
+};
+
+const issueSaleReceiptForOrder = async (
+  order: CommerceOrder,
+  paymentMethod = 'marked_paid',
+): Promise<{ order: CommerceOrder; receipt: SaleReceipt }> => {
+  if (order.receiptId) {
+    const existing = (await readSaleReceipts()).find((item) => item.id === order.receiptId);
+    if (existing) return { order, receipt: existing };
+  }
+  const byOrder = (await readSaleReceipts()).find(
+    (item) => item.orderId === order.id && item.state === 'issued',
+  );
+  if (byOrder) {
+    const linked = { ...order, receiptId: byOrder.id, updatedAt: new Date().toISOString() };
+    await saveOrder(linked);
+    return { order: linked, receipt: byOrder };
+  }
+
+  const [seller, buyer, sellerProfile, buyerProfile] = await Promise.all([
+    readUsers().then((users) => users.find((user) => user.id === order.sellerUserId)),
+    readUsers().then((users) => users.find((user) => user.id === order.buyerUserId)),
+    readProfile(order.sellerUserId),
+    readProfile(order.buyerUserId),
+  ]);
+  const business = order.businessId
+    ? (await readBusinesses()).find((item) => item.id === order.businessId)
+    : null;
+  const now = new Date().toISOString();
+  const businessKey = order.businessId || order.sellerUserId;
+  const receiptNumber = await nextReceiptNumber(businessKey);
+  const receipt: SaleReceipt = {
+    id: `rcpt${Date.now()}`,
+    receiptNumber,
+    orderId: order.id,
+    paymentId: order.paymentId || null,
+    buyerUserId: order.buyerUserId,
+    sellerUserId: order.sellerUserId,
+    businessId: order.businessId || null,
+    businessName: business?.name || sellerProfile?.businessName || seller?.name || 'Seller',
+    sellerName: seller?.name || sellerProfile?.name || 'Seller',
+    buyerName: buyer?.name || buyerProfile?.name || 'Customer',
+    items: order.items.map((item) => ({ ...item })),
+    subtotal: order.totalAmount,
+    discount: 0,
+    tax: 0,
+    totalAmount: order.totalAmount,
+    currency: order.currency,
+    paymentMethod,
+    paymentReference: order.paymentId || order.id,
+    state: 'issued',
+    linkedReceiptId: null,
+    issuedAt: now,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveSaleReceipt(receipt);
+  let withReceipt = { ...order, receiptId: receipt.id, updatedAt: now };
+  const space = order.businessId || 'personal';
+  const chat = order.chatId
+    ? (await readChats()).find((entry) => entry.id === order.chatId) || null
+    : await createOrFindDirectChat(order.sellerUserId, order.buyerUserId, space);
+  if (chat) {
+    const itemTitle = order.items[0]?.title || 'item';
+    const message: Message = {
+      id: `m${Date.now()}`,
+      chatId: chat.id,
+      senderId: order.sellerUserId,
+      kind: 'text',
+      text: `Receipt ${receipt.receiptNumber} · ${receipt.currency} ${receipt.totalAmount} · ${itemTitle}`,
+      mediaUrls: [],
+      sentAt: now,
+      state: 'sent',
+      receiptId: receipt.id,
+      catalogItemId: order.items[0]?.catalogItemId,
+      actorBusinessId: order.businessId || undefined,
+      actorName: receipt.businessName,
+    };
+    await persistMessage(message);
+    const updatedChat = {
+      ...chat,
+      lastMessagePreview: message.text,
+      updatedAt: now,
+    };
+    const db = await getDb();
+    if (!db) {
+      const index = seedChats.findIndex((entry) => entry.id === chat.id);
+      if (index >= 0) seedChats[index] = updatedChat;
+    } else {
+      await collectionsFor(db).chats.updateOne({ id: chat.id }, { $set: updatedChat });
+    }
+    withReceipt = { ...withReceipt, chatId: chat.id };
+    chat.participants.forEach((participantId) => {
+      io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+      io.to(`user:${participantId}`).emit('chat:updated', updatedChat);
+    });
+  }
+  await saveOrder(withReceipt);
+  io.to(`user:${order.sellerUserId}`).emit('receipt:created', { receipt });
+  io.to(`user:${order.buyerUserId}`).emit('receipt:created', { receipt });
+  void recordAdminEvent(getDb, {
+    level: 'info',
+    area: 'receipts',
+    message: 'Sale receipt issued',
+    detail: `${receipt.receiptNumber} ${order.id}`,
+  });
+  return { order: withReceipt, receipt };
+};
+
+const catalogIsPurchasable = (item: CatalogItem) => {
+  const status = item.status || 'active';
+  if (item.takenDown || status === 'archived' || status === 'draft') return false;
+  if (status === 'out_of_stock') return false;
+  if (item.trackStock !== false && item.stockQuantity <= 0) return false;
+  return true;
+};
+
+const availableStock = (item: CatalogItem) =>
+  Math.max(0, Number(item.stockQuantity || 0) - Number(item.reservedQuantity || 0));
+
+const persistCatalogItemUpdate = async (item: CatalogItem) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedCatalogItems.findIndex((entry) => entry.id === item.id);
+    if (index >= 0) seedCatalogItems[index] = item;
+    else seedCatalogItems.unshift(item);
+    return item;
+  }
+  await collectionsFor(db).catalogItems.updateOne({ id: item.id }, { $set: item }, { upsert: true });
+  return item;
+};
+
+const saveInventoryMovement = async (movement: InventoryMovement) => {
+  const db = await getDb();
+  if (!db) {
+    seedInventoryMovements.unshift(movement);
+    return movement;
+  }
+  await db.collection<InventoryMovement>('inventoryMovements').insertOne(movement);
+  return movement;
+};
+
+const readInventoryAlerts = async () => {
+  const db = await getDb();
+  if (!db) return [...seedInventoryAlerts];
+  return db.collection<InventoryAlert>('inventoryAlerts').find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } }).toArray();
+};
+
+const saveInventoryAlert = async (alert: InventoryAlert) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedInventoryAlerts.findIndex((entry) => entry.id === alert.id);
+    if (index >= 0) seedInventoryAlerts[index] = alert;
+    else seedInventoryAlerts.unshift(alert);
+    return alert;
+  }
+  await db.collection<InventoryAlert>('inventoryAlerts').updateOne({ id: alert.id }, { $set: alert }, { upsert: true });
+  return alert;
+};
+
+const maybeCreateLowStockAlert = async (item: CatalogItem) => {
+  if (item.trackStock === false) return null;
+  const threshold = item.lowStockThreshold ?? 2;
+  if ((item.stockQuantity ?? 0) > threshold) return null;
+  const openExisting = (await readInventoryAlerts()).find(
+    (alert) =>
+      alert.catalogItemId === item.id
+      && alert.state === 'open'
+      && alert.stockQuantity === item.stockQuantity,
+  );
+  if (openExisting) return openExisting;
+  const alert: InventoryAlert = {
+    id: `ial${Date.now()}`,
+    catalogItemId: item.id,
+    sellerUserId: item.sellerId,
+    businessId: item.businessId || null,
+    title: item.title,
+    stockQuantity: item.stockQuantity,
+    lowStockThreshold: threshold,
+    state: 'open',
+    createdAt: new Date().toISOString(),
+    reviewedAt: null,
+    reviewedByUserId: null,
+  };
+  await saveInventoryAlert(alert);
+  io.to(`user:${item.sellerId}`).emit('inventory:alert', alert);
+  return alert;
+};
+
+const applyInventoryChange = async (params: {
+  item: CatalogItem;
+  delta: number;
+  kind: InventoryMovementKind;
+  reason: string;
+  byUserId: string;
+  orderId?: string | null;
+  allowNegative?: boolean;
+  lowStockThreshold?: number;
+}) => {
+  const { item, delta, kind, reason, byUserId, orderId, allowNegative, lowStockThreshold } = params;
+  if (item.trackStock === false) {
+    return { item, movement: null as InventoryMovement | null, alert: null as InventoryAlert | null };
+  }
+  const stockBefore = Number(item.stockQuantity || 0);
+  const stockAfter = allowNegative ? stockBefore + delta : Math.max(0, stockBefore + delta);
+  if (!allowNegative && stockBefore + delta < 0) {
+    throw new Error(`Only ${stockBefore} in stock.`);
+  }
+  const now = new Date().toISOString();
+  const next: CatalogItem = {
+    ...item,
+    stockQuantity: stockAfter,
+    lowStockThreshold: lowStockThreshold ?? item.lowStockThreshold ?? 2,
+    status: resolveCatalogStatus(item.status, stockAfter, item.trackStock !== false),
+    availabilityUpdatedAt: now,
+    updatedAt: now,
+  };
+  await persistCatalogItemUpdate(next);
+  const movement: InventoryMovement = {
+    id: `im${Date.now()}`,
+    catalogItemId: item.id,
+    sellerUserId: item.sellerId,
+    businessId: item.businessId || null,
+    kind,
+    quantityDelta: delta,
+    stockBefore,
+    stockAfter,
+    reason,
+    orderId: orderId || null,
+    byUserId,
+    createdAt: now,
+  };
+  await saveInventoryMovement(movement);
+  io.emit('catalog:itemUpdated', next);
+  const alert = await maybeCreateLowStockAlert(next);
+  return { item: next, movement, alert };
+};
+
 const persistCall = async (call: Call) => {
   const db = await getDb();
   if (!db) {
@@ -3857,6 +4326,20 @@ app.post('/api/statuses', async (req, res) => {
   }
 
   const createdAt = new Date().toISOString();
+  if (parseResult.data.catalogItemId) {
+    const tagged = (await readCatalogItems()).find((item) => item.id === parseResult.data.catalogItemId);
+    if (!tagged || tagged.takenDown || (tagged.status || 'active') === 'archived') {
+      return res.status(400).json({ error: 'Tag a live product from your catalogue.' });
+    }
+    const ownsProduct = tagged.sellerId === parseResult.data.userId;
+    const business = tagged.businessId
+      ? (await readBusinesses()).find((item) => item.id === tagged.businessId)
+      : null;
+    const staffOfBusiness = business ? Boolean(businessRoleFor(business, parseResult.data.userId)) : false;
+    if (!ownsProduct && !staffOfBusiness) {
+      return res.status(403).json({ error: 'You can only tag products from your own catalogue.' });
+    }
+  }
   if (parseResult.data.audience === 'marketplace' && parseResult.data.catalogItemId) {
     const existingStatuses = await readStatuses();
     const alreadyPosted = existingStatuses.find((status) =>
@@ -4100,6 +4583,247 @@ app.get('/api/catalog/search', async (req, res) => {
   return res.json({ catalogItems: items, count: items.length });
 });
 
+app.get('/api/catalog/:itemId', async (req, res) => {
+  const item = (await readCatalogItems()).find((entry) => entry.id === req.params.itemId);
+  if (!item || item.takenDown) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
+  const seller = (await readUsers()).find((user) => user.id === item.sellerId);
+  const sellerProfile = await readProfile(item.sellerId);
+  const business = item.businessId
+    ? (await readBusinesses()).find((entry) => entry.id === item.businessId)
+    : (await readBusinesses()).find(
+      (entry) => entry.ownerUserId === item.sellerId && (entry.visibility || 'draft') === 'published',
+    );
+  return res.json({
+    item: {
+      ...item,
+      purchasable: catalogIsPurchasable(item),
+    },
+    seller: {
+      id: item.sellerId,
+      name: seller?.name || sellerProfile?.name || 'Seller',
+      phone: sellerProfile?.phone || seller?.phone || '',
+      businessId: business?.id || null,
+      businessName: business?.name || sellerProfile?.businessName || '',
+      verified: (business?.verificationStatus || 'unverified') === 'approved',
+    },
+  });
+});
+
+app.post('/api/orders', async (req, res) => {
+  const parseResult = createOrderSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose a product and quantity.' });
+  }
+  if (parseResult.data.clientRequestId) {
+    const existing = (await readOrders()).find(
+      (order) =>
+        order.clientRequestId === parseResult.data.clientRequestId
+        && order.buyerUserId === parseResult.data.buyerUserId,
+    );
+    if (existing) {
+      return res.status(200).json({ order: existing, duplicate: true });
+    }
+  }
+  const item = (await readCatalogItems()).find((entry) => entry.id === parseResult.data.catalogItemId);
+  if (!item) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
+  if (!catalogIsPurchasable(item)) {
+    return res.status(409).json({ error: 'This product is not available to buy right now.' });
+  }
+  if (item.sellerId === parseResult.data.buyerUserId) {
+    return res.status(400).json({ error: 'You cannot order your own product.' });
+  }
+  const quantity = parseResult.data.quantity;
+  if (item.trackStock !== false && item.stockQuantity < quantity) {
+    return res.status(409).json({ error: `Only ${item.stockQuantity} left in stock.` });
+  }
+  const selections = parseResult.data.variantSelections || [];
+  for (const selection of selections) {
+    const variant = (item.variants || []).find((entry) => entry.name === selection.name);
+    if (!variant || !variant.options.includes(selection.option)) {
+      return res.status(400).json({ error: `Choose a valid ${selection.name} option.` });
+    }
+  }
+  const now = new Date().toISOString();
+  const order: CommerceOrder = {
+    id: `ord${Date.now()}`,
+    buyerUserId: parseResult.data.buyerUserId,
+    sellerUserId: item.sellerId,
+    businessId: item.businessId || null,
+    statusId: parseResult.data.statusId || null,
+    chatId: parseResult.data.chatId || null,
+    paymentId: null,
+    clientRequestId: parseResult.data.clientRequestId || null,
+    items: [{
+      catalogItemId: item.id,
+      title: item.title,
+      price: item.price,
+      currency: item.currency,
+      quantity,
+      variantSelections: selections,
+      imageUrl: item.imageUrls?.[0] || '',
+    }],
+    totalAmount: Number((item.price * quantity).toFixed(2)),
+    currency: item.currency,
+    state: 'pending_payment',
+    history: [{ state: 'pending_payment', at: now, byUserId: parseResult.data.buyerUserId, note: 'Order created from product' }],
+    createdAt: now,
+    updatedAt: now,
+  };
+  await saveOrder(order);
+  io.to(`user:${order.sellerUserId}`).emit('order:created', { order });
+  io.to(`user:${order.buyerUserId}`).emit('order:created', { order });
+  void recordAdminEvent(getDb, {
+    level: 'info',
+    area: 'orders',
+    message: 'Order created',
+    detail: `${order.id} ${item.title} ${order.totalAmount} ${order.currency}`,
+  });
+  return res.status(201).json({ order, item });
+});
+
+app.get('/api/orders', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const role = typeof req.query.role === 'string' ? req.query.role : 'all';
+  const state = typeof req.query.state === 'string' ? req.query.state : '';
+  let orders = (await readOrders()).filter(
+    (order) => order.buyerUserId === userId || order.sellerUserId === userId,
+  );
+  if (role === 'buyer') orders = orders.filter((order) => order.buyerUserId === userId);
+  if (role === 'seller') orders = orders.filter((order) => order.sellerUserId === userId);
+  if (state) orders = orders.filter((order) => order.state === state);
+  return res.json({ orders });
+});
+
+app.get('/api/orders/:orderId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (userId && order.buyerUserId !== userId && order.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this order.' });
+  }
+  return res.json({ order });
+});
+
+app.patch('/api/orders/:orderId', async (req, res) => {
+  const parseResult = updateOrderSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid order update.' });
+  }
+  const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  const nextState = parseResult.data.state;
+  const denyReason = canTransitionOrder(order, nextState, parseResult.data.userId);
+  if (denyReason) {
+    return res.status(400).json({ error: denyReason });
+  }
+  const now = new Date().toISOString();
+  const updated: CommerceOrder = {
+    ...order,
+    state: nextState,
+    updatedAt: now,
+    history: [
+      ...order.history,
+      { state: nextState, at: now, byUserId: parseResult.data.userId, note: parseResult.data.note || '' },
+    ],
+  };
+  let finalOrder = updated;
+  let issuedReceipt: SaleReceipt | null = null;
+  if (nextState === 'paid' && order.state === 'pending_payment') {
+    const catalogItem = (await readCatalogItems()).find((entry) => entry.id === order.items[0]?.catalogItemId);
+    const shouldTrackStock = catalogItem ? catalogItem.trackStock !== false : false;
+    if (catalogItem && shouldTrackStock) {
+      const qty = order.items[0]?.quantity || 1;
+      const nextStock = Math.max(0, (catalogItem.stockQuantity || 0) - qty);
+      const stockUpdated: CatalogItem = {
+        ...catalogItem,
+        stockQuantity: nextStock,
+        status: resolveCatalogStatus(catalogItem.status, nextStock, shouldTrackStock),
+        availabilityUpdatedAt: now,
+        updatedAt: now,
+      };
+      const db = await getDb();
+      if (!db) {
+        const index = seedCatalogItems.findIndex((entry) => entry.id === stockUpdated.id);
+        if (index >= 0) seedCatalogItems[index] = stockUpdated;
+      } else {
+        await collectionsFor(db).catalogItems.updateOne({ id: stockUpdated.id }, { $set: stockUpdated });
+      }
+      io.emit('catalog:itemUpdated', stockUpdated);
+    }
+    const receiptResult = await issueSaleReceiptForOrder(
+      updated,
+      order.paymentId ? 'provider' : 'seller_confirmed',
+    );
+    finalOrder = { ...receiptResult.order, state: 'paid', history: updated.history };
+    issuedReceipt = receiptResult.receipt;
+    await saveOrder(finalOrder);
+  } else if (nextState === 'refunded' && order.receiptId) {
+    const original = (await readSaleReceipts()).find((item) => item.id === order.receiptId);
+    if (original && original.state === 'issued') {
+      const refundReceipt: SaleReceipt = {
+        ...original,
+        id: `rcpt${Date.now()}`,
+        receiptNumber: `${original.receiptNumber}-RF`,
+        state: 'refunded',
+        linkedReceiptId: original.id,
+        paymentReference: `refund:${original.paymentReference}`,
+        issuedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await saveSaleReceipt({ ...original, state: 'voided', updatedAt: now, linkedReceiptId: refundReceipt.id });
+      await saveSaleReceipt(refundReceipt);
+      io.to(`user:${order.sellerUserId}`).emit('receipt:created', { receipt: refundReceipt });
+      io.to(`user:${order.buyerUserId}`).emit('receipt:created', { receipt: refundReceipt });
+    }
+    await saveOrder(finalOrder);
+  } else {
+    await saveOrder(finalOrder);
+  }
+  io.to(`user:${finalOrder.sellerUserId}`).emit('order:updated', { order: finalOrder });
+  io.to(`user:${finalOrder.buyerUserId}`).emit('order:updated', { order: finalOrder });
+  return res.json({ order: finalOrder, receipt: issuedReceipt });
+});
+
+app.get('/api/receipts', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const receipts = (await readSaleReceipts()).filter(
+    (receipt) => receipt.buyerUserId === userId || receipt.sellerUserId === userId,
+  );
+  return res.json({ receipts });
+});
+
+app.get('/api/receipts/:receiptId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const receipt = (await readSaleReceipts()).find((item) => item.id === req.params.receiptId);
+  if (!receipt) return res.status(404).json({ error: 'Receipt not found' });
+  if (userId && receipt.buyerUserId !== userId && receipt.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this receipt.' });
+  }
+  return res.json({ receipt });
+});
+
+app.get('/api/orders/:orderId/receipt', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (userId && order.buyerUserId !== userId && order.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this order.' });
+  }
+  if (!order.receiptId) {
+    return res.status(404).json({ error: 'No receipt yet. Receipts are issued after payment is confirmed.' });
+  }
+  const receipt = (await readSaleReceipts()).find((item) => item.id === order.receiptId);
+  if (!receipt) return res.status(404).json({ error: 'Receipt not found' });
+  return res.json({ receipt, order });
+});
+
 app.post('/api/catalog', async (req, res) => {
   const parseResult = createCatalogItemSchema.safeParse(req.body);
 
@@ -4143,6 +4867,8 @@ app.post('/api/catalog', async (req, res) => {
     imageUrls: parseResult.data.imageUrls,
     stockQuantity,
     trackStock,
+    costPrice: parseResult.data.costPrice ?? null,
+    lowStockThreshold: parseResult.data.lowStockThreshold ?? 2,
     status,
     variants: parseResult.data.variants || [],
     availabilityUpdatedAt: timestamp,
@@ -4276,6 +5002,16 @@ app.post('/api/payments/intent', async (req, res) => {
   const db = await getDb();
   if (db) {
     await db.collection('payments').insertOne({ ...intent });
+  }
+  if (parseResult.data.orderId) {
+    const order = (await readOrders()).find((entry) => entry.id === parseResult.data.orderId);
+    if (order) {
+      await saveOrder({
+        ...order,
+        paymentId: intent.id,
+        updatedAt: intent.createdAt,
+      });
+    }
   }
   return res.status(201).json({
     intent,
@@ -4528,6 +5264,167 @@ app.get('/api/businesses/:businessId', async (req, res) => {
     business: isMember ? { ...business, verified: publicBusiness.verified } : publicBusiness,
     catalogItems: catalog,
     isMember,
+  });
+});
+
+app.get('/api/sales/dashboard', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : '';
+  const period = typeof req.query.period === 'string' ? req.query.period : '7d';
+  const now = new Date();
+  const start = new Date(now);
+  if (period === 'today') {
+    start.setHours(0, 0, 0, 0);
+  } else if (period === '30d') {
+    start.setDate(start.getDate() - 30);
+  } else {
+    start.setDate(start.getDate() - 7);
+  }
+  const startIso = start.toISOString();
+
+  let business: BusinessProfile | null = null;
+  let role: BusinessRole | null = null;
+  let sellerIds: string[] = [userId];
+  if (businessId) {
+    business = (await readBusinesses()).find((item) => item.id === businessId) || null;
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    role = businessRoleFor(business, userId);
+    if (!role) return res.status(403).json({ error: 'You are not on this business.' });
+    sellerIds = [business.ownerUserId];
+  }
+
+  const canSeeFinance = !businessId || role === 'owner' || role === 'manager';
+  const [orders, receipts, catalog] = await Promise.all([
+    readOrders(),
+    readSaleReceipts(),
+    readCatalogItems(),
+  ]);
+
+  const scopedOrders = orders.filter((order) => {
+    const sellerMatch = sellerIds.includes(order.sellerUserId);
+    const businessMatch = businessId
+      ? order.businessId === businessId || (!order.businessId && order.sellerUserId === business?.ownerUserId)
+      : true;
+    return sellerMatch && businessMatch;
+  });
+  const periodOrders = scopedOrders.filter((order) => order.createdAt >= startIso);
+  const scopedReceipts = receipts.filter((receipt) => {
+    const sellerMatch = sellerIds.includes(receipt.sellerUserId);
+    const businessMatch = businessId
+      ? receipt.businessId === businessId || (!receipt.businessId && receipt.sellerUserId === business?.ownerUserId)
+      : true;
+    return sellerMatch && businessMatch && receipt.issuedAt >= startIso;
+  });
+
+  const issuedReceipts = scopedReceipts.filter((receipt) => receipt.state === 'issued');
+  const refundReceipts = scopedReceipts.filter((receipt) => receipt.state === 'refunded');
+  const grossSales = issuedReceipts.reduce((sum, receipt) => sum + Number(receipt.totalAmount || 0), 0);
+  const discounts = issuedReceipts.reduce((sum, receipt) => sum + Number(receipt.discount || 0), 0);
+  const refunds = refundReceipts.reduce((sum, receipt) => sum + Number(receipt.totalAmount || 0), 0);
+  const netSales = Number((grossSales - refunds).toFixed(2));
+  const cashReceived = grossSales; // only issued receipts = confirmed payment
+  const currency = issuedReceipts[0]?.currency
+    || periodOrders[0]?.currency
+    || (await readProfile(sellerIds[0]))?.currency
+    || 'GHS';
+
+  const pendingOrders = scopedOrders.filter((order) =>
+    ['pending_payment', 'paid', 'processing', 'dispatched'].includes(order.state),
+  );
+  const confirmedOrderIds = new Set(issuedReceipts.map((receipt) => receipt.orderId));
+
+  const productSales: Record<string, { catalogItemId: string; title: string; units: number; revenue: number }> = {};
+  issuedReceipts.forEach((receipt) => {
+    (receipt.items || []).forEach((item) => {
+      const key = item.catalogItemId || item.title;
+      if (!productSales[key]) {
+        productSales[key] = {
+          catalogItemId: item.catalogItemId,
+          title: item.title,
+          units: 0,
+          revenue: 0,
+        };
+      }
+      productSales[key].units += item.quantity || 0;
+      productSales[key].revenue += Number(item.price || 0) * Number(item.quantity || 0);
+    });
+  });
+  const topProducts = Object.values(productSales)
+    .sort((a, b) => b.units - a.units || b.revenue - a.revenue)
+    .slice(0, 5);
+
+  const sellerCatalog = catalog.filter((item) =>
+    sellerIds.includes(item.sellerId)
+    && (!businessId || item.businessId === businessId || !item.businessId)
+    && !item.takenDown
+    && (item.status || 'active') !== 'archived',
+  );
+  const lowStock = sellerCatalog.filter((item) => {
+    if (item.trackStock === false) return false;
+    const threshold = item.lowStockThreshold ?? 2;
+    return (item.stockQuantity ?? 0) <= threshold;
+  }).map((item) => ({
+    id: item.id,
+    title: item.title,
+    stockQuantity: item.stockQuantity,
+    lowStockThreshold: item.lowStockThreshold ?? 2,
+  }));
+
+  let costOfGoodsSold: number | null = 0;
+  let missingCostLines = 0;
+  issuedReceipts.forEach((receipt) => {
+    (receipt.items || []).forEach((item) => {
+      const product = catalog.find((entry) => entry.id === item.catalogItemId);
+      if (product && product.costPrice != null && Number.isFinite(product.costPrice)) {
+        costOfGoodsSold = (costOfGoodsSold || 0) + Number(product.costPrice) * Number(item.quantity || 0);
+      } else {
+        missingCostLines += 1;
+      }
+    });
+  });
+  const grossProfitAvailable = missingCostLines === 0 && issuedReceipts.length > 0;
+  const grossProfit = grossProfitAvailable ? Number((netSales - (costOfGoodsSold || 0)).toFixed(2)) : null;
+  if (!grossProfitAvailable) costOfGoodsSold = null;
+
+  const finance = canSeeFinance
+    ? {
+        grossSales: Number(grossSales.toFixed(2)),
+        discounts: Number(discounts.toFixed(2)),
+        refunds: Number(refunds.toFixed(2)),
+        netSales,
+        cashReceived: Number(cashReceived.toFixed(2)),
+        costOfGoodsSold,
+        grossProfit,
+        grossProfitAvailable,
+        grossProfitNote: grossProfitAvailable
+          ? 'Gross profit uses recorded product cost prices. This is not net profit.'
+          : 'Gross profit unavailable until every sold product has a cost price. This is not profit.',
+      }
+    : null;
+
+  return res.json({
+    period: period === 'today' || period === '30d' ? period : '7d',
+    periodStart: startIso,
+    periodEnd: now.toISOString(),
+    currency,
+    lastUpdatedAt: now.toISOString(),
+    estimated: false,
+    role: role || 'owner',
+    canSeeFinance,
+    metrics: {
+      ordersInPeriod: periodOrders.length,
+      pendingOrders: pendingOrders.length,
+      confirmedSalesCount: confirmedOrderIds.size,
+      lowStockCount: lowStock.length,
+      ...finance,
+    },
+    topProducts: canSeeFinance ? topProducts : topProducts.map(({ catalogItemId, title, units }) => ({ catalogItemId, title, units })),
+    lowStock,
+    drilldown: {
+      pendingOrderIds: pendingOrders.slice(0, 20).map((order) => order.id),
+      issuedReceiptIds: issuedReceipts.slice(0, 20).map((receipt) => receipt.id),
+    },
   });
 });
 
