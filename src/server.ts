@@ -42,6 +42,11 @@ import {
   resolveReactionSelection,
   type ReactionsDeps,
 } from './reactionsApi.js';
+import {
+  registerBadgesApi,
+  recordGroupMemberJoinsFromServer,
+  type BadgesDeps,
+} from './badgesApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
@@ -9380,6 +9385,13 @@ app.post('/api/chats/:chatId/members', async (req, res) => {
   const updated = { ...chat, participants, adminIds: chatAdmins(chat), updatedAt: new Date().toISOString() };
   await saveChatRecord(updated);
   io.emit('chat:updated', updated);
+  if (added.length) {
+    void recordGroupMemberJoinsFromServer({
+      chatId: updated.id,
+      addedUserIds: added,
+      addedBy: userId,
+    });
+  }
   const host = (await readUsers()).find((user) => user.id === userId);
   for (const participantId of added) {
     void notifyOfflineUser(
@@ -10252,6 +10264,15 @@ const reactionsDeps: ReactionsDeps = {
   presentMessage: (message, viewerId) => presentMessage(message as Message, viewerId),
 };
 registerReactionsApi(app, reactionsDeps);
+
+const badgesDeps: BadgesDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  readChats,
+  readMessages,
+};
+registerBadgesApi(app, badgesDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
