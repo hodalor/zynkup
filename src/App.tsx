@@ -3,7 +3,7 @@ import QRCode from 'qrcode';
 import { io, Socket } from 'socket.io-client';
 import './App.css';
 
-type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games';
+type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games' | 'events';
 type ReceiptState = 'sent' | 'delivered' | 'read';
 type SettingsPanelId =
   | 'favorites'
@@ -213,6 +213,95 @@ type GameRoundResultPayload = {
   round?: GameRoundPublic | null;
   picks: Array<{ userId: string; answerIndex: number | null }>;
   players: Array<{ userId: string; status: GamePlayerStatus; score: number }>;
+};
+
+type EventStatus = 'scheduled' | 'live' | 'ended' | 'cancelled';
+type EventRsvpStatus = 'interested' | 'going' | 'cancelled';
+type EventScreen = 'list' | 'create' | 'detail';
+
+type EventRsvpSummary = {
+  status: EventRsvpStatus;
+  updatedAt?: string;
+};
+
+type EventAttendee = {
+  id: string;
+  eventId: string;
+  userId: string;
+  status: EventRsvpStatus;
+  createdAt: string;
+  updatedAt: string;
+  name?: string;
+  avatar?: string;
+};
+
+type CommunityEventPublic = {
+  id: string;
+  title: string;
+  description: string;
+  hostUserId: string;
+  communityId?: string | null;
+  chatId?: string | null;
+  voiceRoomId?: string | null;
+  createVoiceOnStart?: boolean;
+  startsAt: string;
+  endsAt?: string | null;
+  timezone: string;
+  startsAtLocal: string;
+  endsAtLocal?: string | null;
+  capacity: number;
+  status: EventStatus;
+  reminderMinutes: number[];
+  createdAt: string;
+  updatedAt: string;
+  cancelledAt?: string | null;
+  myRsvp?: EventRsvpStatus | EventRsvpSummary | null;
+  goingCount?: number;
+  interestedCount?: number;
+  spotsRemaining?: number;
+  attendees?: EventAttendee[];
+};
+
+type EventAlertModal = {
+  kind: 'reminder' | 'starting' | 'cancelled';
+  eventId: string;
+  title: string;
+  message: string;
+  startsAtLocal?: string;
+  minutesBefore?: number;
+  chatId?: string | null;
+  voiceRoomId?: string | null;
+};
+
+const eventMyRsvpStatus = (
+  event: Pick<CommunityEventPublic, 'myRsvp'> | null | undefined,
+): EventRsvpStatus | null => {
+  if (!event?.myRsvp) return null;
+  if (typeof event.myRsvp === 'string') return event.myRsvp;
+  return event.myRsvp.status ?? null;
+};
+
+const isoToDatetimeLocal = (iso: string) => {
+  if (!iso) return '';
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+
+const datetimeLocalToIso = (value: string) => {
+  if (!value.trim()) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toISOString();
+};
+
+const defaultEventTimezone = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
 };
 
 const VOICE_PUBLISHER_ROLES: VoiceRoomRole[] = ['host', 'moderator', 'speaker'];
@@ -793,6 +882,17 @@ type StatusReactor = {
   reactedAt: string;
 };
 
+type ProfileState = {
+  name: string;
+  about: string;
+  phone: string;
+  photoUrl: string;
+  currency: string;
+  profileVideoUri: string;
+  profileVideoPosterUri: string;
+  profileVideoDurationSeconds: number;
+};
+
 type AppUser = {
   id: string;
   name: string;
@@ -801,6 +901,9 @@ type AppUser = {
   presence?: string;
   lastSeenAt?: string;
   photoUri?: string;
+  profileVideoUri?: string;
+  profileVideoPosterUri?: string;
+  profileVideoDurationSeconds?: number;
 };
 
 type LinkedDevice = {
@@ -879,6 +982,7 @@ const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-web-archived-chats';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const STATUS_REACTIONS = ['❤️', '👍', '👎', '🔥', '😂'];
+const PROFILE_VIDEO_MAX_SECONDS = 6;
 
 const DEFAULT_APP_SETTINGS = {
   enterIsSend: true,
@@ -888,8 +992,11 @@ const DEFAULT_APP_SETTINGS = {
   conversationTones: true,
   saveToCameraRoll: false,
   lowDataMode: false,
+  /** Prefer still profile photos over short looping videos (bandwidth / battery). */
+  dataSaver: false,
   lastSeenPrivacy: 'everyone' as const,
   profilePhotoPrivacy: 'everyone' as const,
+  profileVideoPrivacy: 'everyone' as const,
   aboutPrivacy: 'everyone' as const,
   statusPrivacy: 'contacts' as const,
   readReceiptsEnabled: true,
@@ -921,6 +1028,78 @@ const formatClock = (value: string) => {
     ? value
     : parsed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
+
+/** Still used in chat lists / avatars — never the looping video. */
+const stillAvatarUri = (input: {
+  photoUri?: string;
+  photoUrl?: string;
+  profileVideoPosterUri?: string;
+}) => input.profileVideoPosterUri || input.photoUri || input.photoUrl || '';
+
+const probeVideoDurationSeconds = (file: File): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      const seconds = Number.isFinite(video.duration) ? Math.ceil(video.duration) : 0;
+      URL.revokeObjectURL(url);
+      resolve(seconds);
+    };
+    video.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Could not read video duration'));
+    };
+    video.src = url;
+  });
+
+const captureVideoPosterBlob = (file: File): Promise<Blob | null> =>
+  new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    const cleanup = () => URL.revokeObjectURL(url);
+    video.onseeked = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth || 480;
+        canvas.height = video.videoHeight || 480;
+        const ctx = canvas.getContext('2d');
+        if (!ctx || !canvas.width || !canvas.height) {
+          cleanup();
+          resolve(null);
+          return;
+        }
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => {
+            cleanup();
+            resolve(blob);
+          },
+          'image/jpeg',
+          0.85,
+        );
+      } catch {
+        cleanup();
+        resolve(null);
+      }
+    };
+    video.onloadeddata = () => {
+      try {
+        video.currentTime = Math.min(0.1, Math.max(0, (video.duration || 1) * 0.05));
+      } catch {
+        cleanup();
+        resolve(null);
+      }
+    };
+    video.onerror = () => {
+      cleanup();
+      resolve(null);
+    };
+    video.src = url;
+  });
 
 const mapCatalogItemFromServer = (item: any, usersList: AppUser[] = [], fallbackSeller = 'Seller'): CatalogItem => {
   const currency = item.currency ?? 'GHS';
@@ -1211,6 +1390,36 @@ function App() {
   const [gameChatId, setGameChatId] = useState<string | null>(null);
   const [gamePendingInvite, setGamePendingInvite] = useState<GamePendingInvite | null>(null);
   const [gameRoundSecondsLeft, setGameRoundSecondsLeft] = useState<number | null>(null);
+  const [eventsList, setEventsList] = useState<CommunityEventPublic[]>([]);
+  const [eventScreen, setEventScreen] = useState<EventScreen>('list');
+  const [selectedEventId, setSelectedEventId] = useState('');
+  const [eventDetail, setEventDetail] = useState<CommunityEventPublic | null>(null);
+  const [eventBusy, setEventBusy] = useState(false);
+  const [eventNotice, setEventNotice] = useState('');
+  const [eventAlert, setEventAlert] = useState<EventAlertModal | null>(null);
+  const [eventCreateForm, setEventCreateForm] = useState({
+    title: '',
+    description: '',
+    startsAtLocal: '',
+    endsAtLocal: '',
+    timezone: defaultEventTimezone(),
+    capacity: '50',
+    communityId: '',
+    chatId: '',
+    voiceRoomId: '',
+    createVoiceOnStart: false,
+  });
+  const [eventEditForm, setEventEditForm] = useState({
+    title: '',
+    description: '',
+    startsAtLocal: '',
+    endsAtLocal: '',
+    timezone: defaultEventTimezone(),
+    capacity: '50',
+    chatId: '',
+    voiceRoomId: '',
+    createVoiceOnStart: false,
+  });
   const [callSheetVisible, setCallSheetVisible] = useState(false);
   const [calls, setCalls] = useState<CallItem[]>([]);
   const [incomingCall, setIncomingCall] = useState<CallItem | null>(null);
@@ -1262,13 +1471,19 @@ function App() {
   const [linkError, setLinkError] = useState('');
   const [linkedDevices, setLinkedDevices] = useState<LinkedDevice[]>([]);
   const [linkedDeviceSlots, setLinkedDeviceSlots] = useState({ linkedCount: 0, limit: 4, remaining: 4 });
-  const [profile, setProfile] = useState({
+  const [profile, setProfile] = useState<ProfileState>({
     name: 'Temwa Lesa',
     about: 'Seller, founder, and product operator.',
     phone: '+260765453163',
     photoUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
     currency: 'GHS',
+    profileVideoUri: '',
+    profileVideoPosterUri: '',
+    profileVideoDurationSeconds: 0,
   });
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+  );
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
   const [settingsPanel, setSettingsPanel] = useState<SettingsPanelId>('account');
   const [businessHubTab, setBusinessHubTab] = useState<BusinessHubTab>('catalog');
@@ -1383,6 +1598,7 @@ function App() {
   const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({});
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const profilePhotoInputRef = useRef<HTMLInputElement | null>(null);
+  const profileVideoInputRef = useRef<HTMLInputElement | null>(null);
   const statusInputRef = useRef<HTMLInputElement | null>(null);
   const catalogInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -1408,6 +1624,8 @@ function App() {
   const voiceParticipantsRef = useRef<VoiceRoomParticipant[]>([]);
   const voiceMakingOfferRef = useRef<Set<string>>(new Set());
   const gameActiveSessionIdRef = useRef('');
+  const selectedEventIdRef = useRef('');
+  selectedEventIdRef.current = selectedEventId;
   const callMediaStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -1569,7 +1787,7 @@ function App() {
     return connection;
   };
 
-  const uploadFiles = async (files: File[]) => {
+  const uploadFiles = async (files: File[], purpose?: string) => {
     if (!files.length) {
       return [];
     }
@@ -1578,6 +1796,9 @@ function App() {
     files.forEach((file) => {
       formData.append('files', file);
     });
+    if (purpose) {
+      formData.append('purpose', purpose);
+    }
 
     const response = await fetch(`${API_BASE_URL}/api/uploads`, {
       method: 'POST',
@@ -1591,6 +1812,36 @@ function App() {
     const payload = await response.json();
     return (payload.files ?? []).map((file: { url: string }) => file.url);
   };
+
+  const allowProfileVideoPlayback = !appSettings.dataSaver && !prefersReducedMotion;
+
+  const applyProfileFieldsFromServer = useCallback((serverProfile: any, fallback?: Partial<ProfileState>) => {
+    if (!serverProfile) {
+      return;
+    }
+    setProfile((current) => ({
+      ...current,
+      ...fallback,
+      name: serverProfile.name ?? fallback?.name ?? current.name,
+      about: serverProfile.about ?? fallback?.about ?? current.about,
+      phone: serverProfile.phone ?? fallback?.phone ?? current.phone,
+      photoUrl:
+        serverProfile.photoUri
+        || (typeof serverProfile.avatar === 'string' && serverProfile.avatar.startsWith('http')
+          ? serverProfile.avatar
+          : undefined)
+        || fallback?.photoUrl
+        || current.photoUrl,
+      currency: serverProfile.currency || fallback?.currency || current.currency,
+      profileVideoUri: serverProfile.profileVideoUri ?? fallback?.profileVideoUri ?? current.profileVideoUri,
+      profileVideoPosterUri:
+        serverProfile.profileVideoPosterUri ?? fallback?.profileVideoPosterUri ?? current.profileVideoPosterUri,
+      profileVideoDurationSeconds:
+        serverProfile.profileVideoDurationSeconds
+        ?? fallback?.profileVideoDurationSeconds
+        ?? current.profileVideoDurationSeconds,
+    }));
+  }, []);
 
   const getStatusItemDuration = (item: UpdateGroup['items'][number]) =>
     item.assets.some((asset) => asset.kind === 'video') ? STATUS_VIDEO_DURATION_MS : STATUS_IMAGE_DURATION_MS;
@@ -1707,7 +1958,7 @@ function App() {
   };
 
   const saveProfileToServer = async (
-    overrides: Partial<typeof profile> = {},
+    overrides: Partial<ProfileState> = {},
     settingsOverrides: Partial<typeof DEFAULT_APP_SETTINGS> = {},
   ) => {
     if (!currentUserId) {
@@ -1725,8 +1976,12 @@ function App() {
           about: nextProfile.about.trim() || 'Hey there! I am using ZynkUp.',
           phone: nextProfile.phone.trim() || undefined,
           photoUri: nextProfile.photoUrl || '',
+          profileVideoUri: nextProfile.profileVideoUri || '',
+          profileVideoPosterUri: nextProfile.profileVideoPosterUri || '',
+          profileVideoDurationSeconds: nextProfile.profileVideoDurationSeconds ?? 0,
           lastSeenPrivacy: nextSettings.lastSeenPrivacy,
           profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
+          profileVideoPrivacy: nextSettings.profileVideoPrivacy,
           aboutPrivacy: nextSettings.aboutPrivacy,
           statusPrivacy: nextSettings.statusPrivacy,
           readReceiptsEnabled: nextSettings.readReceiptsEnabled,
@@ -1739,20 +1994,65 @@ function App() {
       }
       const payload = await response.json();
       if (payload.profile) {
-        setProfile((current) => ({
-          ...current,
-          name: payload.profile.name ?? current.name,
-          about: payload.profile.about ?? current.about,
-          phone: payload.profile.phone ?? current.phone,
-          photoUrl: payload.profile.photoUri || current.photoUrl,
-          currency: payload.profile.currency || current.currency,
-        }));
+        applyProfileFieldsFromServer(payload.profile, nextProfile);
       }
       showToast('Settings saved');
       return true;
     } catch {
       showToast('Network error while saving settings.');
       return false;
+    }
+  };
+
+  const removeProfileVideo = async () => {
+    setProfile((current) => ({
+      ...current,
+      profileVideoUri: '',
+      profileVideoPosterUri: '',
+      profileVideoDurationSeconds: 0,
+    }));
+    await saveProfileToServer({
+      profileVideoUri: '',
+      profileVideoPosterUri: '',
+      profileVideoDurationSeconds: 0,
+    });
+  };
+
+  const uploadProfileVideo = async (file: File) => {
+    showToast('Checking video…');
+    try {
+      const durationSeconds = await probeVideoDurationSeconds(file);
+      if (durationSeconds < 1 || durationSeconds > PROFILE_VIDEO_MAX_SECONDS) {
+        showToast(`Profile videos must be 1–${PROFILE_VIDEO_MAX_SECONDS} seconds.`);
+        return;
+      }
+      showToast('Uploading video…');
+      const uploaded = await uploadFiles([file], 'profile-video');
+      const profileVideoUri = uploaded[0];
+      if (!profileVideoUri) {
+        showToast('Could not upload profile video.');
+        return;
+      }
+
+      let profileVideoPosterUri = profile.photoUrl || '';
+      if (!profileVideoPosterUri) {
+        const posterBlob = await captureVideoPosterBlob(file);
+        if (posterBlob) {
+          const posterFile = new File([posterBlob], 'profile-video-poster.jpg', { type: 'image/jpeg' });
+          const posterUploaded = await uploadFiles([posterFile]);
+          profileVideoPosterUri = posterUploaded[0] || '';
+        }
+      }
+
+      const nextFields = {
+        profileVideoUri,
+        profileVideoPosterUri,
+        profileVideoDurationSeconds: durationSeconds,
+      };
+      setProfile((current) => ({ ...current, ...nextFields }));
+      await saveProfileToServer(nextFields);
+    } catch {
+      showToast('Could not upload profile video.');
     }
   };
 
@@ -1906,6 +2206,9 @@ function App() {
           ? payload.profile.avatar
           : 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80'),
       currency: payload.profile?.currency || 'GHS',
+      profileVideoUri: payload.profile?.profileVideoUri || '',
+      profileVideoPosterUri: payload.profile?.profileVideoPosterUri || '',
+      profileVideoDurationSeconds: payload.profile?.profileVideoDurationSeconds ?? 0,
     });
     if (payload.profile) {
       setAppSettings((current) => {
@@ -1913,6 +2216,7 @@ function App() {
           ...current,
           lastSeenPrivacy: payload.profile.lastSeenPrivacy ?? current.lastSeenPrivacy,
           profilePhotoPrivacy: payload.profile.profilePhotoPrivacy ?? current.profilePhotoPrivacy,
+          profileVideoPrivacy: payload.profile.profileVideoPrivacy ?? current.profileVideoPrivacy,
           aboutPrivacy: payload.profile.aboutPrivacy ?? current.aboutPrivacy,
           statusPrivacy: payload.profile.statusPrivacy ?? current.statusPrivacy,
           readReceiptsEnabled:
@@ -2322,6 +2626,50 @@ function App() {
       }
       setPeerTypingByChat((current) => ({ ...current, [chatId]: Boolean(typing) }));
     });
+    socket.on('profile:updated', (updatedProfile) => {
+      if (!updatedProfile?.id) {
+        return;
+      }
+      setUsers((current) =>
+        current.map((user) =>
+          user.id === updatedProfile.id
+            ? {
+                ...user,
+                name: updatedProfile.name ?? user.name,
+                photoUri: updatedProfile.photoUri ?? user.photoUri,
+                profileVideoUri: updatedProfile.profileVideoUri ?? user.profileVideoUri,
+                profileVideoPosterUri: updatedProfile.profileVideoPosterUri ?? user.profileVideoPosterUri,
+                profileVideoDurationSeconds:
+                  updatedProfile.profileVideoDurationSeconds ?? user.profileVideoDurationSeconds,
+              }
+            : user,
+        ),
+      );
+      if (updatedProfile.id === currentUserIdRef.current) {
+        applyProfileFieldsFromServer(updatedProfile);
+        setAppSettings((current) => {
+          const next = {
+            ...current,
+            lastSeenPrivacy: updatedProfile.lastSeenPrivacy ?? current.lastSeenPrivacy,
+            profilePhotoPrivacy: updatedProfile.profilePhotoPrivacy ?? current.profilePhotoPrivacy,
+            profileVideoPrivacy: updatedProfile.profileVideoPrivacy ?? current.profileVideoPrivacy,
+            aboutPrivacy: updatedProfile.aboutPrivacy ?? current.aboutPrivacy,
+            statusPrivacy: updatedProfile.statusPrivacy ?? current.statusPrivacy,
+            readReceiptsEnabled:
+              updatedProfile.readReceiptsEnabled == null
+                ? current.readReceiptsEnabled
+                : Boolean(updatedProfile.readReceiptsEnabled),
+            appLockEnabled:
+              updatedProfile.appLockEnabled == null
+                ? current.appLockEnabled
+                : Boolean(updatedProfile.appLockEnabled),
+          };
+          appSettingsRef.current = next;
+          localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
+          return next;
+        });
+      }
+    });
     socket.on('presence:changed', ({ userId, presence, lastSeenAt }) => {
       if (!userId) {
         return;
@@ -2634,6 +2982,18 @@ function App() {
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUserId]);
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const onChange = () => setPrefersReducedMotion(media.matches);
+    onChange();
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', onChange);
+      return () => media.removeEventListener('change', onChange);
+    }
+    media.addListener(onChange);
+    return () => media.removeListener(onChange);
+  }, []);
 
   useEffect(() => {
     try {
@@ -6977,6 +7337,474 @@ function App() {
     upsertGameSessionMine,
   ]);
 
+  const eventsJson = async (response: Response) => {
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
+  };
+
+  const upsertEventInList = useCallback((event: CommunityEventPublic) => {
+    if (!event?.id) return;
+    setEventsList((current) => {
+      const without = current.filter((item) => item.id !== event.id);
+      return [event, ...without].sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+    });
+    setEventDetail((current) => (current?.id === event.id ? { ...current, ...event } : current));
+  }, []);
+
+  const loadEventsList = useCallback(async () => {
+    const userId = currentUserIdRef.current;
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        setEventNotice(payload.error || 'Could not load events.');
+        return;
+      }
+      setEventsList(Array.isArray(payload.events) ? payload.events : []);
+      setEventNotice('');
+    } catch {
+      setEventNotice('Could not load events.');
+    }
+  }, []);
+
+  const loadEventDetail = useCallback(async (eventId: string) => {
+    const userId = currentUserIdRef.current;
+    if (!userId || !eventId) return;
+    setEventBusy(true);
+    setEventNotice('');
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(eventId)}?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load event.');
+        return;
+      }
+      const event = payload.event as CommunityEventPublic;
+      setSelectedEventId(eventId);
+      setEventDetail(event);
+      setEventScreen('detail');
+      upsertEventInList(event);
+      setEventEditForm({
+        title: event.title || '',
+        description: event.description || '',
+        startsAtLocal: isoToDatetimeLocal(event.startsAt),
+        endsAtLocal: event.endsAt ? isoToDatetimeLocal(event.endsAt) : '',
+        timezone: event.timezone || defaultEventTimezone(),
+        capacity: String(event.capacity ?? 50),
+        chatId: event.chatId || '',
+        voiceRoomId: event.voiceRoomId || '',
+        createVoiceOnStart: Boolean(event.createVoiceOnStart),
+      });
+    } catch {
+      showToast('Could not load event.');
+    } finally {
+      setEventBusy(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [upsertEventInList]);
+
+  const openEventChat = (chatId: string) => {
+    if (!chatId) return;
+    setSelectedChatId(chatId);
+    setActiveView('chats');
+  };
+
+  const openEventVoice = (voiceRoomId: string) => {
+    if (!voiceRoomId) return;
+    setActiveView('voiceRooms');
+    void joinVoiceRoom(voiceRoomId);
+  };
+
+  const createEvent = async () => {
+    if (!currentUserId) return;
+    const title = eventCreateForm.title.trim();
+    const startsAt = datetimeLocalToIso(eventCreateForm.startsAtLocal);
+    const timezone = eventCreateForm.timezone.trim() || defaultEventTimezone();
+    const capacity = Number.parseInt(eventCreateForm.capacity, 10);
+    if (title.length < 2) {
+      showToast('Enter an event title');
+      return;
+    }
+    if (!startsAt) {
+      showToast('Pick a valid start time');
+      return;
+    }
+    if (!Number.isFinite(capacity) || capacity < 1) {
+      showToast('Capacity must be at least 1');
+      return;
+    }
+    const endsAt = eventCreateForm.endsAtLocal
+      ? datetimeLocalToIso(eventCreateForm.endsAtLocal)
+      : null;
+    if (eventCreateForm.endsAtLocal && !endsAt) {
+      showToast('Pick a valid end time');
+      return;
+    }
+    setEventBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          title,
+          description: eventCreateForm.description.trim(),
+          startsAt,
+          endsAt,
+          timezone,
+          capacity,
+          communityId: eventCreateForm.communityId.trim() || null,
+          chatId: eventCreateForm.chatId.trim() || null,
+          voiceRoomId: eventCreateForm.voiceRoomId.trim() || null,
+          createVoiceOnStart: Boolean(eventCreateForm.createVoiceOnStart),
+        }),
+      });
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create event');
+        return;
+      }
+      setEventCreateForm({
+        title: '',
+        description: '',
+        startsAtLocal: '',
+        endsAtLocal: '',
+        timezone: defaultEventTimezone(),
+        capacity: '50',
+        communityId: '',
+        chatId: '',
+        voiceRoomId: '',
+        createVoiceOnStart: false,
+      });
+      showToast('Event created');
+      if (payload.event?.id) {
+        await loadEventDetail(payload.event.id);
+      } else {
+        setEventScreen('list');
+        await loadEventsList();
+      }
+    } catch {
+      showToast('Could not create event');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  const updateEvent = async () => {
+    if (!currentUserId || !selectedEventId) return;
+    const title = eventEditForm.title.trim();
+    const startsAt = datetimeLocalToIso(eventEditForm.startsAtLocal);
+    const timezone = eventEditForm.timezone.trim() || defaultEventTimezone();
+    const capacity = Number.parseInt(eventEditForm.capacity, 10);
+    if (title.length < 2 || !startsAt || !Number.isFinite(capacity) || capacity < 1) {
+      showToast('Title, start time, and capacity are required');
+      return;
+    }
+    const endsAt = eventEditForm.endsAtLocal
+      ? datetimeLocalToIso(eventEditForm.endsAtLocal)
+      : null;
+    setEventBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(selectedEventId)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            title,
+            description: eventEditForm.description.trim(),
+            startsAt,
+            endsAt,
+            timezone,
+            capacity,
+            chatId: eventEditForm.chatId.trim() || null,
+            voiceRoomId: eventEditForm.voiceRoomId.trim() || null,
+            createVoiceOnStart: Boolean(eventEditForm.createVoiceOnStart),
+          }),
+        },
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update event');
+        return;
+      }
+      showToast('Event updated');
+      await loadEventDetail(selectedEventId);
+      await loadEventsList();
+    } catch {
+      showToast('Could not update event');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  const cancelEvent = async () => {
+    if (!currentUserId || !selectedEventId) return;
+    if (!window.confirm('Cancel this event? Guests will be notified.')) return;
+    setEventBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(selectedEventId)}/cancel`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not cancel event');
+        return;
+      }
+      showToast('Event cancelled');
+      await loadEventDetail(selectedEventId);
+      await loadEventsList();
+    } catch {
+      showToast('Could not cancel event');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  const rsvpEvent = async (status: EventRsvpStatus) => {
+    if (!currentUserId || !selectedEventId) return;
+    setEventBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(selectedEventId)}/rsvp`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, status }),
+        },
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update RSVP');
+        return;
+      }
+      if (payload.event) {
+        upsertEventInList(payload.event as CommunityEventPublic);
+        setEventDetail((current) => (
+          current?.id === selectedEventId
+            ? { ...current, ...payload.event }
+            : current
+        ));
+      }
+      showToast(
+        status === 'going'
+          ? 'Marked as attending'
+          : status === 'interested'
+            ? 'Marked as interested'
+            : 'RSVP cleared',
+      );
+      await loadEventDetail(selectedEventId);
+    } catch {
+      showToast('Could not update RSVP');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  const startEvent = async () => {
+    if (!currentUserId || !selectedEventId) return;
+    setEventBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(selectedEventId)}/start`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            chatId: eventEditForm.chatId.trim() || undefined,
+            voiceRoomId: eventEditForm.voiceRoomId.trim() || undefined,
+          }),
+        },
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not start event');
+        return;
+      }
+      showToast(payload.alreadyLive ? 'Event already live' : 'Event started');
+      await loadEventDetail(selectedEventId);
+      await loadEventsList();
+      const hints = payload.joinHints || {};
+      if (hints.voiceRoomId) {
+        openEventVoice(hints.voiceRoomId);
+      } else if (hints.chatId) {
+        openEventChat(hints.chatId);
+      }
+    } catch {
+      showToast('Could not start event');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  const endEvent = async () => {
+    if (!currentUserId || !selectedEventId) return;
+    setEventBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/events/${encodeURIComponent(selectedEventId)}/end`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await eventsJson(response);
+      if (!response.ok) {
+        showToast(payload.error || 'Could not end event');
+        return;
+      }
+      showToast(payload.alreadyEnded ? 'Event already ended' : 'Event ended');
+      await loadEventDetail(selectedEventId);
+      await loadEventsList();
+    } catch {
+      showToast('Could not end event');
+    } finally {
+      setEventBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeView === 'events' && currentUserId) {
+      void loadEventsList();
+    }
+  }, [activeView, currentUserId, loadEventsList]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !currentUserId) return undefined;
+
+    const onEventUpdated = (payload: {
+      event?: CommunityEventPublic;
+      action?: string;
+      goingCount?: number;
+      interestedCount?: number;
+      joinHints?: { chatId?: string | null; voiceRoomId?: string | null };
+    }) => {
+      const event = payload?.event;
+      if (!event?.id) return;
+      const merged: CommunityEventPublic = {
+        ...event,
+        goingCount: payload.goingCount ?? event.goingCount,
+        interestedCount: payload.interestedCount ?? event.interestedCount,
+      };
+      upsertEventInList(merged);
+      if (selectedEventIdRef.current === event.id) {
+        void loadEventDetail(event.id);
+      } else {
+        void loadEventsList();
+      }
+      if (payload.action === 'cancelled') {
+        showToast(`Event cancelled: ${event.title}`, 3500);
+      } else if (payload.action === 'live') {
+        showToast(`Event live: ${event.title}`, 3500);
+      }
+    };
+
+    const onEventCancelled = (payload: {
+      event?: CommunityEventPublic;
+      cancelledAt?: string;
+    }) => {
+      const event = payload?.event;
+      if (!event?.id) return;
+      upsertEventInList(event);
+      if (selectedEventIdRef.current === event.id) {
+        void loadEventDetail(event.id);
+      }
+      setEventAlert({
+        kind: 'cancelled',
+        eventId: event.id,
+        title: event.title,
+        message: `"${event.title}" was cancelled.`,
+        startsAtLocal: event.startsAtLocal,
+        chatId: event.chatId,
+        voiceRoomId: event.voiceRoomId,
+      });
+      showToast(`Cancelled: ${event.title}`, 4000);
+    };
+
+    const onEventReminder = (payload: {
+      eventId?: string;
+      minutesBefore?: number;
+      event?: CommunityEventPublic;
+      startsAtLocal?: string;
+    }) => {
+      const event = payload?.event;
+      const title = event?.title || 'Upcoming event';
+      const minutes = payload?.minutesBefore;
+      const startsAtLocal = payload?.startsAtLocal || event?.startsAtLocal || '';
+      const message = typeof minutes === 'number'
+        ? `"${title}" starts in ${minutes} minute${minutes === 1 ? '' : 's'}${startsAtLocal ? ` (${startsAtLocal})` : ''}.`
+        : `"${title}" reminder${startsAtLocal ? ` · ${startsAtLocal}` : ''}.`;
+      setEventAlert({
+        kind: 'reminder',
+        eventId: payload.eventId || event?.id || '',
+        title,
+        message,
+        startsAtLocal,
+        minutesBefore: minutes,
+        chatId: event?.chatId,
+        voiceRoomId: event?.voiceRoomId,
+      });
+      showToast(message, 5000);
+    };
+
+    const onEventStarting = (payload: {
+      eventId?: string;
+      event?: CommunityEventPublic;
+      startsAtLocal?: string;
+      joinHints?: { chatId?: string | null; voiceRoomId?: string | null };
+    }) => {
+      const event = payload?.event;
+      const title = event?.title || 'Event';
+      const startsAtLocal = payload?.startsAtLocal || event?.startsAtLocal || '';
+      const chatId = payload.joinHints?.chatId ?? event?.chatId ?? null;
+      const voiceRoomId = payload.joinHints?.voiceRoomId ?? event?.voiceRoomId ?? null;
+      const message = `"${title}" is starting${startsAtLocal ? ` · ${startsAtLocal}` : ''}.`;
+      setEventAlert({
+        kind: 'starting',
+        eventId: payload.eventId || event?.id || '',
+        title,
+        message,
+        startsAtLocal,
+        chatId,
+        voiceRoomId,
+      });
+      showToast(message, 5000);
+      if (event?.id) upsertEventInList(event);
+      if (event?.id && selectedEventIdRef.current === event.id) {
+        void loadEventDetail(event.id);
+      }
+    };
+
+    socket.on('event:updated', onEventUpdated);
+    socket.on('event:cancelled', onEventCancelled);
+    socket.on('event:reminder', onEventReminder);
+    socket.on('event:starting', onEventStarting);
+    return () => {
+      socket.off('event:updated', onEventUpdated);
+      socket.off('event:cancelled', onEventCancelled);
+      socket.off('event:reminder', onEventReminder);
+      socket.off('event:starting', onEventStarting);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUserId, loadEventDetail, loadEventsList, upsertEventInList]);
+
   const renderGamesView = () => {
     const catalogEntry = gameCatalog.find((item) => item.slug === gameSelectedSlug)
       || gameCatalog.find((item) => item.slug === gameActiveSession?.gameSlug);
@@ -7355,6 +8183,444 @@ function App() {
     );
   };
 
+  const renderEventsView = () => {
+    const detail = eventDetail;
+    const isHost = Boolean(detail && detail.hostUserId === currentUserId);
+    const myStatus = eventMyRsvpStatus(detail);
+    const canRsvp = Boolean(
+      detail
+      && detail.status !== 'cancelled'
+      && detail.status !== 'ended',
+    );
+    const hostCanManage = Boolean(
+      isHost
+      && detail
+      && detail.status !== 'cancelled'
+      && detail.status !== 'ended',
+    );
+
+    const renderEventCard = (event: CommunityEventPublic) => {
+      const rsvp = eventMyRsvpStatus(event);
+      const hostLabel = event.hostUserId === currentUserId ? 'You host' : getUserMeta(event.hostUserId).name;
+      return (
+        <button
+          className={`community-list-item ${selectedEventId === event.id ? 'active' : ''}`}
+          key={event.id}
+          onClick={() => void loadEventDetail(event.id)}
+          type="button"
+        >
+          <div className="community-list-avatar">📅</div>
+          <div className="community-list-copy">
+            <strong>{event.title}</strong>
+            <span>
+              {event.status}
+              {' · '}
+              {event.startsAtLocal || event.startsAt}
+              {typeof event.goingCount === 'number' ? ` · ${event.goingCount}/${event.capacity} going` : ''}
+              {rsvp ? ` · ${rsvp}` : ''}
+              {` · ${hostLabel}`}
+            </span>
+          </div>
+        </button>
+      );
+    };
+
+    if (eventScreen === 'create') {
+      return (
+        <>
+          <section className="chat-sidebar community-sidebar events-sidebar">
+            <header className="chat-sidebar-header">
+              <h1>New event</h1>
+            </header>
+            <div className="community-sidebar-scroll">
+              <p className="muted">Free events only — no tickets or payments.</p>
+              <div className="community-section community-create-form event-create-form">
+                <label>
+                  <span>Title</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, title: event.target.value }))}
+                    value={eventCreateForm.title}
+                  />
+                </label>
+                <label>
+                  <span>Description</span>
+                  <textarea
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, description: event.target.value }))}
+                    value={eventCreateForm.description}
+                  />
+                </label>
+                <label>
+                  <span>Starts</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, startsAtLocal: event.target.value }))}
+                    type="datetime-local"
+                    value={eventCreateForm.startsAtLocal}
+                  />
+                </label>
+                <label>
+                  <span>Ends (optional)</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, endsAtLocal: event.target.value }))}
+                    type="datetime-local"
+                    value={eventCreateForm.endsAtLocal}
+                  />
+                </label>
+                <label>
+                  <span>Timezone (IANA)</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, timezone: event.target.value }))}
+                    placeholder="Africa/Accra"
+                    value={eventCreateForm.timezone}
+                  />
+                </label>
+                <label>
+                  <span>Capacity (Attend)</span>
+                  <input
+                    min={1}
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, capacity: event.target.value }))}
+                    type="number"
+                    value={eventCreateForm.capacity}
+                  />
+                </label>
+                <label>
+                  <span>Community ID (optional)</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, communityId: event.target.value }))}
+                    value={eventCreateForm.communityId}
+                  />
+                </label>
+                <label>
+                  <span>Chat ID (optional)</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, chatId: event.target.value }))}
+                    value={eventCreateForm.chatId}
+                  />
+                </label>
+                <label>
+                  <span>Voice room ID (optional)</span>
+                  <input
+                    onChange={(event) => setEventCreateForm((current) => ({ ...current, voiceRoomId: event.target.value }))}
+                    value={eventCreateForm.voiceRoomId}
+                  />
+                </label>
+                <label className="community-checkbox">
+                  <input
+                    checked={eventCreateForm.createVoiceOnStart}
+                    onChange={(event) => setEventCreateForm((current) => ({
+                      ...current,
+                      createVoiceOnStart: event.target.checked,
+                    }))}
+                    type="checkbox"
+                  />
+                  <span>Create/link voice on start</span>
+                </label>
+                <div className="community-detail-actions game-actions-row">
+                  <button
+                    disabled={eventBusy}
+                    onClick={() => setEventScreen('list')}
+                    type="button"
+                  >
+                    Back
+                  </button>
+                  <button
+                    className="send-button"
+                    disabled={eventBusy}
+                    onClick={() => void createEvent()}
+                    type="button"
+                  >
+                    Create event
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+          <main className="panel-shell community-detail-pane events-detail-pane">
+            <header className="panel-header">
+              <div>
+                <h2>Schedule a free event</h2>
+                <p>Interested is unlimited; Attend (going) is capped by capacity.</p>
+              </div>
+            </header>
+          </main>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <section className="chat-sidebar community-sidebar events-sidebar">
+          <header className="chat-sidebar-header">
+            <h1>Events</h1>
+          </header>
+          <div className="community-detail-actions event-list-actions">
+            <button
+              className="send-button community-inline-btn"
+              onClick={() => setEventScreen('create')}
+              type="button"
+            >
+              Create
+            </button>
+            <button
+              className="community-inline-btn"
+              disabled={eventBusy}
+              onClick={() => void loadEventsList()}
+              type="button"
+            >
+              Refresh
+            </button>
+          </div>
+          {eventNotice ? <p className="muted event-notice">{eventNotice}</p> : null}
+          <div className="community-sidebar-scroll">
+            <div className="community-section">
+              <h3>Upcoming & yours</h3>
+              {eventsList.length
+                ? eventsList.map(renderEventCard)
+                : <p className="muted">No events yet. Create a free session.</p>}
+            </div>
+          </div>
+        </section>
+
+        <main className="panel-shell community-detail-pane events-detail-pane">
+          {!detail || eventScreen !== 'detail' ? (
+            <header className="panel-header">
+              <div>
+                <h2>Events</h2>
+                <p>Free community sessions with timezone-aware times, RSVPs, and reminders.</p>
+              </div>
+            </header>
+          ) : (
+            <>
+              <header className="panel-header community-detail-header">
+                <div>
+                  <h2>{detail.title}</h2>
+                  <p>
+                    {detail.status}
+                    {' · '}
+                    {detail.startsAtLocal || detail.startsAt}
+                    {' · '}
+                    {detail.timezone}
+                    {typeof detail.goingCount === 'number'
+                      ? ` · ${detail.goingCount}/${detail.capacity} attending`
+                      : ` · capacity ${detail.capacity}`}
+                    {typeof detail.interestedCount === 'number'
+                      ? ` · ${detail.interestedCount} interested`
+                      : ''}
+                    {typeof detail.spotsRemaining === 'number'
+                      ? ` · ${detail.spotsRemaining} spots left`
+                      : ''}
+                  </p>
+                </div>
+                <div className="community-detail-actions">
+                  {canRsvp ? (
+                    <>
+                      <button
+                        className={myStatus === 'interested' ? 'send-button' : ''}
+                        disabled={eventBusy}
+                        onClick={() => void rsvpEvent('interested')}
+                        type="button"
+                      >
+                        Interested
+                      </button>
+                      <button
+                        className={myStatus === 'going' ? 'send-button' : ''}
+                        disabled={eventBusy || (typeof detail.spotsRemaining === 'number' && detail.spotsRemaining <= 0 && myStatus !== 'going')}
+                        onClick={() => void rsvpEvent('going')}
+                        type="button"
+                      >
+                        Attend
+                      </button>
+                      {myStatus ? (
+                        <button
+                          disabled={eventBusy}
+                          onClick={() => void rsvpEvent('cancelled')}
+                          type="button"
+                        >
+                          Clear RSVP
+                        </button>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {isHost ? <span className="muted">You are the host</span> : null}
+                </div>
+              </header>
+
+              {detail.description ? <p className="event-description">{detail.description}</p> : null}
+              <p className="muted">
+                Host: {getUserMeta(detail.hostUserId).name}
+                {detail.endsAtLocal ? ` · Ends ${detail.endsAtLocal}` : ''}
+                {detail.cancelledAt ? ` · Cancelled ${detail.cancelledAt}` : ''}
+              </p>
+
+              <div className="community-detail-actions game-actions-row">
+                {detail.chatId ? (
+                  <button
+                    className="send-button"
+                    onClick={() => openEventChat(detail.chatId!)}
+                    type="button"
+                  >
+                    Join chat
+                  </button>
+                ) : null}
+                {detail.voiceRoomId ? (
+                  <button
+                    className="send-button"
+                    onClick={() => openEventVoice(detail.voiceRoomId!)}
+                    type="button"
+                  >
+                    Join voice
+                  </button>
+                ) : null}
+                <button
+                  onClick={() => {
+                    setEventScreen('list');
+                    setSelectedEventId('');
+                    setEventDetail(null);
+                  }}
+                  type="button"
+                >
+                  Back to list
+                </button>
+              </div>
+
+              {hostCanManage || (isHost && detail.status === 'live') ? (
+                <section className="community-section event-host-tools">
+                  <h3>Host tools</h3>
+                  {hostCanManage ? (
+                    <div className="community-create-form event-edit-form">
+                      <label>
+                        <span>Title</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, title: event.target.value }))}
+                          value={eventEditForm.title}
+                        />
+                      </label>
+                      <label>
+                        <span>Description</span>
+                        <textarea
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, description: event.target.value }))}
+                          value={eventEditForm.description}
+                        />
+                      </label>
+                      <label>
+                        <span>Starts</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, startsAtLocal: event.target.value }))}
+                          type="datetime-local"
+                          value={eventEditForm.startsAtLocal}
+                        />
+                      </label>
+                      <label>
+                        <span>Ends</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, endsAtLocal: event.target.value }))}
+                          type="datetime-local"
+                          value={eventEditForm.endsAtLocal}
+                        />
+                      </label>
+                      <label>
+                        <span>Timezone</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, timezone: event.target.value }))}
+                          value={eventEditForm.timezone}
+                        />
+                      </label>
+                      <label>
+                        <span>Capacity</span>
+                        <input
+                          min={1}
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, capacity: event.target.value }))}
+                          type="number"
+                          value={eventEditForm.capacity}
+                        />
+                      </label>
+                      <label>
+                        <span>Chat ID</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, chatId: event.target.value }))}
+                          value={eventEditForm.chatId}
+                        />
+                      </label>
+                      <label>
+                        <span>Voice room ID</span>
+                        <input
+                          onChange={(event) => setEventEditForm((current) => ({ ...current, voiceRoomId: event.target.value }))}
+                          value={eventEditForm.voiceRoomId}
+                        />
+                      </label>
+                      <label className="community-checkbox">
+                        <input
+                          checked={eventEditForm.createVoiceOnStart}
+                          onChange={(event) => setEventEditForm((current) => ({
+                            ...current,
+                            createVoiceOnStart: event.target.checked,
+                          }))}
+                          type="checkbox"
+                        />
+                        <span>Create/link voice on start</span>
+                      </label>
+                      <div className="community-detail-actions game-actions-row">
+                        <button
+                          className="send-button"
+                          disabled={eventBusy}
+                          onClick={() => void updateEvent()}
+                          type="button"
+                        >
+                          Save changes
+                        </button>
+                        {detail.status === 'scheduled' ? (
+                          <button
+                            className="send-button"
+                            disabled={eventBusy}
+                            onClick={() => void startEvent()}
+                            type="button"
+                          >
+                            Start event
+                          </button>
+                        ) : null}
+                        <button
+                          disabled={eventBusy}
+                          onClick={() => void cancelEvent()}
+                          type="button"
+                        >
+                          Cancel event
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {isHost && detail.status === 'live' ? (
+                    <div className="community-detail-actions game-actions-row">
+                      <button
+                        className="send-button"
+                        disabled={eventBusy}
+                        onClick={() => void endEvent()}
+                        type="button"
+                      >
+                        End event
+                      </button>
+                    </div>
+                  ) : null}
+                  {Array.isArray(detail.attendees) && detail.attendees.length ? (
+                    <div className="event-attendees">
+                      <h4>Attendees</h4>
+                      {detail.attendees.map((attendee) => (
+                        <div className="game-player-row" key={attendee.id || `${attendee.userId}-${attendee.status}`}>
+                          <strong>{attendee.name || getUserMeta(attendee.userId).name}</strong>
+                          <span>{attendee.status}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : isHost ? (
+                    <p className="muted">No RSVPs yet.</p>
+                  ) : null}
+                </section>
+              ) : null}
+            </>
+          )}
+        </main>
+      </>
+    );
+  };
+
   const renderVoiceRoomsView = () => {
     const room = activeVoiceRoom;
     const myPart = voiceParticipants.find(
@@ -7688,7 +8954,13 @@ function App() {
         ) : null}
 
         <div className="chat-list desktop-chat-list">
-          {visibleChatItems.map((chat) => (
+          {visibleChatItems.map((chat) => {
+            const peer = chat.peerUserId ? users.find((user) => user.id === chat.peerUserId) : undefined;
+            const peerStill = stillAvatarUri({
+              photoUri: peer?.photoUri,
+              profileVideoPosterUri: peer?.profileVideoPosterUri,
+            });
+            return (
             <button
               className={`chat-list-item desktop-chat-item ${chat.id === activeChat?.id ? 'active' : ''}`}
               key={chat.id}
@@ -7709,7 +8981,9 @@ function App() {
               }}
               type="button"
             >
-              <div className="avatar desktop-avatar">{chat.name.slice(0, 2).toUpperCase()}</div>
+              <div className="avatar desktop-avatar">
+                {peerStill ? <img alt="" src={peerStill} /> : chat.name.slice(0, 2).toUpperCase()}
+              </div>
               <div className="chat-copy">
                 <div className="chat-topline">
                   <strong>
@@ -7725,7 +8999,8 @@ function App() {
                 </div>
               </div>
             </button>
-          ))}
+            );
+          })}
         </div>
       </section>
 
@@ -7734,7 +9009,20 @@ function App() {
           <>
         <header className="desktop-chat-header">
           <div className="desktop-chat-title">
-            <div className="avatar desktop-avatar">{activeChat.name.slice(0, 2).toUpperCase()}</div>
+            {(() => {
+              const peer = activeChat.peerUserId
+                ? users.find((user) => user.id === activeChat.peerUserId)
+                : undefined;
+              const peerStill = stillAvatarUri({
+                photoUri: peer?.photoUri,
+                profileVideoPosterUri: peer?.profileVideoPosterUri,
+              });
+              return (
+                <div className="avatar desktop-avatar">
+                  {peerStill ? <img alt="" src={peerStill} /> : activeChat.name.slice(0, 2).toUpperCase()}
+                </div>
+              );
+            })()}
             <div>
               <strong>{activeChat.name}</strong>
               <small>{getPresenceLabel(activeChat)}</small>
@@ -8448,7 +9736,7 @@ function App() {
 
   const renderPrivacyChoice = (
     label: string,
-    key: 'lastSeenPrivacy' | 'profilePhotoPrivacy' | 'aboutPrivacy' | 'statusPrivacy',
+    key: 'lastSeenPrivacy' | 'profilePhotoPrivacy' | 'profileVideoPrivacy' | 'aboutPrivacy' | 'statusPrivacy',
     options: Array<{ value: string; label: string }>,
   ) => (
     <div className="settings-choice-block">
@@ -10129,6 +11417,11 @@ function App() {
             { value: 'contacts', label: 'My contacts' },
             { value: 'nobody', label: 'Nobody' },
           ])}
+          {renderPrivacyChoice('Profile video', 'profileVideoPrivacy', [
+            { value: 'everyone', label: 'Everyone' },
+            { value: 'contacts', label: 'My contacts' },
+            { value: 'nobody', label: 'Nobody' },
+          ])}
           {renderPrivacyChoice('About', 'aboutPrivacy', [
             { value: 'everyone', label: 'Everyone' },
             { value: 'contacts', label: 'My contacts' },
@@ -10214,6 +11507,12 @@ function App() {
         <>
           <p>{Object.values(messagesByChat).flat().length} messages · {catalogItems.length} catalog items · {favoriteChatIds.length} favorites</p>
           {renderSettingsToggle('Low data mode', appSettings.lowDataMode, (value) => updateAppSetting('lowDataMode', value))}
+          {renderSettingsToggle(
+            'Data saver',
+            appSettings.dataSaver,
+            (value) => updateAppSetting('dataSaver', value),
+            'Show still profile photos instead of short looping videos',
+          )}
           <button className="settings-list-row" onClick={() => { setCatalogAssetFiles([]); setStatusAssetFiles([]); showToast('Local media cache cleared'); }} type="button">
             Clear cache
           </button>
@@ -10245,17 +11544,57 @@ function App() {
       );
     }
 
+    const profileStill = stillAvatarUri({
+      photoUrl: profile.photoUrl,
+      profileVideoPosterUri: profile.profileVideoPosterUri,
+    });
+    const playOwnProfileVideo = Boolean(
+      profile.profileVideoUri && allowProfileVideoPlayback,
+    );
+
     return (
       <>
         <h2>Profile</h2>
         <div className="profile-top">
-          <img alt={profile.name} src={profile.photoUrl} />
-          <button onClick={() => profilePhotoInputRef.current?.click()} type="button">Edit photo</button>
+          {playOwnProfileVideo ? (
+            <video
+              aria-label={profile.name}
+              autoPlay
+              className="profile-media"
+              loop
+              muted
+              playsInline
+              poster={profileStill || undefined}
+              src={profile.profileVideoUri}
+            />
+          ) : (
+            <img alt={profile.name} className="profile-media" src={profileStill || profile.photoUrl} />
+          )}
+          <div className="profile-media-actions">
+            <button onClick={() => profilePhotoInputRef.current?.click()} type="button">Edit photo</button>
+            <button onClick={() => profileVideoInputRef.current?.click()} type="button">
+              {profile.profileVideoUri ? 'Replace video' : 'Upload short video'}
+            </button>
+            {profile.profileVideoUri ? (
+              <button className="danger-text" onClick={() => void removeProfileVideo()} type="button">
+                Remove video
+              </button>
+            ) : null}
+          </div>
+          {profile.profileVideoUri ? (
+            <small className="profile-video-meta">
+              {profile.profileVideoDurationSeconds || '?'}s clip
+              {allowProfileVideoPlayback ? '' : ' · still preview (data saver / reduced motion)'}
+            </small>
+          ) : (
+            <small className="profile-video-meta">Short profile video up to {PROFILE_VIDEO_MAX_SECONDS}s · muted loop</small>
+          )}
           <input
             accept="image/*"
             className="hidden-input"
             onChange={async (event) => {
               const file = event.target.files?.[0];
+              event.target.value = '';
               if (!file) {
                 return;
               }
@@ -10263,13 +11602,31 @@ function App() {
               try {
                 const uploaded = await uploadFiles([file]);
                 const photoUrl = uploaded[0] || URL.createObjectURL(file);
-                setProfile((current) => ({ ...current, photoUrl }));
-                await saveProfileToServer({ photoUrl });
+                const nextOverrides: Partial<ProfileState> = { photoUrl };
+                if (profile.profileVideoUri) {
+                  nextOverrides.profileVideoPosterUri = photoUrl;
+                }
+                setProfile((current) => ({ ...current, ...nextOverrides }));
+                await saveProfileToServer(nextOverrides);
               } catch {
                 showToast('Could not upload profile photo.');
               }
             }}
             ref={profilePhotoInputRef}
+            type="file"
+          />
+          <input
+            accept="video/*"
+            className="hidden-input"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = '';
+              if (!file) {
+                return;
+              }
+              void uploadProfileVideo(file);
+            }}
+            ref={profileVideoInputRef}
             type="file"
           />
         </div>
@@ -10284,6 +11641,19 @@ function App() {
         <label>
           <span>Phone number</span>
           <input readOnly value={profile.phone} />
+        </label>
+        <label>
+          <span>Profile video privacy</span>
+          <select
+            onChange={(event) =>
+              updateAppSetting('profileVideoPrivacy', event.target.value as any, { syncProfile: true })
+            }
+            value={appSettings.profileVideoPrivacy}
+          >
+            <option value="everyone">Everyone</option>
+            <option value="contacts">My contacts</option>
+            <option value="nobody">Nobody</option>
+          </select>
         </label>
         <button className="send-button" onClick={() => void saveProfileToServer()} type="button">Save account</button>
 
@@ -10323,7 +11693,13 @@ function App() {
       <aside className="settings-menu">
         <h2>Settings</h2>
         <div className="settings-user">
-          <img alt={profile.name} src={profile.photoUrl} />
+          <img
+            alt={profile.name}
+            src={stillAvatarUri({
+              photoUrl: profile.photoUrl,
+              profileVideoPosterUri: profile.profileVideoPosterUri,
+            }) || profile.photoUrl}
+          />
           <strong>{profile.name}</strong>
         </div>
         <div className="settings-links">
@@ -11024,6 +12400,7 @@ function App() {
           <button className={`rail-button ${activeView === 'calls' ? 'active' : ''}`} onClick={() => setActiveView('calls')} type="button">☎</button>
           <button className={`rail-button ${activeView === 'updates' ? 'active' : ''}`} onClick={() => setActiveView('updates')} type="button">◌</button>
           <button className={`rail-button ${activeView === 'communities' ? 'active' : ''}`} onClick={() => setActiveView('communities')} type="button" title="Communities">◎</button>
+          <button className={`rail-button ${activeView === 'events' ? 'active' : ''}`} onClick={() => setActiveView('events')} type="button" title="Events">📅</button>
           <button className={`rail-button ${activeView === 'voiceRooms' ? 'active' : ''}`} onClick={() => setActiveView('voiceRooms')} type="button" title="Voice rooms">🎙</button>
           <button className={`rail-button ${activeView === 'games' ? 'active' : ''}`} onClick={() => setActiveView('games')} type="button" title="Games">🎮</button>
           <button className={`rail-button ${activeView === 'catalog' ? 'active' : ''}`} onClick={() => setActiveView('catalog')} type="button">🏬</button>
@@ -11036,6 +12413,7 @@ function App() {
       {activeView === 'calls' ? renderCallsView() : null}
       {activeView === 'updates' ? renderUpdatesView() : null}
       {activeView === 'communities' ? renderCommunitiesView() : null}
+      {activeView === 'events' ? renderEventsView() : null}
       {activeView === 'voiceRooms' ? renderVoiceRoomsView() : null}
       {activeView === 'games' ? renderGamesView() : null}
       {activeView === 'catalog' ? renderCatalogView() : null}
@@ -11069,6 +12447,68 @@ function App() {
             >
               Accept
             </button>
+          </div>
+        </div>
+      ) : null}
+
+      {eventAlert ? (
+        <div className="modal-overlay" onClick={() => setEventAlert(null)}>
+          <div className="dialog-card event-alert-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>
+              {eventAlert.kind === 'reminder'
+                ? 'Event reminder'
+                : eventAlert.kind === 'starting'
+                  ? 'Event starting'
+                  : 'Event cancelled'}
+            </h3>
+            <p>{eventAlert.message}</p>
+            {eventAlert.startsAtLocal ? (
+              <p className="muted">{eventAlert.startsAtLocal}</p>
+            ) : null}
+            <div className="community-detail-actions game-actions-row">
+              {eventAlert.eventId ? (
+                <button
+                  onClick={() => {
+                    const id = eventAlert.eventId;
+                    setEventAlert(null);
+                    setActiveView('events');
+                    void loadEventDetail(id);
+                  }}
+                  type="button"
+                >
+                  Open event
+                </button>
+              ) : null}
+              {eventAlert.chatId ? (
+                <button
+                  className="send-button"
+                  onClick={() => {
+                    const chatId = eventAlert.chatId!;
+                    setEventAlert(null);
+                    openEventChat(chatId);
+                  }}
+                  type="button"
+                >
+                  Join chat
+                </button>
+              ) : null}
+              {eventAlert.voiceRoomId ? (
+                <button
+                  className="send-button"
+                  onClick={() => {
+                    const voiceRoomId = eventAlert.voiceRoomId!;
+                    setEventAlert(null);
+                    openEventVoice(voiceRoomId);
+                  }}
+                  type="button"
+                >
+                  Join voice
+                </button>
+              ) : null}
+              <button onClick={() => setEventAlert(null)} type="button">
+                Dismiss
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -11180,7 +12620,10 @@ function App() {
 
       {activeCall ? (() => {
         const peer = users.find((user) => user.id === activeCall.peerUserId);
-        const peerPhoto = peer?.photoUri || '';
+        const peerPhoto = stillAvatarUri({
+          photoUri: peer?.photoUri,
+          profileVideoPosterUri: peer?.profileVideoPosterUri,
+        });
         const localVideoLive = Boolean(localCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live')) && !callCameraOff;
         const remoteVideoLive = Boolean(remoteCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live' && !track.muted)) && !remoteCameraOff;
         const showRemoteVideo = activeCall.kind === 'video' && remoteVideoLive;

@@ -199,6 +199,15 @@
   place-items: center;
   font-size: 0.82rem;
   font-weight: 700;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .chat-topline span,
@@ -751,7 +760,8 @@
 }
 
 .settings-user img,
-.profile-top img {
+.profile-top img,
+.profile-top video.profile-media {
   width: 56px;
   height: 56px;
   border-radius: 50%;
@@ -797,15 +807,41 @@
   gap: 14px;
 }
 
-.profile-top img {
+.profile-top img,
+.profile-top video.profile-media {
   width: 180px;
   height: 180px;
+}
+
+.profile-top .profile-media {
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #2a2f35;
+}
+
+.profile-media-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  justify-content: center;
 }
 
 .profile-top button {
   background: transparent;
   color: #60a5fa;
   font-weight: 700;
+}
+
+.profile-top button.danger-text {
+  color: #f87171;
+}
+
+.profile-video-meta {
+  color: #8ea1aa;
+  font-size: 12px;
+  text-align: center;
 }
 
 .settings-links button.active {
@@ -3097,6 +3133,43 @@
 
 .games-detail-pane {
   overflow: auto;
+}
+
+.events-sidebar .event-list-actions {
+  padding: 0 14px 8px;
+  gap: 8px;
+}
+
+.events-sidebar .event-notice {
+  padding: 0 14px 8px;
+}
+
+.events-detail-pane {
+  overflow: auto;
+}
+
+.events-detail-pane .event-description {
+  margin: 0 16px 12px;
+  white-space: pre-wrap;
+}
+
+.events-detail-pane .event-host-tools {
+  margin: 16px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.event-create-form,
+.event-edit-form {
+  gap: 10px;
+}
+
+.event-attendees {
+  margin-top: 14px;
+}
+
+.event-alert-modal .muted {
+  margin-top: 4px;
 }
 
 @media (max-width: 960px) {
