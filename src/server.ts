@@ -56,6 +56,9 @@ type Message = {
   anonymousDay?: string;
   callKind?: 'audio' | 'video';
   callState?: 'missed' | 'declined' | 'completed';
+  actorBusinessId?: string;
+  actorName?: string;
+  expiresAt?: string;
 };
 
 type Chat = {
@@ -68,6 +71,8 @@ type Chat = {
   unreadByUser?: Record<string, number>;
   lastMessagePreview: string;
   updatedAt: string;
+  space?: string;
+  disappearAfterSeconds?: number;
 };
 
 type Contact = {
@@ -131,6 +136,8 @@ type StatusPost = {
   createdAt: string;
   expiresAt: string;
   audience: 'contacts' | 'close-friends' | 'public' | 'marketplace';
+  businessId?: string;
+  businessName?: string;
 };
 
 type ChatRequest = {
@@ -143,9 +150,18 @@ type ChatRequest = {
   createdAt: string;
 };
 
+type CatalogProductStatus = 'draft' | 'active' | 'archived' | 'out_of_stock';
+
+type CatalogVariant = {
+  id: string;
+  name: string;
+  options: string[];
+};
+
 type CatalogItem = {
   id: string;
   sellerId: string;
+  businessId?: string | null;
   title: string;
   price: number;
   currency: string;
@@ -153,6 +169,10 @@ type CatalogItem = {
   description: string;
   imageUrls: string[];
   stockQuantity: number;
+  trackStock?: boolean;
+  status?: CatalogProductStatus;
+  variants?: CatalogVariant[];
+  availabilityUpdatedAt?: string;
   isPublic?: boolean;
   location?: string;
   condition?: 'New' | 'Used';
@@ -182,9 +202,47 @@ type Profile = {
   profilePhotoPrivacy?: 'everyone' | 'contacts' | 'nobody';
   aboutPrivacy?: 'everyone' | 'contacts' | 'nobody';
   statusPrivacy?: 'contacts' | 'close-friends' | 'nobody';
+  typingPrivacy?: 'everyone' | 'contacts' | 'nobody';
+  callPrivacy?: 'everyone' | 'contacts' | 'nobody';
+  groupInvitePrivacy?: 'everyone' | 'contacts' | 'nobody';
   readReceiptsEnabled?: boolean;
+  blockedUserIds?: string[];
   blocked?: boolean;
   blockedUntil?: string | null;
+  activeBusinessId?: string | null;
+};
+
+type BusinessRole = 'owner' | 'manager' | 'sales' | 'support';
+
+type BusinessMember = {
+  userId: string;
+  role: BusinessRole;
+  addedAt: string;
+};
+
+type BusinessVerificationStatus = 'unverified' | 'pending' | 'approved' | 'rejected';
+type BusinessVisibility = 'draft' | 'published';
+
+type BusinessProfile = {
+  id: string;
+  ownerUserId: string;
+  name: string;
+  description: string;
+  logoUrl?: string;
+  location?: string;
+  hours?: string;
+  contactButtonLabel?: string;
+  showPhone?: boolean;
+  visibility?: BusinessVisibility;
+  verificationStatus?: BusinessVerificationStatus;
+  verificationNote?: string;
+  verificationEvidenceUrls?: string[];
+  verificationSubmittedAt?: string | null;
+  verificationReviewedAt?: string | null;
+  verificationReviewNote?: string;
+  createdAt: string;
+  updatedAt: string;
+  members: BusinessMember[];
 };
 
 type UpdateFeedEntry = {
@@ -250,6 +308,7 @@ type BootstrapPayload = {
   statuses: StatusPost[];
   updatesFeed: UpdateFeedEntry[];
   catalogItems: CatalogItem[];
+  businesses?: BusinessProfile[];
   notice?: { text: string } | null;
   anonymousDailyLimit?: number;
   settingsMenu: string[];
@@ -284,7 +343,11 @@ const emptyProfile: Profile = {
   profilePhotoPrivacy: 'everyone',
   aboutPrivacy: 'everyone',
   statusPrivacy: 'contacts',
+  typingPrivacy: 'everyone',
+  callPrivacy: 'everyone',
+  groupInvitePrivacy: 'everyone',
   readReceiptsEnabled: true,
+  blockedUserIds: [],
 };
 
 const seedUsers: User[] = [];
@@ -361,6 +424,7 @@ const seedLinkRequests: LinkRequest[] = [];
 
 const seedProfiles: Profile[] = [];
 const seedSessions: DeviceSession[] = [];
+const seedBusinesses: BusinessProfile[] = [];
 
 let mongoClientPromise: Promise<MongoClient | null> | null = null;
 let mongoConnectionState: 'not-configured' | 'connected' | 'failed' = 'not-configured';
@@ -379,6 +443,7 @@ const sendMessageSchema = z.object({
   replyPreview: z.string().max(280).optional(),
   catalogItemId: z.string().min(1).max(80).optional(),
   anonymous: z.boolean().optional(),
+  businessId: z.string().min(1).max(80).optional(),
 });
 
 const clearChatUnreadSchema = z.object({
@@ -407,9 +472,22 @@ const updateProfileSchema = z.object({
   profilePhotoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   aboutPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   statusPrivacy: z.enum(['contacts', 'close-friends', 'nobody']).optional(),
+  typingPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
+  callPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
+  groupInvitePrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   readReceiptsEnabled: z.boolean().optional(),
   appLockEnabled: z.boolean().optional(),
   pin: z.string().regex(/^\d{4,6}$/).optional(),
+});
+
+const blockUserSchema = z.object({
+  userId: z.string().min(1),
+  targetUserId: z.string().min(1),
+});
+
+const chatDisappearSchema = z.object({
+  userId: z.string().min(1),
+  disappearAfterSeconds: z.union([z.literal(0), z.literal(86400), z.literal(604800), z.literal(7776000)]),
 });
 
 const statusAssetSchema = z.object({
@@ -426,6 +504,7 @@ const createStatusSchema = z.object({
   fontFamily: z.string().min(2).max(40).optional(),
   fontSize: z.number().int().min(16).max(64).optional(),
   catalogItemId: z.string().min(1).max(80).optional(),
+  businessId: z.string().min(1).max(80).optional(),
   audience: z.enum(['contacts', 'close-friends', 'public', 'marketplace']).default('contacts'),
 }).refine((value) => value.text.trim().length > 0 || value.assets.length > 0, {
   message: 'A status needs text or at least one asset',
@@ -443,8 +522,15 @@ const updateCallSchema = z.object({
   durationSeconds: z.number().int().nonnegative().optional(),
 });
 
+const catalogVariantSchema = z.object({
+  id: z.string().min(1).max(40),
+  name: z.string().trim().min(1).max(40),
+  options: z.array(z.string().trim().min(1).max(40)).min(1).max(20),
+});
+
 const createCatalogItemSchema = z.object({
   sellerId: z.string().min(1).optional(),
+  businessId: z.string().max(80).optional(),
   title: z.string().min(2).max(120),
   price: z.number().positive(),
   currency: z.string().min(3).max(5).default('GHS'),
@@ -452,6 +538,9 @@ const createCatalogItemSchema = z.object({
   description: z.string().min(2).max(2000),
   imageUrls: z.array(z.string().url()).min(1).max(8),
   stockQuantity: z.number().int().nonnegative().default(0),
+  trackStock: z.boolean().optional(),
+  status: z.enum(['draft', 'active', 'archived', 'out_of_stock']).optional(),
+  variants: z.array(catalogVariantSchema).max(8).optional(),
   isPublic: z.boolean().optional(),
   location: z.string().max(80).optional(),
   condition: z.enum(['New', 'Used']).optional(),
@@ -465,11 +554,25 @@ const updateCatalogItemSchema = z.object({
   description: z.string().min(2).max(2000).optional(),
   imageUrls: z.array(z.string().url()).min(1).max(8).optional(),
   stockQuantity: z.number().int().nonnegative().optional(),
+  trackStock: z.boolean().optional(),
+  status: z.enum(['draft', 'active', 'archived', 'out_of_stock']).optional(),
+  variants: z.array(catalogVariantSchema).max(8).optional(),
   isPublic: z.boolean().optional(),
   location: z.string().max(80).optional(),
   condition: z.enum(['New', 'Used']).optional(),
   takenDown: z.boolean().optional(),
 });
+
+const resolveCatalogStatus = (
+  status: CatalogProductStatus | undefined,
+  stockQuantity: number,
+  trackStock: boolean,
+): CatalogProductStatus => {
+  if (status === 'archived' || status === 'draft') return status;
+  if (trackStock && stockQuantity <= 0) return 'out_of_stock';
+  if (status === 'out_of_stock' && (!trackStock || stockQuantity > 0)) return 'active';
+  return status || 'active';
+};
 
 const paymentIntentSchema = z.object({
   action: z.enum(['send', 'request', 'topup']),
@@ -507,6 +610,7 @@ const markStatusViewSchema = z.object({
 const createChatSchema = z.object({
   userId: z.string().min(1),
   peerUserId: z.string().min(1),
+  businessId: z.string().min(1).max(80).optional(),
 });
 
 const createChatRequestSchema = z.object({
@@ -520,6 +624,7 @@ const createRoomSchema = z.object({
   userId: z.string().min(1),
   title: z.string().trim().min(1).max(80),
   memberIds: z.array(z.string().min(1)).min(1),
+  businessId: z.string().min(1).max(80).optional(),
 });
 
 const pinCodeSchema = z.string().regex(/^\d{4,6}$/);
@@ -1312,6 +1417,62 @@ const readProfiles = async () => {
   return withProjection(collectionsFor(db).profiles).toArray();
 };
 
+const readBusinesses = async () => {
+  const db = await getDb();
+  if (!db) {
+    return seedBusinesses;
+  }
+  await seedDatabaseIfNeeded();
+  return db.collection<BusinessProfile>('businesses').find({}, { projection: { _id: 0 } }).toArray();
+};
+
+const saveBusiness = async (business: BusinessProfile) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedBusinesses.findIndex((item) => item.id === business.id);
+    if (index >= 0) {
+      seedBusinesses[index] = business;
+    } else {
+      seedBusinesses.unshift(business);
+    }
+    return business;
+  }
+  await seedDatabaseIfNeeded();
+  await db.collection<BusinessProfile>('businesses').updateOne({ id: business.id }, { $set: business }, { upsert: true });
+  return business;
+};
+
+const businessesForUser = async (userId: string) =>
+  (await readBusinesses()).filter((business) => business.members.some((member) => member.userId === userId));
+
+const businessRoleFor = (business: BusinessProfile, userId: string) =>
+  business.members.find((member) => member.userId === userId)?.role ?? null;
+
+const chatSpaceOf = (chat: Chat) => (chat.space && chat.space !== 'personal' ? chat.space : 'personal');
+
+const blockedBy = (profile: Profile | null | undefined, otherUserId: string) =>
+  Boolean(profile?.blockedUserIds?.includes(otherUserId));
+
+const usersHaveBlock = async (leftUserId: string, rightUserId: string) => {
+  if (!leftUserId || !rightUserId || leftUserId === rightUserId) {
+    return false;
+  }
+  const [left, right] = await Promise.all([readProfile(leftUserId), readProfile(rightUserId)]);
+  return blockedBy(left, rightUserId) || blockedBy(right, leftUserId);
+};
+
+const privacyAllows = (
+  setting: 'everyone' | 'contacts' | 'nobody' | undefined,
+  viewerId: string,
+  ownerId: string,
+  mutual: boolean,
+) => {
+  const privacy = setting ?? 'everyone';
+  if (viewerId === ownerId || privacy === 'everyone') return true;
+  if (privacy === 'nobody') return false;
+  return mutual;
+};
+
 const readUserByPhone = async (phone: string, countryCode?: string) => {
   const users = await readUsers();
   const profiles = await readProfiles();
@@ -1920,8 +2081,14 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     ...user,
     photoUri: photoByUserId.get(user.id) || user.photoUri || '',
   }));
+  const myBusinesses = await businessesForUser(currentUserId);
+  const myBusinessIds = new Set(myBusinesses.map((business) => business.id));
+  if (profile?.activeBusinessId && !myBusinessIds.has(profile.activeBusinessId)) {
+    profile = { ...profile, activeBusinessId: null };
+    await updateProfile(currentUserId, { activeBusinessId: null }).catch(() => undefined);
+  }
   const visibleChats = chats
-    .filter((chat) => chat.participants.includes(currentUserId))
+    .filter((chat) => chat.participants.includes(currentUserId) || (chat.space ? myBusinessIds.has(chat.space) : false))
     .map((chat) => {
       const unreadForUser = chat.unreadByUser?.[currentUserId] ?? 0;
       if (chat.kind !== 'direct') {
@@ -1942,11 +2109,13 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       };
     });
   const visibleChatIds = new Set(visibleChats.map((chat) => chat.id));
+  const nowMs = Date.now();
   const visibleMessages = messages.filter(
     (message) =>
       visibleChatIds.has(message.chatId) &&
       !message.deletedForEveryone &&
-      !(message.deletedFor ?? []).includes(currentUserId),
+      !(message.deletedFor ?? []).includes(currentUserId) &&
+      !(message.expiresAt && new Date(message.expiresAt).getTime() <= nowMs),
   );
   const visibleCalls = calls.filter((call) => call.participantIds.includes(currentUserId) && !(call.hiddenFor ?? []).includes(currentUserId));
   const mergedContacts = contacts.map((contact) => {
@@ -1990,6 +2159,13 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     if (status.userId === currentUserId) {
       return true;
     }
+    const ownerStatusPrivacy = profileById.get(status.userId)?.statusPrivacy ?? 'contacts';
+    if (ownerStatusPrivacy === 'nobody') {
+      return false;
+    }
+    if ((ownerStatusPrivacy === 'contacts' || ownerStatusPrivacy === 'close-friends') && !mutualSet.has(status.userId) && status.audience !== 'marketplace') {
+      return false;
+    }
     if (status.audience === 'public') {
       return true;
     }
@@ -2020,17 +2196,28 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     ...visibleChats.flatMap((chat) => chat.participants),
   ]);
   const safeUsers = users.map((user) => {
-    if (knownUserIds.has(user.id)) {
-      return user;
-    }
     const theirProfile = profileById.get(user.id);
-    const showPhoto = theirProfile?.profilePhotoPrivacy === 'everyone';
+    const allows = (setting: 'everyone' | 'contacts' | 'nobody' | undefined) => {
+      const privacy = setting ?? 'everyone';
+      if (user.id === currentUserId || privacy === 'everyone') return true;
+      if (privacy === 'nobody') return false;
+      return mutualSet.has(user.id);
+    };
+    const seePresence = allows(theirProfile?.lastSeenPrivacy);
+    const seePhoto = allows(theirProfile?.profilePhotoPrivacy);
+    const seeAbout = allows(theirProfile?.aboutPrivacy);
+    const known = knownUserIds.has(user.id);
     return {
       ...user,
-      phone: '',
-      username: '',
-      about: '',
-      photoUri: showPhoto ? user.photoUri : '',
+      phone: known ? user.phone : '',
+      username: known ? user.username : '',
+      about: seeAbout ? user.about : '',
+      photoUri: seePhoto ? (user.photoUri || '') : '',
+      presence: seePresence ? user.presence : 'offline',
+      lastSeenAt: seePresence ? user.lastSeenAt : undefined,
+      lastSeenPrivacy: theirProfile?.lastSeenPrivacy ?? 'everyone',
+      profilePhotoPrivacy: theirProfile?.profilePhotoPrivacy ?? 'everyone',
+      aboutPrivacy: theirProfile?.aboutPrivacy ?? 'everyone',
     };
   });
 
@@ -2050,6 +2237,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     statuses: visibleStatuses,
     updatesFeed: buildUpdateFeed(safeUsers, visibleStatuses),
     catalogItems: visibleCatalog,
+    businesses: myBusinesses,
     notice: appConfig.bannerActive && appConfig.bannerText ? { text: appConfig.bannerText } : null,
     anonymousDailyLimit: appConfig.anonymousDailyLimit,
     settingsMenu,
@@ -2216,22 +2404,23 @@ const persistMessage = async (message: Message) => {
   return message;
 };
 
-const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
+const createOrFindDirectChat = async (userId: string, peerUserId: string, space = 'personal') => {
   const users = await readUsers();
   const peerUser = users.find((user) => user.id === peerUserId);
   if (!peerUser) {
     return null;
   }
 
+  const wantedSpace = space && space !== 'personal' ? space : 'personal';
   const selfChat = userId === peerUserId;
   const participants = selfChat ? [userId] : [userId, peerUserId].sort();
+  const sameThread = (chat: Chat) =>
+    chat.kind === 'direct'
+    && [...chat.participants].sort().join(':') === participants.join(':')
+    && chatSpaceOf(chat) === wantedSpace;
   const db = await getDb();
   if (!db) {
-    const existing = seedChats.find(
-      (chat) =>
-        chat.kind === 'direct' &&
-        [...chat.participants].sort().join(':') === participants.join(':'),
-    );
+    const existing = seedChats.find(sameThread);
     if (existing) {
       return existing;
     }
@@ -2241,6 +2430,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
       title: selfChat ? 'Message yourself' : peerUser.name,
       kind: 'direct',
       participants,
+      space: wantedSpace,
       unreadCount: 0,
       lastMessagePreview: 'Say hello',
       updatedAt: new Date().toISOString(),
@@ -2252,9 +2442,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
   await seedDatabaseIfNeeded();
   const collections = collectionsFor(db);
   const chats = await collections.chats.find({ kind: 'direct' }, { projection: { _id: 0 } }).toArray();
-  const existing = chats.find(
-    (chat) => [...chat.participants].sort().join(':') === participants.join(':'),
-  );
+  const existing = chats.find(sameThread);
   if (existing) {
     return existing;
   }
@@ -2264,6 +2452,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
     title: selfChat ? 'Message yourself' : peerUser.name,
     kind: 'direct',
     participants,
+    space: wantedSpace,
     unreadCount: 0,
     lastMessagePreview: 'Say hello',
     updatedAt: new Date().toISOString(),
@@ -2272,7 +2461,7 @@ const createOrFindDirectChat = async (userId: string, peerUserId: string) => {
   return chat;
 };
 
-const createChatRoom = async (userId: string, title: string, memberIds: string[]) => {
+const createChatRoom = async (userId: string, title: string, memberIds: string[], space = 'personal') => {
   const users = await readUsers();
   if (!users.some((user) => user.id === userId)) {
     return null;
@@ -2288,6 +2477,7 @@ const createChatRoom = async (userId: string, title: string, memberIds: string[]
     kind: 'group',
     participants,
     adminIds: [userId],
+    space: space && space !== 'personal' ? space : 'personal',
     unreadCount: 0,
     unreadByUser: {},
     lastMessagePreview: 'Chat room created',
@@ -3720,7 +3910,16 @@ app.post('/api/statuses', async (req, res) => {
       ? new Date('2099-01-01T00:00:00.000Z').toISOString()
       : new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString(),
     audience: parseResult.data.audience,
+    businessId: parseResult.data.businessId,
+    businessName: undefined as string | undefined,
   };
+  if (status.businessId) {
+    const business = (await readBusinesses()).find((item) => item.id === status.businessId);
+    if (!business || !businessRoleFor(business, status.userId)) {
+      return res.status(403).json({ error: 'You cannot post as that business.' });
+    }
+    status.businessName = business.name;
+  }
 
   await persistStatus(status);
   const [users, statuses] = await Promise.all([readUsers(), readStatuses()]);
@@ -3855,8 +4054,50 @@ app.delete('/api/statuses/:statusId', async (req, res) => {
   return res.json({ deleted: true, statusId: deletedStatus.id });
 });
 
-app.get('/api/catalog', async (_req, res) => {
-  res.json({ catalogItems: await readCatalogItems() });
+app.get('/api/catalog', async (req, res) => {
+  const sellerId = typeof req.query.sellerId === 'string' ? req.query.sellerId : '';
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : '';
+  const status = typeof req.query.status === 'string' ? req.query.status : '';
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  const publicOnly = req.query.public === '1' || req.query.public === 'true';
+  let items = await readCatalogItems();
+  if (sellerId) items = items.filter((item) => item.sellerId === sellerId);
+  if (businessId) items = items.filter((item) => item.businessId === businessId || (!item.businessId && item.sellerId));
+  if (status) items = items.filter((item) => (item.status || 'active') === status);
+  if (publicOnly) {
+    items = items.filter(
+      (item) => item.isPublic
+        && !item.takenDown
+        && (item.status || 'active') !== 'archived'
+        && (item.status || 'active') !== 'draft',
+    );
+  }
+  if (q) {
+    items = items.filter((item) => {
+      const haystack = `${item.title} ${item.description} ${item.category} ${item.location || ''}`.toLowerCase();
+      return haystack.includes(q);
+    });
+  }
+  return res.json({ catalogItems: items });
+});
+
+app.get('/api/catalog/search', async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+  const sellerId = typeof req.query.sellerId === 'string' ? req.query.sellerId : '';
+  const category = typeof req.query.category === 'string' ? req.query.category.trim().toLowerCase() : '';
+  const items = (await readCatalogItems()).filter((item) => {
+    if (item.takenDown) return false;
+    if ((item.status || 'active') === 'archived' || (item.status || 'active') === 'draft') return false;
+    if (!item.isPublic) return false;
+    if (sellerId && item.sellerId !== sellerId) return false;
+    if (category && category !== 'all' && item.category.toLowerCase() !== category) return false;
+    if (!q) return true;
+    const haystack = `${item.title} ${item.description} ${item.category} ${(item.variants || [])
+      .map((variant) => `${variant.name} ${variant.options.join(' ')}`)
+      .join(' ')}`.toLowerCase();
+    return haystack.includes(q);
+  });
+  return res.json({ catalogItems: items, count: items.length });
 });
 
 app.post('/api/catalog', async (req, res) => {
@@ -3876,6 +4117,7 @@ app.post('/api/catalog', async (req, res) => {
   const duplicate = existingItems.find((item) =>
     item.sellerId === sellerId
     && !item.takenDown
+    && (item.status || 'active') !== 'archived'
     && item.title.trim().toLowerCase() === titleKey,
   );
   if (duplicate) {
@@ -3886,17 +4128,25 @@ app.post('/api/catalog', async (req, res) => {
     || (sellerProfile?.phone || sellerProfile?.countryCode
       ? currencyForCallingCode(sellerProfile.countryCode || sellerProfile.phone)
       : '');
+  const trackStock = parseResult.data.trackStock !== false;
+  const stockQuantity = parseResult.data.stockQuantity ?? 0;
+  const status = resolveCatalogStatus(parseResult.data.status || 'active', stockQuantity, trackStock);
   const item: CatalogItem = {
     id: `p${Date.now()}`,
     sellerId,
+    businessId: parseResult.data.businessId || sellerProfile?.activeBusinessId || null,
     title: parseResult.data.title,
     price: parseResult.data.price,
     currency: sellerCurrency || parseResult.data.currency,
     category: parseResult.data.category,
     description: parseResult.data.description,
     imageUrls: parseResult.data.imageUrls,
-    stockQuantity: parseResult.data.stockQuantity ?? 0,
-    isPublic: Boolean(parseResult.data.isPublic),
+    stockQuantity,
+    trackStock,
+    status,
+    variants: parseResult.data.variants || [],
+    availabilityUpdatedAt: timestamp,
+    isPublic: parseResult.data.isPublic == null ? status === 'active' : Boolean(parseResult.data.isPublic),
     location: parseResult.data.location?.trim() || '',
     condition: parseResult.data.condition || 'New',
     takenDown: false,
@@ -3927,9 +4177,29 @@ app.patch('/api/catalog/:itemId', async (req, res) => {
     return res.status(404).json({ error: 'Catalog item not found' });
   }
 
+  const nextStock = parseResult.data.stockQuantity ?? existing.stockQuantity;
+  const nextTrack = parseResult.data.trackStock ?? existing.trackStock !== false;
+  const nextStatus = resolveCatalogStatus(
+    parseResult.data.status ?? existing.status,
+    nextStock,
+    nextTrack,
+  );
+  const stockChanged = parseResult.data.stockQuantity != null
+    || parseResult.data.trackStock != null
+    || parseResult.data.status != null;
   const updated: CatalogItem = {
     ...existing,
     ...parseResult.data,
+    stockQuantity: nextStock,
+    trackStock: nextTrack,
+    status: nextStatus,
+    variants: parseResult.data.variants ?? existing.variants ?? [],
+    availabilityUpdatedAt: stockChanged
+      ? new Date().toISOString()
+      : (existing.availabilityUpdatedAt || existing.updatedAt),
+    isPublic: nextStatus === 'archived' || nextStatus === 'draft'
+      ? false
+      : (parseResult.data.isPublic == null ? existing.isPublic : Boolean(parseResult.data.isPublic)),
     updatedAt: new Date().toISOString(),
   };
 
@@ -4045,6 +4315,351 @@ app.patch('/api/profile', async (req, res) => {
   return res.json({ profile });
 });
 
+const createBusinessSchema = z.object({
+  userId: z.string().min(1),
+  name: z.string().trim().min(2).max(80),
+  description: z.string().trim().max(280).optional(),
+});
+
+const updateBusinessSchema = z.object({
+  userId: z.string().min(1),
+  name: z.string().trim().min(2).max(80).optional(),
+  description: z.string().trim().max(280).optional(),
+  logoUrl: z.string().max(2000).refine(
+    (value) => value === '' || /^https?:\/\//i.test(value),
+    'Logo must be an uploaded https URL',
+  ).optional(),
+  location: z.string().trim().max(120).optional(),
+  hours: z.string().trim().max(120).optional(),
+  contactButtonLabel: z.string().trim().max(40).optional(),
+  showPhone: z.boolean().optional(),
+  visibility: z.enum(['draft', 'published']).optional(),
+});
+
+const businessVerifySchema = z.object({
+  userId: z.string().min(1),
+  note: z.string().trim().max(280).optional(),
+  evidenceUrls: z.array(z.string().url()).max(5).default([]),
+});
+
+const businessReportSchema = z.object({
+  userId: z.string().min(1),
+  reason: z.string().trim().min(4).max(280),
+});
+
+const addBusinessStaffSchema = z.object({
+  userId: z.string().min(1),
+  phone: z.string().min(7).max(30),
+  countryCode: z.string().max(8).optional(),
+  role: z.enum(['manager', 'sales', 'support']),
+});
+
+const switchIdentitySchema = z.object({
+  userId: z.string().min(1),
+  businessId: z.string().max(80).optional(),
+});
+
+app.get('/api/businesses', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+  return res.json({ businesses: await businessesForUser(userId) });
+});
+
+app.post('/api/businesses', async (req, res) => {
+  const parseResult = createBusinessSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Enter a business name.' });
+  }
+  const owner = (await readUsers()).find((user) => user.id === parseResult.data.userId);
+  if (!owner) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+  const now = new Date().toISOString();
+  const business: BusinessProfile = {
+    id: `b${Date.now()}`,
+    ownerUserId: owner.id,
+    name: parseResult.data.name,
+    description: parseResult.data.description?.trim() || '',
+    logoUrl: '',
+    location: '',
+    hours: '',
+    contactButtonLabel: 'Chat',
+    showPhone: false,
+    visibility: 'draft',
+    verificationStatus: 'unverified',
+    verificationNote: '',
+    verificationEvidenceUrls: [],
+    verificationSubmittedAt: null,
+    verificationReviewedAt: null,
+    verificationReviewNote: '',
+    createdAt: now,
+    updatedAt: now,
+    members: [{ userId: owner.id, role: 'owner', addedAt: now }],
+  };
+  await saveBusiness(business);
+  const profile = await updateProfile(owner.id, {
+    activeBusinessId: business.id,
+    businessName: business.name,
+    businessDescription: business.description,
+  });
+  return res.status(201).json({ business, profile });
+});
+
+app.patch('/api/businesses/:businessId', async (req, res) => {
+  const parseResult = updateBusinessSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'That business update is not valid.' });
+  }
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  const role = businessRoleFor(business, parseResult.data.userId);
+  if (role !== 'owner' && role !== 'manager') {
+    return res.status(403).json({ error: 'Only an owner or manager can edit this business.' });
+  }
+  const next: BusinessProfile = {
+    ...business,
+    name: parseResult.data.name ?? business.name,
+    description: parseResult.data.description ?? business.description,
+    logoUrl: parseResult.data.logoUrl ?? business.logoUrl ?? '',
+    location: parseResult.data.location ?? business.location ?? '',
+    hours: parseResult.data.hours ?? business.hours ?? '',
+    contactButtonLabel: parseResult.data.contactButtonLabel ?? business.contactButtonLabel ?? 'Chat',
+    showPhone: parseResult.data.showPhone ?? Boolean(business.showPhone),
+    visibility: parseResult.data.visibility ?? business.visibility ?? 'draft',
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBusiness(next);
+  if (role === 'owner' || role === 'manager') {
+    await updateProfile(business.ownerUserId, {
+      businessName: next.name,
+      businessDescription: next.description,
+    }).catch(() => undefined);
+  }
+  return res.json({ business: next });
+});
+
+app.get('/api/businesses/owner/:ownerUserId/public', async (req, res) => {
+  const viewerId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const business = (await readBusinesses()).find(
+    (item) =>
+      item.ownerUserId === req.params.ownerUserId
+      && (item.visibility || 'draft') === 'published',
+  );
+  if (!business) {
+    return res.status(404).json({ error: 'No public business for this account.' });
+  }
+  const isMember = viewerId ? Boolean(businessRoleFor(business, viewerId)) : false;
+  const owner = (await readUsers()).find((user) => user.id === business.ownerUserId);
+  const ownerProfile = await readProfile(business.ownerUserId);
+  const catalog = (await readCatalogItems()).filter(
+    (item) =>
+      item.sellerId === business.ownerUserId
+      && item.isPublic
+      && !item.takenDown
+      && (item.status || 'active') !== 'archived'
+      && (item.status || 'active') !== 'draft',
+  );
+  return res.json({
+    business: {
+      id: business.id,
+      name: business.name,
+      description: business.description,
+      logoUrl: business.logoUrl || '',
+      location: business.location || '',
+      hours: business.hours || '',
+      contactButtonLabel: business.contactButtonLabel || 'Chat',
+      showPhone: Boolean(business.showPhone),
+      phone: business.showPhone ? (ownerProfile?.phone || owner?.phone || '') : '',
+      visibility: business.visibility || 'draft',
+      verificationStatus: business.verificationStatus || 'unverified',
+      verified: (business.verificationStatus || 'unverified') === 'approved',
+      ownerUserId: business.ownerUserId,
+      ownerName: owner?.name || ownerProfile?.name || '',
+      catalogCount: catalog.length,
+    },
+    catalogItems: catalog,
+    isMember,
+  });
+});
+
+app.get('/api/businesses/:businessId', async (req, res) => {
+  const viewerId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  const isMember = viewerId ? Boolean(businessRoleFor(business, viewerId)) : false;
+  const published = (business.visibility || 'draft') === 'published';
+  if (!published && !isMember) {
+    return res.status(404).json({ error: 'This business is not public yet.' });
+  }
+  const owner = (await readUsers()).find((user) => user.id === business.ownerUserId);
+  const ownerProfile = await readProfile(business.ownerUserId);
+  const catalog = (await readCatalogItems()).filter(
+    (item) =>
+      item.sellerId === business.ownerUserId
+      && item.isPublic
+      && !item.takenDown
+      && (item.status || 'active') !== 'archived'
+      && (item.status || 'active') !== 'draft',
+  );
+  const publicBusiness = {
+    id: business.id,
+    name: business.name,
+    description: business.description,
+    logoUrl: business.logoUrl || '',
+    location: business.location || '',
+    hours: business.hours || '',
+    contactButtonLabel: business.contactButtonLabel || 'Chat',
+    showPhone: Boolean(business.showPhone),
+    phone: business.showPhone ? (ownerProfile?.phone || owner?.phone || '') : '',
+    visibility: business.visibility || 'draft',
+    verificationStatus: business.verificationStatus || 'unverified',
+    verified: (business.verificationStatus || 'unverified') === 'approved',
+    ownerUserId: business.ownerUserId,
+    ownerName: owner?.name || ownerProfile?.name || '',
+    catalogCount: catalog.length,
+  };
+  return res.json({
+    business: isMember ? { ...business, verified: publicBusiness.verified } : publicBusiness,
+    catalogItems: catalog,
+    isMember,
+  });
+});
+
+app.post('/api/businesses/:businessId/verify', async (req, res) => {
+  const parseResult = businessVerifySchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Add a short note or supporting documents.' });
+  }
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  if (businessRoleFor(business, parseResult.data.userId) !== 'owner') {
+    return res.status(403).json({ error: 'Only the owner can request verification.' });
+  }
+  if ((business.verificationStatus || 'unverified') === 'approved') {
+    return res.status(400).json({ error: 'This business is already verified.' });
+  }
+  const next: BusinessProfile = {
+    ...business,
+    verificationStatus: 'pending',
+    verificationNote: parseResult.data.note || '',
+    verificationEvidenceUrls: parseResult.data.evidenceUrls,
+    verificationSubmittedAt: new Date().toISOString(),
+    verificationReviewedAt: null,
+    verificationReviewNote: '',
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBusiness(next);
+  void recordAdminEvent(getDb, {
+    level: 'info',
+    area: 'business',
+    message: 'Business verification submitted',
+    detail: `${next.id} ${next.name}`,
+  });
+  return res.json({ business: next });
+});
+
+app.post('/api/businesses/:businessId/report', async (req, res) => {
+  const parseResult = businessReportSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Tell us why you are reporting this business.' });
+  }
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  const db = await getDb();
+  const report = {
+    id: `br${Date.now()}`,
+    businessId: business.id,
+    businessName: business.name,
+    reporterUserId: parseResult.data.userId,
+    reason: parseResult.data.reason,
+    createdAt: new Date().toISOString(),
+    state: 'open',
+  };
+  if (db) {
+    await db.collection('businessReports').insertOne({ ...report });
+  }
+  void recordAdminEvent(getDb, {
+    level: 'warn',
+    area: 'business',
+    message: 'Business reported',
+    detail: `${business.id} ${parseResult.data.reason}`,
+  });
+  return res.status(201).json({ report });
+});
+
+app.post('/api/businesses/:businessId/staff', async (req, res) => {
+  const parseResult = addBusinessStaffSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Enter the staff phone number and role.' });
+  }
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  if (businessRoleFor(business, parseResult.data.userId) !== 'owner') {
+    return res.status(403).json({ error: 'Only the owner can add staff.' });
+  }
+  const staffUser = await readUserByPhone(parseResult.data.phone, parseResult.data.countryCode);
+  if (!staffUser) {
+    return res.status(404).json({ error: 'That phone number is not on ZynkUp yet.' });
+  }
+  if (staffUser.id === business.ownerUserId) {
+    return res.status(400).json({ error: 'The owner is already on this business.' });
+  }
+  const members = business.members.filter((member) => member.userId !== staffUser.id);
+  members.push({ userId: staffUser.id, role: parseResult.data.role, addedAt: new Date().toISOString() });
+  const next = { ...business, members, updatedAt: new Date().toISOString() };
+  await saveBusiness(next);
+  return res.json({ business: next });
+});
+
+app.delete('/api/businesses/:businessId/staff/:memberUserId', async (req, res) => {
+  const userId = typeof req.body?.userId === 'string' ? req.body.userId : '';
+  const business = (await readBusinesses()).find((item) => item.id === req.params.businessId);
+  if (!business) {
+    return res.status(404).json({ error: 'Business not found' });
+  }
+  if (businessRoleFor(business, userId) !== 'owner') {
+    return res.status(403).json({ error: 'Only the owner can remove staff.' });
+  }
+  if (req.params.memberUserId === business.ownerUserId) {
+    return res.status(400).json({ error: 'The owner cannot be removed.' });
+  }
+  const next = {
+    ...business,
+    members: business.members.filter((member) => member.userId !== req.params.memberUserId),
+    updatedAt: new Date().toISOString(),
+  };
+  await saveBusiness(next);
+  return res.json({ business: next });
+});
+
+app.post('/api/identity', async (req, res) => {
+  const parseResult = switchIdentitySchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose Personal or a business.' });
+  }
+  const businessId = parseResult.data.businessId?.trim() || '';
+  if (businessId) {
+    const business = (await readBusinesses()).find((item) => item.id === businessId);
+    if (!business || !businessRoleFor(business, parseResult.data.userId)) {
+      return res.status(403).json({ error: 'You do not have access to that business.' });
+    }
+  }
+  const profile = await updateProfile(parseResult.data.userId, { activeBusinessId: businessId || null });
+  return res.json({ profile, activeBusinessId: businessId || null });
+});
+
 app.post('/api/calls', async (req, res) => {
   const parseResult = createCallSchema.safeParse(req.body);
 
@@ -4055,10 +4670,31 @@ app.post('/api/calls', async (req, res) => {
     });
   }
 
+  const initiatorId = parseResult.data.initiatorId ?? parseResult.data.participantIds[0];
+  const calleeId = parseResult.data.participantIds.find((id) => id !== initiatorId) || '';
+  if (calleeId) {
+    if (await usersHaveBlock(initiatorId, calleeId)) {
+      return res.status(403).json({ error: 'You cannot call this person.' });
+    }
+    const [calleeProfile, mutualContacts] = await Promise.all([
+      readProfile(calleeId),
+      readContacts(),
+    ]);
+    const savedByCallee = mutualContacts.some(
+      (contact) => contact.ownerUserId === calleeId && contact.linkedUserId === initiatorId,
+    );
+    const savedByCaller = mutualContacts.some(
+      (contact) => contact.ownerUserId === initiatorId && contact.linkedUserId === calleeId,
+    );
+    if (!privacyAllows(calleeProfile?.callPrivacy, initiatorId, calleeId, savedByCallee && savedByCaller)) {
+      return res.status(403).json({ error: 'This person only accepts calls from people they allow.' });
+    }
+  }
+
   const call: Call = {
     id: `call${Date.now()}`,
     participantIds: parseResult.data.participantIds,
-    initiatorId: parseResult.data.initiatorId ?? parseResult.data.participantIds[0],
+    initiatorId,
     kind: parseResult.data.kind,
     direction: parseResult.data.direction,
     state: 'ringing',
@@ -4171,7 +4807,17 @@ app.post('/api/chats', async (req, res) => {
     });
   }
 
-  const chat = await createOrFindDirectChat(parseResult.data.userId, parseResult.data.peerUserId);
+  const requestedSpace = parseResult.data.businessId || 'personal';
+  if (requestedSpace !== 'personal') {
+    const business = (await readBusinesses()).find((item) => item.id === requestedSpace);
+    if (!business || !businessRoleFor(business, parseResult.data.userId)) {
+      return res.status(403).json({ error: 'You cannot message as that business.' });
+    }
+  }
+  if (await usersHaveBlock(parseResult.data.userId, parseResult.data.peerUserId)) {
+    return res.status(403).json({ error: 'You cannot start a chat with this person.' });
+  }
+  const chat = await createOrFindDirectChat(parseResult.data.userId, parseResult.data.peerUserId, requestedSpace);
   if (!chat) {
     return res.status(404).json({ error: 'Peer user not found' });
   }
@@ -4189,10 +4835,18 @@ app.post('/api/chats/rooms', async (req, res) => {
     });
   }
 
+  const roomSpace = parseResult.data.businessId || 'personal';
+  if (roomSpace !== 'personal') {
+    const business = (await readBusinesses()).find((item) => item.id === roomSpace);
+    if (!business || !businessRoleFor(business, parseResult.data.userId)) {
+      return res.status(403).json({ error: 'You cannot create a room for that business.' });
+    }
+  }
   const chat = await createChatRoom(
     parseResult.data.userId,
     parseResult.data.title,
     parseResult.data.memberIds,
+    roomSpace,
   );
   if (!chat) {
     return res.status(400).json({ error: 'A chat room needs at least 2 people.' });
@@ -4271,7 +4925,21 @@ app.post('/api/chats/:chatId/members', async (req, res) => {
     return res.status(403).json({ error: 'Only a group admin can add people.' });
   }
   const known = new Set((await readUsers()).map((user) => user.id));
-  const participants = [...new Set([...chat.participants, ...memberIds.filter((id: string) => known.has(id))])];
+  const contacts = await readContacts();
+  const allowedMemberIds: string[] = [];
+  for (const candidateId of memberIds) {
+    if (!known.has(candidateId) || chat.participants.includes(candidateId)) continue;
+    if (await usersHaveBlock(userId, candidateId)) continue;
+    const invitee = await readProfile(candidateId);
+    const mutual = contacts.some((contact) => contact.ownerUserId === userId && contact.linkedUserId === candidateId)
+      && contacts.some((contact) => contact.ownerUserId === candidateId && contact.linkedUserId === userId);
+    if (!privacyAllows(invitee?.groupInvitePrivacy, userId, candidateId, mutual)) continue;
+    allowedMemberIds.push(candidateId);
+  }
+  if (!allowedMemberIds.length) {
+    return res.status(403).json({ error: 'None of those people accept this group invite.' });
+  }
+  const participants = [...new Set([...chat.participants, ...allowedMemberIds])];
   const added = participants.filter((id) => !chat.participants.includes(id));
   const updated = { ...chat, participants, adminIds: chatAdmins(chat), updatedAt: new Date().toISOString() };
   await saveChatRecord(updated);
@@ -4418,8 +5086,36 @@ app.post('/api/messages', async (req, res) => {
   const payload = parseResult.data;
   const chat = (await readChats()).find((item) => item.id === payload.chatId);
 
-  if (!chat || !chat.participants.includes(payload.senderId)) {
+  const space = chat ? chatSpaceOf(chat) : 'personal';
+  const sendingAs = payload.businessId || 'personal';
+  const sendingBusiness = sendingAs === 'personal'
+    ? null
+    : (await readBusinesses()).find((item) => item.id === sendingAs) ?? null;
+  const senderRole = sendingBusiness ? businessRoleFor(sendingBusiness, payload.senderId) : null;
+  const canAccessChat = Boolean(
+    chat && (
+      chat.participants.includes(payload.senderId)
+      || (space !== 'personal' && senderRole)
+    ),
+  );
+  if (!chat || !canAccessChat) {
     return res.status(404).json({ error: 'Chat not found' });
+  }
+  if (sendingAs !== space) {
+    return res.status(409).json({
+      error: space === 'personal'
+        ? 'This chat is personal. Switch to Personal before you reply.'
+        : 'This chat belongs to a business. Switch to that business before you reply.',
+    });
+  }
+  if (sendingAs !== 'personal' && !senderRole) {
+    return res.status(403).json({ error: 'You cannot send as that business.' });
+  }
+  if (chat.kind === 'direct') {
+    const peerId = chat.participants.find((id) => id !== payload.senderId) || '';
+    if (peerId && (await usersHaveBlock(payload.senderId, peerId))) {
+      return res.status(403).json({ error: 'You cannot message this person.' });
+    }
   }
   if (payload.anonymous && chat.kind !== 'group') {
     return res.status(400).json({ error: 'Anonymous messages are only for chat rooms.' });
@@ -4471,6 +5167,11 @@ app.post('/api/messages', async (req, res) => {
     catalogItemId: payload.catalogItemId,
     anonymous: Boolean(payload.anonymous),
     anonymousDay,
+    actorBusinessId: sendingBusiness?.id,
+    actorName: sendingBusiness?.name,
+    expiresAt: chat.disappearAfterSeconds
+      ? new Date(Date.now() + chat.disappearAfterSeconds * 1000).toISOString()
+      : undefined,
   };
 
   await persistMessage(message);
@@ -4483,7 +5184,9 @@ app.post('/api/messages', async (req, res) => {
 
   const senderUser = (await readUsers()).find((user) => user.id === message.senderId);
   const senderProfile = senderUser ? await readProfile(senderUser.id) : null;
-  for (const participantId of chat.participants) {
+  const recipientIds = new Set(chat.participants);
+  sendingBusiness?.members.forEach((member) => recipientIds.add(member.userId));
+  for (const participantId of recipientIds) {
     const delivered = presentMessage(message, participantId);
     io.to(`user:${participantId}`).emit('message:new', {
       ...delivered,
@@ -4617,6 +5320,27 @@ app.patch('/api/messages/:messageId/receipt', async (req, res) => {
     });
   }
 
+  if (parseResult.data.state === 'read') {
+    const current = (await readMessages()).find((item) => item.id === req.params.messageId);
+    if (current) {
+      const chat = (await readChats()).find((item) => item.id === current.chatId);
+      const readerId = chat?.participants.find((id) => id !== current.senderId) || '';
+      const [senderProfile, readerProfile] = await Promise.all([
+        readProfile(current.senderId),
+        readerId ? readProfile(readerId) : Promise.resolve(null),
+      ]);
+      if (senderProfile?.readReceiptsEnabled === false || readerProfile?.readReceiptsEnabled === false) {
+        const delivered = current.state === 'sent'
+          ? await updateMessageReceipt(req.params.messageId, 'delivered')
+          : current;
+        if (delivered) {
+          io.emit('message:receiptUpdated', delivered);
+        }
+        return res.json({ message: delivered, receiptsHidden: true });
+      }
+    }
+  }
+
   const message = await updateMessageReceipt(req.params.messageId, parseResult.data.state);
   if (!message) {
     return res.status(404).json({ error: 'Message not found' });
@@ -4624,6 +5348,56 @@ app.patch('/api/messages/:messageId/receipt', async (req, res) => {
 
   io.emit('message:receiptUpdated', message);
   return res.json({ message });
+});
+
+app.post('/api/users/block', async (req, res) => {
+  const parseResult = blockUserSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose who to block.' });
+  }
+  if (parseResult.data.userId === parseResult.data.targetUserId) {
+    return res.status(400).json({ error: 'You cannot block yourself.' });
+  }
+  const profile = await readProfile(parseResult.data.userId);
+  const blockedUserIds = [...new Set([...(profile?.blockedUserIds ?? []), parseResult.data.targetUserId])];
+  const next = await updateProfile(parseResult.data.userId, { blockedUserIds });
+  return res.json({ profile: next, blockedUserIds });
+});
+
+app.post('/api/users/unblock', async (req, res) => {
+  const parseResult = blockUserSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose who to unblock.' });
+  }
+  const profile = await readProfile(parseResult.data.userId);
+  const blockedUserIds = (profile?.blockedUserIds ?? []).filter((id) => id !== parseResult.data.targetUserId);
+  const next = await updateProfile(parseResult.data.userId, { blockedUserIds });
+  return res.json({ profile: next, blockedUserIds });
+});
+
+app.patch('/api/chats/:chatId/disappear', async (req, res) => {
+  const parseResult = chatDisappearSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose a disappearing timer.' });
+  }
+  const chats = await readChats();
+  const chat = chats.find((item) => item.id === req.params.chatId);
+  if (!chat || !chat.participants.includes(parseResult.data.userId)) {
+    return res.status(404).json({ error: 'Chat not found' });
+  }
+  const next = {
+    ...chat,
+    disappearAfterSeconds: parseResult.data.disappearAfterSeconds,
+  };
+  await saveChatRecord(next);
+  for (const participantId of chat.participants) {
+    io.to(`user:${participantId}`).emit('chat:updated', {
+      ...next,
+      unreadCount: next.unreadByUser?.[participantId] ?? 0,
+      viewerUserId: participantId,
+    });
+  }
+  return res.json({ chat: next });
 });
 
 app.post('/api/calls/:callId/reached', async (req, res) => {
@@ -4665,8 +5439,27 @@ io.on('connection', (socket) => {
     socket.leave(chatId);
   });
 
-  socket.on('typing:update', ({ chatId, userId, typing }) => {
-    socket.to(chatId).emit('typing:update', { chatId, userId, typing });
+  socket.on('typing:update', async ({ chatId, userId, typing }) => {
+    try {
+      const chat = (await readChats()).find((item) => item.id === chatId);
+      if (!chat || !userId || !chat.participants.includes(userId)) {
+        return;
+      }
+      const typerProfile = await readProfile(userId);
+      for (const participantId of chat.participants) {
+        if (participantId === userId) continue;
+        if (await usersHaveBlock(userId, participantId)) continue;
+        const contacts = await readContacts();
+        const mutual = contacts.some((contact) => contact.ownerUserId === userId && contact.linkedUserId === participantId)
+          && contacts.some((contact) => contact.ownerUserId === participantId && contact.linkedUserId === userId);
+        if (!privacyAllows(typerProfile?.typingPrivacy, participantId, userId, mutual)) {
+          continue;
+        }
+        io.to(`user:${participantId}`).emit('typing:update', { chatId, userId, typing });
+      }
+    } catch {
+      socket.to(chatId).emit('typing:update', { chatId, userId, typing });
+    }
   });
 
   socket.on('presence:update', ({ userId, presence }: { userId: string; presence: Presence }) => {

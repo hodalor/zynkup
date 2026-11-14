@@ -223,6 +223,9 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
     const payments = db ? await db.collection('payments').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(8).toArray() : [];
     const boosts = db ? await db.collection('boostRequests').countDocuments({ state: 'pending' }) : 0;
     const blocks = db ? await db.collection('blockedNumbers').countDocuments({}) : 0;
+    const pendingVerifications = db
+      ? await db.collection('businesses').countDocuments({ verificationStatus: 'pending' })
+      : 0;
     return res.json({
       cards: {
         users: users.length,
@@ -231,6 +234,7 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
         statuses: statuses.length,
         products: catalog.length,
         pendingBoosts: boosts,
+        pendingVerifications,
         blockedNumbers: blocks,
         payments: payments.length,
       },
@@ -424,6 +428,50 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
     if (!db) return res.status(503).json({ error: 'Database is not connected.' });
     await db.collection('boostRequests').updateOne({ id: param(req.params.requestId) }, { $set: { state: 'rejected' } });
     return res.json({ ok: true });
+  });
+
+  app.get('/api/admin/businesses', requireAdmin, async (_req, res) => {
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const [businesses, reports] = await Promise.all([
+      db.collection('businesses').find({}, { projection: { _id: 0 } }).sort({ updatedAt: -1 }).limit(200).toArray(),
+      db.collection('businessReports').find({}, { projection: { _id: 0 } }).sort({ createdAt: -1 }).limit(100).toArray(),
+    ]);
+    return res.json({
+      businesses,
+      pending: businesses.filter((item) => item.verificationStatus === 'pending'),
+      reports,
+    });
+  });
+
+  app.post('/api/admin/businesses/:businessId/verify', requireAdmin, async (req, res) => {
+    const decision = String(req.body?.decision || '');
+    const note = String(req.body?.note || '').slice(0, 280);
+    if (decision !== 'approved' && decision !== 'rejected') {
+      return res.status(400).json({ error: 'Choose approved or rejected.' });
+    }
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const now = new Date().toISOString();
+    const result = await db.collection('businesses').updateOne(
+      { id: param(req.params.businessId) },
+      {
+        $set: {
+          verificationStatus: decision,
+          verificationReviewedAt: now,
+          verificationReviewNote: note,
+          updatedAt: now,
+        },
+      },
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: 'Business not found' });
+    await recordAdminEvent(deps.getDb, {
+      level: 'info',
+      area: 'business',
+      message: `Business verification ${decision}`,
+      detail: param(req.params.businessId),
+    });
+    return res.json({ ok: true, decision });
   });
 
   app.get('/api/admin/announcements', requireAdmin, async (_req, res) => {
