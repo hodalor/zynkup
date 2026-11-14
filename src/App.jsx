@@ -6,6 +6,7 @@ const NAV = [
   ['users', 'Users'],
   ['numbers', 'Blocked numbers'],
   ['marketplace', 'Marketplace'],
+  ['businesses', 'Businesses'],
   ['payments', 'Payments'],
   ['activity', 'Activity'],
   ['announcements', 'Announcements'],
@@ -132,6 +133,7 @@ export default function App() {
       users: `/api/admin/users?q=${encodeURIComponent(query)}&country=${encodeURIComponent(country)}`,
       numbers: '/api/admin/blocks',
       marketplace: '/api/admin/catalog',
+      businesses: '/api/admin/businesses',
       payments: '/api/admin/payments',
       activity: '/api/admin/activity',
       announcements: '/api/admin/announcements',
@@ -159,6 +161,7 @@ export default function App() {
     if (page === 'users') return data.users || [];
     if (page === 'numbers') return data.blocks || [];
     if (page === 'marketplace') return data.items || [];
+    if (page === 'businesses') return data.businesses || [];
     if (page === 'payments') return data.payments || [];
     if (page === 'activity') return data.messages || [];
     if (page === 'announcements') return data.announcements || [];
@@ -199,6 +202,7 @@ export default function App() {
               ['Products', data.cards.products],
               ['Statuses', data.cards.statuses],
               ['Pending boosts', data.cards.pendingBoosts],
+              ['Pending verifications', data.cards.pendingVerifications || 0],
               ['Blocked numbers', data.cards.blockedNumbers],
               ['Payments', data.cards.payments],
             ]} />
@@ -244,7 +248,7 @@ export default function App() {
               ) : <span className="muted">{rows.length} records</span>}
             </div>
             <button className="primary" onClick={() => { setForm({}); setModal({ kind: 'create' }); }}>
-              {page === 'numbers' ? 'Block number' : page === 'announcements' ? 'Send notice' : page === 'marketplace' ? 'Review boosts' : 'Refresh'}
+              {page === 'numbers' ? 'Block number' : page === 'announcements' ? 'Send notice' : page === 'marketplace' ? 'Review boosts' : page === 'businesses' ? 'Review verifications' : 'Refresh'}
             </button>
           </div>
         ) : null}
@@ -299,6 +303,51 @@ export default function App() {
               ]}
               rows={data?.requests || []}
               onRow={(row) => setModal({ kind: 'boost', row })}
+            />
+          </>
+        ) : null}
+        {page === 'businesses' ? (
+          <>
+            <Cards items={[
+              ['Businesses', data?.businesses?.length || 0],
+              ['Pending verification', (data?.pending || []).length],
+              ['Published', (data?.businesses || []).filter((row) => row.visibility === 'published').length],
+              ['Reports', (data?.reports || []).length],
+            ]} />
+            <h3>Pending verification</h3>
+            <Table
+              columns={[
+                { key: 'name', label: 'Business' },
+                { key: 'location', label: 'Location' },
+                { key: 'verificationNote', label: 'Note' },
+                { key: 'verificationSubmittedAt', label: 'Submitted', render: (row) => row.verificationSubmittedAt ? new Date(row.verificationSubmittedAt).toLocaleString() : '' },
+                { key: 'visibility', label: 'Visibility' },
+              ]}
+              rows={data?.pending || []}
+              onRow={(row) => setModal({ kind: 'verify', row })}
+            />
+            <h3>All businesses</h3>
+            <Table
+              columns={[
+                { key: 'name', label: 'Business' },
+                { key: 'visibility', label: 'Visibility' },
+                { key: 'verificationStatus', label: 'Verification' },
+                { key: 'location', label: 'Location' },
+                { key: 'updatedAt', label: 'Updated', render: (row) => row.updatedAt ? new Date(row.updatedAt).toLocaleString() : '' },
+              ]}
+              rows={rows}
+              onRow={(row) => setModal({ kind: 'verify', row })}
+            />
+            <h3>Reports</h3>
+            <Table
+              columns={[
+                { key: 'businessName', label: 'Business' },
+                { key: 'reason', label: 'Reason' },
+                { key: 'state', label: 'State' },
+                { key: 'createdAt', label: 'When', render: (row) => row.createdAt ? new Date(row.createdAt).toLocaleString() : '' },
+              ]}
+              rows={data?.reports || []}
+              onRow={(row) => setModal({ kind: 'detail', row })}
             />
           </>
         ) : null}
@@ -411,6 +460,30 @@ export default function App() {
             <textarea placeholder="Text attached to the featured product" value={form.boostText ?? modal.row.note ?? ''} onChange={(event) => setForm({ ...form, boostText: event.target.value })} />
             <button className="primary" onClick={() => act(`/api/admin/catalog/${modal.row.itemId}/boost`, { days: Number(form.days || modal.row.days || 7), boostText: form.boostText ?? modal.row.note })}>Approve and feature</button>
             <button className="danger" onClick={() => act(`/api/admin/boosts/${modal.row.id}/reject`, {})}>Reject</button>
+          </div>
+        </Modal>
+      ) : null}
+      {modal?.kind === 'verify' ? (
+        <Modal title={modal.row.name || 'Business'} onClose={() => setModal(null)}>
+          <Detail row={modal.row} />
+          <div className="stack">
+            <textarea
+              placeholder="Review note (optional)"
+              value={form.note || ''}
+              onChange={(event) => setForm({ ...form, note: event.target.value })}
+            />
+            <button
+              className="primary"
+              onClick={() => act(`/api/admin/businesses/${modal.row.id}/verify`, { decision: 'approved', note: form.note || '' })}
+            >
+              Approve verification
+            </button>
+            <button
+              className="danger"
+              onClick={() => act(`/api/admin/businesses/${modal.row.id}/verify`, { decision: 'rejected', note: form.note || '' })}
+            >
+              Reject verification
+            </button>
           </div>
         </Modal>
       ) : null}
