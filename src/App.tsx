@@ -17,6 +17,27 @@ type SettingsPanelId =
   | 'help'
   | '';
 
+type ReactionKind = 'standard' | 'animated' | 'sound';
+
+type ReactionCatalogEntry = {
+  id: string;
+  emoji: string;
+  label: string;
+  kind: ReactionKind;
+  animationKey?: string;
+  soundKey?: string;
+  fallbackEmoji: string;
+};
+
+type MessageReaction = {
+  userId: string;
+  emoji: string;
+  reactionId?: string;
+  reactedAt: string;
+};
+
+type MessageReactionAction = 'add' | 'remove' | 'replace';
+
 type Message = {
   id: string;
   clientRef?: string;
@@ -44,6 +65,7 @@ type Message = {
   transcriptLanguage?: string;
   transcriptUpdatedAt?: string;
   transcriptNotice?: string;
+  reactions?: MessageReaction[];
 };
 
 type TranslateLanguage = 'en' | 'tw' | 'ga' | 'ee' | 'pcm';
@@ -69,7 +91,43 @@ type Chat = {
   kind?: 'direct' | 'group';
   communityId?: string;
   allowAnonymous?: boolean;
+  participants?: string[];
   adminIds?: string[];
+  reactionSoundMutedBy?: string[];
+};
+
+type BadgeType = 'helpful' | 'welcoming' | 'fast_support';
+type BadgeSource = 'moderator' | 'system';
+
+type BadgeDefinition = {
+  badgeType: BadgeType;
+  label: string;
+  description: string;
+  rules: string;
+};
+
+type GroupBadgePublic = {
+  id: string;
+  chatId: string;
+  userId: string;
+  badgeType: BadgeType;
+  source: BadgeSource;
+  awardedBy?: string | null;
+  note?: string | null;
+  createdAt: string;
+  revokedAt?: string | null;
+};
+
+type GroupBadgeSettingsPublic = {
+  enabled: boolean;
+  updatedAt?: string;
+  updatedBy?: string | null;
+};
+
+type GroupBadgesPayload = {
+  settings: GroupBadgeSettingsPublic;
+  badges: GroupBadgePublic[];
+  definitions: BadgeDefinition[];
 };
 
 type CommunityPrivacy = 'public' | 'private' | 'invite-only';
@@ -935,7 +993,7 @@ type UpdateGroup = {
   }>;
 };
 
-const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:4000';
+const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'https://zynkup-api-597625475865.europe-west9.run.app';
 const AI_TONES: AiTone[] = ['polite', 'concise', 'professional', 'friendly', 'apologetic'];
 const AI_ASSISTANT_TASKS: Array<{ id: AiAssistantTask; label: string }> = [
   { id: 'draft', label: 'Draft' },
@@ -979,6 +1037,7 @@ const SETTINGS_STORAGE_KEY = 'zynkup-web-app-settings';
 const FAVORITES_STORAGE_KEY = 'zynkup-web-favorite-chats';
 const MUTED_CHATS_STORAGE_KEY = 'zynkup-web-muted-chats';
 const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-web-archived-chats';
+const REACTION_SOUND_MUTED_STORAGE_KEY = 'zynkup-web-reaction-sound-muted-chats';
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const STATUS_REACTIONS = ['❤️', '👍', '👎', '🔥', '😂'];
@@ -1001,6 +1060,9 @@ const DEFAULT_APP_SETTINGS = {
   statusPrivacy: 'contacts' as const,
   readReceiptsEnabled: true,
   appLockEnabled: false,
+  /** Reaction sound cues — off by default; never autoplay on history load. */
+  reactionSoundEnabled: false,
+  reactionAnimationEnabled: true,
 };
 
 const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
@@ -1180,10 +1242,44 @@ const mapChatFromServer = (chat: any, userId: string, userList: AppUser[]) => {
     kind: chat.kind === 'group' || chat.kind === 'direct' ? chat.kind : undefined,
     communityId: typeof chat.communityId === 'string' ? chat.communityId : undefined,
     allowAnonymous: Boolean(chat.allowAnonymous),
+    participants: Array.isArray(chat.participants)
+      ? chat.participants.filter((id: unknown): id is string => typeof id === 'string')
+      : undefined,
     adminIds: Array.isArray(chat.adminIds)
       ? chat.adminIds.filter((id: unknown): id is string => typeof id === 'string')
       : undefined,
+    reactionSoundMutedBy: Array.isArray(chat.reactionSoundMutedBy)
+      ? chat.reactionSoundMutedBy.filter((id: unknown): id is string => typeof id === 'string')
+      : undefined,
   };
+};
+
+const BADGE_TYPE_OPTIONS: BadgeType[] = ['helpful', 'welcoming', 'fast_support'];
+
+const badgeShortLabel = (badgeType: BadgeType, definitions?: BadgeDefinition[]) => {
+  const match = definitions?.find((item) => item.badgeType === badgeType);
+  if (match?.label) return match.label;
+  if (badgeType === 'fast_support') return 'Fast Support';
+  if (badgeType === 'welcoming') return 'Welcoming';
+  return 'Helpful';
+};
+
+const mapMessageReactions = (raw: unknown): MessageReaction[] | undefined => {
+  if (!Array.isArray(raw)) return undefined;
+  const mapped = raw
+    .map((entry): MessageReaction | null => {
+      if (!entry || typeof entry !== 'object') return null;
+      const item = entry as Record<string, unknown>;
+      if (typeof item.userId !== 'string' || typeof item.emoji !== 'string') return null;
+      return {
+        userId: item.userId,
+        emoji: item.emoji,
+        reactedAt: typeof item.reactedAt === 'string' ? item.reactedAt : new Date().toISOString(),
+        reactionId: typeof item.reactionId === 'string' ? item.reactionId : undefined,
+      };
+    })
+    .filter((entry): entry is MessageReaction => Boolean(entry));
+  return mapped;
 };
 
 const mapServerMessage = (message: any, userId: string): Message => ({
@@ -1230,6 +1326,7 @@ const mapServerMessage = (message: any, userId: string): Message => ({
       : undefined,
   transcriptLanguage: typeof message.transcriptLanguage === 'string' ? message.transcriptLanguage : undefined,
   transcriptUpdatedAt: typeof message.transcriptUpdatedAt === 'string' ? message.transcriptUpdatedAt : undefined,
+  reactions: mapMessageReactions(message.reactions),
 });
 
 const describeCallMessage = (message: Message) => {
@@ -1247,12 +1344,17 @@ const describeCallMessage = (message: Message) => {
 };
 
 let webAudioContext: AudioContext | null = null;
-const playWebCue = (kind: 'message' | 'call') => {
+const ensureWebAudioContext = () => {
   const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!Ctx) return;
+  if (!Ctx) return null;
   if (!webAudioContext) webAudioContext = new Ctx();
-  const ctx = webAudioContext;
-  void ctx.resume().catch(() => undefined);
+  void webAudioContext.resume().catch(() => undefined);
+  return webAudioContext;
+};
+
+const playWebCue = (kind: 'message' | 'call') => {
+  const ctx = ensureWebAudioContext();
+  if (!ctx) return;
   const oscillator = ctx.createOscillator();
   const gain = ctx.createGain();
   oscillator.type = 'sine';
@@ -1264,6 +1366,91 @@ const playWebCue = (kind: 'message' | 'call') => {
   gain.connect(ctx.destination);
   oscillator.start();
   oscillator.stop(ctx.currentTime + (kind === 'call' ? 0.72 : 0.2));
+};
+
+/** Procedural short beeps mapped from catalog soundKey — no binary assets. */
+const playReactionSoundCue = (soundKey: string) => {
+  const ctx = ensureWebAudioContext();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const beep = (freq: number, start: number, duration: number, type: OscillatorType = 'sine', peak = 0.07) => {
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(freq, now + start);
+    gain.gain.setValueAtTime(0.0001, now + start);
+    gain.gain.exponentialRampToValueAtTime(peak, now + start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + start + duration);
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start(now + start);
+    oscillator.stop(now + start + duration + 0.02);
+  };
+  switch (soundKey) {
+    case 'laugh':
+      beep(520, 0, 0.09, 'triangle', 0.06);
+      beep(640, 0.1, 0.09, 'triangle', 0.05);
+      beep(480, 0.2, 0.12, 'triangle', 0.05);
+      break;
+    case 'clap':
+      beep(180, 0, 0.05, 'square', 0.04);
+      beep(220, 0.08, 0.05, 'square', 0.035);
+      beep(160, 0.16, 0.06, 'square', 0.03);
+      break;
+    case 'party':
+      beep(523, 0, 0.08, 'sine', 0.06);
+      beep(659, 0.09, 0.08, 'sine', 0.06);
+      beep(784, 0.18, 0.1, 'sine', 0.055);
+      break;
+    case 'pop':
+      beep(320, 0, 0.04, 'sine', 0.08);
+      beep(140, 0.03, 0.08, 'triangle', 0.04);
+      break;
+    default:
+      beep(660, 0, 0.1, 'sine', 0.05);
+      break;
+  }
+};
+
+type ReactionChip = {
+  key: string;
+  emoji: string;
+  reactionId?: string;
+  count: number;
+  mine: boolean;
+  animated: boolean;
+  soundKey?: string;
+};
+
+const buildReactionChips = (
+  reactions: MessageReaction[] | undefined,
+  catalog: ReactionCatalogEntry[],
+  currentUserId: string,
+): ReactionChip[] => {
+  if (!reactions?.length) return [];
+  const byKey = new Map<string, ReactionChip>();
+  for (const reaction of reactions) {
+    const entry =
+      (reaction.reactionId ? catalog.find((item) => item.id === reaction.reactionId) : undefined)
+      || catalog.find((item) => item.emoji === reaction.emoji);
+    const key = reaction.reactionId || reaction.emoji;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.count += 1;
+      existing.mine = existing.mine || reaction.userId === currentUserId;
+      continue;
+    }
+    byKey.set(key, {
+      key,
+      emoji: entry?.fallbackEmoji || entry?.emoji || reaction.emoji,
+      reactionId: entry?.id || reaction.reactionId,
+      count: 1,
+      mine: reaction.userId === currentUserId,
+      animated: Boolean(entry && entry.kind !== 'standard' && entry.animationKey),
+      soundKey: entry?.soundKey,
+    });
+  }
+  return Array.from(byKey.values());
 };
 
 const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
@@ -1546,6 +1733,10 @@ function App() {
   const [showArchivedChats, setShowArchivedChats] = useState(false);
   const [replyTarget, setReplyTarget] = useState<Message | null>(null);
   const [messageActionTarget, setMessageActionTarget] = useState<Message | null>(null);
+  const [reactionCatalog, setReactionCatalog] = useState<ReactionCatalogEntry[]>([]);
+  const [reactionPickerMessageId, setReactionPickerMessageId] = useState<string | null>(null);
+  const [reactionSoundMutedChatIds, setReactionSoundMutedChatIds] = useState<string[]>([]);
+  const [bouncingReactionKeys, setBouncingReactionKeys] = useState<Record<string, number>>({});
   const [peerTypingByChat, setPeerTypingByChat] = useState<Record<string, boolean>>({});
   const [toastMessage, setToastMessage] = useState('');
   const [aiTone, setAiTone] = useState<AiTone>('polite');
@@ -1573,6 +1764,13 @@ function App() {
   const [chatSummary, setChatSummary] = useState<ChatSummary | null>(null);
   const [summaryNotice, setSummaryNotice] = useState('');
   const [summaryBusy, setSummaryBusy] = useState(false);
+  const [groupInfoVisible, setGroupInfoVisible] = useState(false);
+  const [groupBadgesByChat, setGroupBadgesByChat] = useState<Record<string, GroupBadgesPayload>>({});
+  const [badgeDefinitions, setBadgeDefinitions] = useState<BadgeDefinition[]>([]);
+  const [badgesBusy, setBadgesBusy] = useState(false);
+  const [badgeAwardTargetUserId, setBadgeAwardTargetUserId] = useState('');
+  const [badgeAwardType, setBadgeAwardType] = useState<BadgeType>('helpful');
+  const [badgeAwardNote, setBadgeAwardNote] = useState('');
   const [focusedMessageId, setFocusedMessageId] = useState<string | null>(null);
   const [isDictating, setIsDictating] = useState(false);
   const [dictationNotice, setDictationNotice] = useState('');
@@ -1630,8 +1828,11 @@ function App() {
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const applyBootstrapRef = useRef<(payload: any) => void>(() => undefined);
+  const refreshGroupBadgesRef = useRef<((chatId: string, userId?: string) => Promise<GroupBadgesPayload | null>) | null>(null);
   const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
   const mutedChatIdsRef = useRef<string[]>([]);
+  const reactionSoundMutedChatIdsRef = useRef<string[]>([]);
+  const reactionCatalogRef = useRef<ReactionCatalogEntry[]>([]);
   const updatesFeedRef = useRef<UpdateGroup[]>([]);
   const statusGroupIndexRef = useRef<number | null>(null);
   const statusItemIndexRef = useRef(0);
@@ -1986,6 +2187,8 @@ function App() {
           statusPrivacy: nextSettings.statusPrivacy,
           readReceiptsEnabled: nextSettings.readReceiptsEnabled,
           appLockEnabled: nextSettings.appLockEnabled,
+          reactionSoundEnabled: nextSettings.reactionSoundEnabled,
+          reactionAnimationEnabled: nextSettings.reactionAnimationEnabled,
         }),
       });
       if (!response.ok) {
@@ -2190,6 +2393,148 @@ function App() {
     setMessageActionTarget(null);
   };
 
+  const persistReactionSoundMutedChats = (next: string[]) => {
+    reactionSoundMutedChatIdsRef.current = next;
+    setReactionSoundMutedChatIds(next);
+    localStorage.setItem(REACTION_SOUND_MUTED_STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const triggerReactionFeedback = (messageId: string, entry: ReactionCatalogEntry | undefined, playSound: boolean) => {
+    if (playSound && entry?.soundKey && appSettingsRef.current.reactionSoundEnabled) {
+      const chatId = activeChat?.id;
+      if (!chatId || !reactionSoundMutedChatIdsRef.current.includes(chatId)) {
+        playReactionSoundCue(entry.soundKey);
+      }
+    }
+    if (
+      entry
+      && entry.kind !== 'standard'
+      && appSettingsRef.current.reactionAnimationEnabled
+      && !prefersReducedMotion
+    ) {
+      const bounceKey = `${messageId}:${entry.id || entry.emoji}`;
+      setBouncingReactionKeys((current) => ({ ...current, [bounceKey]: Date.now() }));
+      window.setTimeout(() => {
+        setBouncingReactionKeys((current) => {
+          if (!current[bounceKey]) return current;
+          const next = { ...current };
+          delete next[bounceKey];
+          return next;
+        });
+      }, 700);
+    }
+  };
+
+  const toggleMessageReaction = async (
+    message: Message,
+    selection: { emoji?: string; reactionId?: string },
+  ) => {
+    if (!currentUserId || message.deletedForEveryone) return;
+    const entry =
+      (selection.reactionId
+        ? reactionCatalog.find((item) => item.id === selection.reactionId)
+        : undefined)
+      || reactionCatalog.find((item) => item.emoji === selection.emoji);
+    const mine = (message.reactions || []).find((reaction) => reaction.userId === currentUserId);
+    const selectedEmoji = selection.emoji || entry?.emoji;
+    const selectedId = selection.reactionId || entry?.id;
+    const sameAsMine = Boolean(
+      mine
+      && (
+        (selectedId && mine.reactionId === selectedId)
+        || (selectedEmoji && mine.emoji === selectedEmoji)
+      ),
+    );
+    const removing = sameAsMine;
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}/reactions`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            emoji: selectedEmoji,
+            reactionId: selectedId,
+          }),
+        },
+      );
+      if (!response.ok) {
+        showToast('Could not update reaction.');
+        return;
+      }
+      const payload = await response.json();
+      const nextReactions = mapMessageReactions(payload.reactions ?? payload.message?.reactions) ?? [];
+      const chatId = activeChat?.id || payload.message?.chatId;
+      if (chatId) {
+        setMessagesByChat((current) => ({
+          ...current,
+          [chatId]: (current[chatId] ?? []).map((item) =>
+            item.id === message.id ? { ...item, reactions: nextReactions } : item,
+          ),
+        }));
+      }
+      if (!removing) {
+        triggerReactionFeedback(message.id, entry, true);
+      }
+      setReactionPickerMessageId(null);
+    } catch {
+      showToast('Network error while reacting.');
+    }
+  };
+
+  const toggleReactionSoundMuteForChat = async (chatId: string) => {
+    if (!currentUserId || !chatId) return;
+    const muted = !reactionSoundMutedChatIds.includes(chatId);
+    const next = muted
+      ? [...reactionSoundMutedChatIds, chatId]
+      : reactionSoundMutedChatIds.filter((id) => id !== chatId);
+    persistReactionSoundMutedChats(next);
+    showToast(muted ? 'Reaction sounds muted in this chat' : 'Reaction sounds unmuted');
+    try {
+      await fetch(`${API_BASE_URL}/api/chats/${encodeURIComponent(chatId)}/reaction-sound-mute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, muted }),
+      });
+    } catch {
+      // Client-side mute still applies if sync fails.
+    }
+  };
+
+  const loadReactionCatalog = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/reactions/catalog`);
+      if (!response.ok) return;
+      const payload = await response.json();
+      const list = Array.isArray(payload.reactions) ? payload.reactions : [];
+      const mapped = list
+        .map((item: any): ReactionCatalogEntry | null => {
+          if (!item || typeof item.id !== 'string' || typeof item.emoji !== 'string') return null;
+          const kind: ReactionKind =
+            item.kind === 'animated' || item.kind === 'sound' || item.kind === 'standard'
+              ? item.kind
+              : 'standard';
+          return {
+            id: item.id,
+            emoji: item.emoji,
+            label: typeof item.label === 'string' ? item.label : item.emoji,
+            kind,
+            animationKey: typeof item.animationKey === 'string' ? item.animationKey : undefined,
+            soundKey: typeof item.soundKey === 'string' ? item.soundKey : undefined,
+            fallbackEmoji:
+              typeof item.fallbackEmoji === 'string' ? item.fallbackEmoji : item.emoji,
+          };
+        })
+        .filter((item: ReactionCatalogEntry | null): item is ReactionCatalogEntry => Boolean(item));
+      reactionCatalogRef.current = mapped;
+      setReactionCatalog(mapped);
+    } catch {
+      // Catalog is optional until backend is reachable.
+    }
+  }, []);
+
   const applyBootstrap = useCallback((payload: any) => {
     setAuthRequired(Boolean(payload.authRequired));
     setCurrentUserId(payload.currentUserId ?? '');
@@ -2227,6 +2572,14 @@ function App() {
             payload.profile.appLockEnabled == null
               ? current.appLockEnabled
               : Boolean(payload.profile.appLockEnabled),
+          reactionSoundEnabled:
+            payload.profile.reactionSoundEnabled == null
+              ? current.reactionSoundEnabled
+              : Boolean(payload.profile.reactionSoundEnabled),
+          reactionAnimationEnabled:
+            payload.profile.reactionAnimationEnabled == null
+              ? current.reactionAnimationEnabled
+              : Boolean(payload.profile.reactionAnimationEnabled),
         };
         appSettingsRef.current = next;
         localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
@@ -2235,6 +2588,20 @@ function App() {
     }
     const nextChats = (payload.chats ?? []).map((chat: any) => mapChatFromServer(chat, payload.currentUserId ?? '', nextUsers));
     setChatItems(nextChats);
+    const viewerId = payload.currentUserId ?? '';
+    if (viewerId) {
+      const mutedFromServer = nextChats
+        .filter((chat: Chat) => (chat.reactionSoundMutedBy || []).includes(viewerId))
+        .map((chat: Chat) => chat.id);
+      if (mutedFromServer.length) {
+        setReactionSoundMutedChatIds((current) => {
+          const merged = Array.from(new Set(current.concat(mutedFromServer)));
+          reactionSoundMutedChatIdsRef.current = merged;
+          localStorage.setItem(REACTION_SOUND_MUTED_STORAGE_KEY, JSON.stringify(merged));
+          return merged;
+        });
+      }
+    }
     setSelectedChatId((current) =>
       nextChats.some((chat: Chat) => chat.id === current) ? current : nextChats[0]?.id ?? '',
     );
@@ -2411,6 +2778,14 @@ function App() {
       void fetchLinkedDevices(currentUserId);
     }
   }, [authRequired, currentUserId, fetchLinkedDevices]);
+
+  useEffect(() => {
+    void loadReactionCatalog();
+  }, [loadReactionCatalog]);
+
+  useEffect(() => {
+    setReactionPickerMessageId(null);
+  }, [selectedChatId]);
 
   const closeStatusViewer = useCallback(() => {
     setActiveStatusGroupIndex(null);
@@ -2663,6 +3038,14 @@ function App() {
               updatedProfile.appLockEnabled == null
                 ? current.appLockEnabled
                 : Boolean(updatedProfile.appLockEnabled),
+            reactionSoundEnabled:
+              updatedProfile.reactionSoundEnabled == null
+                ? current.reactionSoundEnabled
+                : Boolean(updatedProfile.reactionSoundEnabled),
+            reactionAnimationEnabled:
+              updatedProfile.reactionAnimationEnabled == null
+                ? current.reactionAnimationEnabled
+                : Boolean(updatedProfile.reactionAnimationEnabled),
           };
           appSettingsRef.current = next;
           localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
@@ -2704,13 +3087,32 @@ function App() {
                 allowAnonymous: typeof chat.allowAnonymous === 'boolean'
                   ? chat.allowAnonymous
                   : item.allowAnonymous,
+                participants: Array.isArray(chat.participants)
+                  ? chat.participants.filter((id: unknown): id is string => typeof id === 'string')
+                  : item.participants,
                 adminIds: Array.isArray(chat.adminIds)
                   ? chat.adminIds.filter((id: unknown): id is string => typeof id === 'string')
                   : item.adminIds,
+                reactionSoundMutedBy: Array.isArray(chat.reactionSoundMutedBy)
+                  ? chat.reactionSoundMutedBy.filter((id: unknown): id is string => typeof id === 'string')
+                  : item.reactionSoundMutedBy,
               }
             : item,
         ),
       );
+      if (Array.isArray(chat.reactionSoundMutedBy) && currentUserId) {
+        const mutedOnServer = chat.reactionSoundMutedBy.includes(currentUserId);
+        setReactionSoundMutedChatIds((current) => {
+          const already = current.includes(chat.id);
+          if (mutedOnServer === already) return current;
+          const next = mutedOnServer
+            ? [...current, chat.id]
+            : current.filter((id) => id !== chat.id);
+          reactionSoundMutedChatIdsRef.current = next;
+          localStorage.setItem(REACTION_SOUND_MUTED_STORAGE_KEY, JSON.stringify(next));
+          return next;
+        });
+      }
     });
     socket.on('chat:created', (chat) => {
       if (!(chat.participants ?? []).includes(currentUserId)) {
@@ -2949,6 +3351,68 @@ function App() {
         ),
       }));
     });
+    socket.on('message:reaction', (payload: {
+      messageId?: string;
+      chatId?: string;
+      reactions?: MessageReaction[];
+      reactorUserId?: string;
+      emoji?: string;
+      action?: MessageReactionAction;
+      message?: any;
+    }) => {
+      const chatId = payload.chatId || payload.message?.chatId;
+      const messageId = payload.messageId || payload.message?.id;
+      if (!chatId || !messageId) return;
+
+      const nextReactions = mapMessageReactions(payload.reactions ?? payload.message?.reactions) ?? [];
+      setMessagesByChat((current) => ({
+        ...current,
+        [chatId]: (current[chatId] ?? []).map((item) =>
+          item.id === messageId ? { ...item, reactions: nextReactions } : item,
+        ),
+      }));
+
+      // Live socket only — never play from history/bootstrap hydration.
+      if (payload.action === 'remove') return;
+      const isOwnReaction = payload.reactorUserId === currentUserIdRef.current;
+      const settings = appSettingsRef.current;
+      const catalog = reactionCatalogRef.current;
+      const entry =
+        catalog.find((item) => item.emoji === payload.emoji)
+        || catalog.find((item) =>
+          nextReactions.some(
+            (reaction) => reaction.reactionId === item.id && reaction.emoji === payload.emoji,
+          ),
+        );
+
+      // Own toggle already played feedback; only cue for live incoming reactions.
+      if (
+        !isOwnReaction
+        && settings.reactionSoundEnabled
+        && !reactionSoundMutedChatIdsRef.current.includes(chatId)
+        && entry?.soundKey
+      ) {
+        playReactionSoundCue(entry.soundKey);
+      }
+
+      if (
+        settings.reactionAnimationEnabled
+        && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        && entry
+        && entry.kind !== 'standard'
+      ) {
+        const bounceKey = `${messageId}:${entry.id || entry.emoji}`;
+        setBouncingReactionKeys((current) => ({ ...current, [bounceKey]: Date.now() }));
+        window.setTimeout(() => {
+          setBouncingReactionKeys((current) => {
+            if (!current[bounceKey]) return current;
+            const next = { ...current };
+            delete next[bounceKey];
+            return next;
+          });
+        }, 700);
+      }
+    });
     socket.on('status:updated', (status) => {
       upsertStatus(status);
     });
@@ -3001,6 +3465,7 @@ function App() {
       const storedFavorites = localStorage.getItem(FAVORITES_STORAGE_KEY);
       const storedMuted = localStorage.getItem(MUTED_CHATS_STORAGE_KEY);
       const storedArchived = localStorage.getItem(ARCHIVED_CHATS_STORAGE_KEY);
+      const storedReactionSoundMuted = localStorage.getItem(REACTION_SOUND_MUTED_STORAGE_KEY);
       if (storedSettings) {
         const next = { ...DEFAULT_APP_SETTINGS, ...JSON.parse(storedSettings) };
         appSettingsRef.current = next;
@@ -3010,6 +3475,13 @@ function App() {
         const parsed = JSON.parse(storedFavorites);
         if (Array.isArray(parsed)) {
           setFavoriteChatIds(parsed);
+        }
+      }
+      if (storedReactionSoundMuted) {
+        const parsed = JSON.parse(storedReactionSoundMuted);
+        if (Array.isArray(parsed)) {
+          reactionSoundMutedChatIdsRef.current = parsed;
+          setReactionSoundMutedChatIds(parsed);
         }
       }
       if (storedMuted) {
@@ -3056,6 +3528,9 @@ function App() {
     setDictationNotice('');
     setAnonymousCompose(false);
     setAnonymousRemaining(null);
+    setGroupInfoVisible(false);
+    setBadgeAwardTargetUserId('');
+    setBadgeAwardNote('');
   }, [selectedChatId]);
 
   useEffect(() => {
@@ -5410,6 +5885,271 @@ function App() {
     return rank[role] >= rank[minimum];
   };
 
+  const groupAdminsForChat = useCallback((chat: Chat | null) => {
+    if (!chat || chat.kind !== 'group') return [] as string[];
+    if (Array.isArray(chat.adminIds) && chat.adminIds.length) return chat.adminIds;
+    return (chat.participants ?? []).slice(0, 1);
+  }, []);
+
+  const isGroupAdminForChat = useCallback(
+    (chat: Chat | null) => {
+      if (!chat || !currentUserId || chat.kind !== 'group') return false;
+      return groupAdminsForChat(chat).includes(currentUserId);
+    },
+    [currentUserId, groupAdminsForChat],
+  );
+
+  const refreshGroupBadges = useCallback(async (chatId: string, userId = currentUserId) => {
+    if (!chatId || !userId) return null;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(chatId)}/badges?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        return null;
+      }
+      const next: GroupBadgesPayload = {
+        settings: {
+          enabled: Boolean(payload.settings?.enabled),
+          updatedAt: typeof payload.settings?.updatedAt === 'string' ? payload.settings.updatedAt : undefined,
+          updatedBy: typeof payload.settings?.updatedBy === 'string' ? payload.settings.updatedBy : null,
+        },
+        badges: Array.isArray(payload.badges)
+          ? payload.badges.filter(
+              (item: unknown): item is GroupBadgePublic =>
+                Boolean(item)
+                && typeof item === 'object'
+                && typeof (item as GroupBadgePublic).id === 'string'
+                && typeof (item as GroupBadgePublic).userId === 'string'
+                && typeof (item as GroupBadgePublic).badgeType === 'string',
+            )
+          : [],
+        definitions: Array.isArray(payload.definitions) ? payload.definitions : [],
+      };
+      setGroupBadgesByChat((current) => ({ ...current, [chatId]: next }));
+      if (next.definitions.length) {
+        setBadgeDefinitions(next.definitions);
+      }
+      return next;
+    } catch {
+      return null;
+    }
+  }, [currentUserId]);
+
+  refreshGroupBadgesRef.current = refreshGroupBadges;
+
+  const loadBadgeDefinitions = useCallback(async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/badges/definitions?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !Array.isArray(payload.badges)) return;
+      setBadgeDefinitions(payload.badges as BadgeDefinition[]);
+    } catch {
+      // ignore
+    }
+  }, [currentUserId]);
+
+  const setGroupBadgesEnabled = async (enabled: boolean) => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    setBadgesBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(activeChat.id)}/badges/settings`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, enabled }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update badge settings.');
+        return;
+      }
+      await refreshGroupBadges(activeChat.id);
+      showToast(enabled ? 'Contribution badges enabled' : 'Contribution badges disabled');
+    } catch {
+      showToast('Could not update badge settings.');
+    } finally {
+      setBadgesBusy(false);
+    }
+  };
+
+  const awardGroupBadge = async () => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    if (!badgeAwardTargetUserId) {
+      showToast('Pick a member to award.');
+      return;
+    }
+    setBadgesBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(activeChat.id)}/badges`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: currentUserId,
+            targetUserId: badgeAwardTargetUserId,
+            badgeType: badgeAwardType,
+            note: badgeAwardNote.trim() || undefined,
+          }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not award badge.');
+        return;
+      }
+      setBadgeAwardNote('');
+      await refreshGroupBadges(activeChat.id);
+      showToast('Badge awarded');
+    } catch {
+      showToast('Could not award badge.');
+    } finally {
+      setBadgesBusy(false);
+    }
+  };
+
+  const revokeGroupBadge = async (badgeId: string) => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    if (!window.confirm('Revoke this badge?')) return;
+    setBadgesBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(activeChat.id)}/badges/${encodeURIComponent(badgeId)}?userId=${encodeURIComponent(currentUserId)}`,
+        { method: 'DELETE' },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not revoke badge.');
+        return;
+      }
+      await refreshGroupBadges(activeChat.id);
+      showToast('Badge revoked');
+    } catch {
+      showToast('Could not revoke badge.');
+    } finally {
+      setBadgesBusy(false);
+    }
+  };
+
+  const reportGroupBadge = async (badgeId: string) => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    const reason = window.prompt('Why are you reporting this badge? (min 3 characters)');
+    if (!reason || reason.trim().length < 3) return;
+    setBadgesBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(activeChat.id)}/badges/${encodeURIComponent(badgeId)}/report`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, reason: reason.trim() }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not report badge.');
+        return;
+      }
+      showToast('Report sent to admins');
+    } catch {
+      showToast('Could not report badge.');
+    } finally {
+      setBadgesBusy(false);
+    }
+  };
+
+  const recomputeGroupBadges = async () => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    setBadgesBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/groups/${encodeURIComponent(activeChat.id)}/badges/recompute`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not recompute badges.');
+        return;
+      }
+      await refreshGroupBadges(activeChat.id);
+      const count = typeof payload.awardedCount === 'number' ? payload.awardedCount : 0;
+      showToast(count ? `Awarded ${count} system badge${count === 1 ? '' : 's'}` : 'No new system badges');
+    } catch {
+      showToast('Could not recompute badges.');
+    } finally {
+      setBadgesBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!currentUserId) return;
+    void loadBadgeDefinitions(currentUserId);
+  }, [currentUserId, loadBadgeDefinitions]);
+
+  useEffect(() => {
+    if (!currentUserId || !activeChat || activeChat.kind !== 'group') return;
+    void refreshGroupBadges(activeChat.id, currentUserId);
+  }, [activeChat?.id, activeChat?.kind, currentUserId, refreshGroupBadges]);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket) return;
+    const onBadgeUpdated = (payload: { chatId?: string }) => {
+      const chatId = typeof payload?.chatId === 'string' ? payload.chatId : '';
+      if (!chatId || !currentUserIdRef.current) return;
+      void refreshGroupBadgesRef.current?.(chatId, currentUserIdRef.current);
+    };
+    socket.on('badge:updated', onBadgeUpdated);
+    return () => {
+      socket.off('badge:updated', onBadgeUpdated);
+    };
+  }, [currentUserId]);
+
+  const activeGroupBadges = activeChat?.kind === 'group' ? groupBadgesByChat[activeChat.id] : undefined;
+  const activeGroupBadgesEnabled = Boolean(activeGroupBadges?.settings.enabled);
+  const activeBadgeDefinitions = activeGroupBadges?.definitions?.length
+    ? activeGroupBadges.definitions
+    : badgeDefinitions;
+  const badgesByUserId = useMemo(() => {
+    const map: Record<string, GroupBadgePublic[]> = {};
+    for (const badge of activeGroupBadges?.badges ?? []) {
+      if (badge.revokedAt) continue;
+      if (!map[badge.userId]) map[badge.userId] = [];
+      map[badge.userId].push(badge);
+    }
+    return map;
+  }, [activeGroupBadges?.badges]);
+
+  const renderContributionBadgeChips = (userId?: string, compact = false) => {
+    if (!activeGroupBadgesEnabled || !userId || userId === 'anonymous') return null;
+    const list = badgesByUserId[userId];
+    if (!list?.length) return null;
+    return (
+      <span className={`contribution-badge-chips ${compact ? 'compact' : ''}`} aria-label="Contribution badges">
+        {list.map((badge) => (
+          <span
+            className={`contribution-badge-chip type-${badge.badgeType}`}
+            key={badge.id}
+            title={`${badgeShortLabel(badge.badgeType, activeBadgeDefinitions)} · ${badge.source}`}
+          >
+            {badgeShortLabel(badge.badgeType, activeBadgeDefinitions)}
+          </span>
+        ))}
+      </span>
+    );
+  };
+
   const canRevealAnonymousAuthor = (chat: Chat | null) => {
     if (!chat || chat.kind !== 'group' || !currentUserId) {
       return false;
@@ -5422,9 +6162,9 @@ function App() {
       if (communityRoleAtLeast(community?.myRole ?? null, 'moderator')) {
         return true;
       }
-      return Array.isArray(chat.adminIds) && chat.adminIds.includes(currentUserId);
+      return groupAdminsForChat(chat).includes(currentUserId);
     }
-    return Array.isArray(chat.adminIds) && chat.adminIds.includes(currentUserId);
+    return groupAdminsForChat(chat).includes(currentUserId);
   };
 
   const revealAnonymousAuthor = async (message: Message) => {
@@ -5504,6 +6244,9 @@ function App() {
                 name: room.title || item.name,
                 communityId: room.communityId || chatPayload?.communityId || item.communityId,
                 allowAnonymous,
+                participants: Array.isArray(chatPayload?.participants)
+                  ? chatPayload.participants.filter((id: unknown): id is string => typeof id === 'string')
+                  : item.participants,
                 adminIds: Array.isArray(chatPayload?.adminIds)
                   ? chatPayload.adminIds.filter((id: unknown): id is string => typeof id === 'string')
                   : item.adminIds,
@@ -9029,6 +9772,17 @@ function App() {
             </div>
           </div>
           <div className="desktop-chat-actions">
+            {activeChat.kind === 'group' ? (
+              <button
+                className={`summarise-header-button ${groupInfoVisible ? 'active-header-action' : ''}`}
+                disabled={!currentUserId}
+                onClick={() => setGroupInfoVisible((current) => !current)}
+                title="Group info"
+                type="button"
+              >
+                Group info
+              </button>
+            ) : null}
             <button
               className={`summarise-header-button ${aiHelperVisible ? 'active-header-action' : ''}`}
               disabled={!currentUserId}
@@ -9064,7 +9818,13 @@ function App() {
             </button>
             <button
               onClick={() => {
-                const action = window.prompt('1 Mute  2 Archive  3 Pin  4 Play a game', '1');
+                const muteReactionLabel = reactionSoundMutedChatIds.includes(activeChat.id)
+                  ? 'Unmute reaction sounds'
+                  : 'Mute reaction sounds';
+                const action = window.prompt(
+                  `1 Mute  2 Archive  3 Pin  4 Play a game  5 ${muteReactionLabel}`,
+                  '1',
+                );
                 if (action === '1') {
                   toggleMuteChat(activeChat.id);
                 } else if (action === '2') {
@@ -9073,6 +9833,8 @@ function App() {
                   toggleFavoriteChat(activeChat.id);
                 } else if (action === '4') {
                   openPlayGameFromChat();
+                } else if (action === '5') {
+                  void toggleReactionSoundMuteForChat(activeChat.id);
                 }
               }}
               type="button"
@@ -9083,6 +9845,167 @@ function App() {
             <button onClick={() => setCallSheetVisible(true)} type="button">☎</button>
           </div>
         </header>
+
+        {groupInfoVisible && activeChat.kind === 'group' ? (
+          <aside className="group-info-panel" aria-label="Group info">
+            <div className="group-info-toolbar">
+              <strong>{activeChat.name}</strong>
+              <button onClick={() => setGroupInfoVisible(false)} type="button">
+                Close
+              </button>
+            </div>
+            <p className="group-info-subtitle">Members & contribution badges</p>
+            <div className="group-members-list">
+              {(activeChat.participants?.length
+                ? activeChat.participants
+                : Array.from(new Set([
+                    ...(activeChat.adminIds ?? []),
+                    ...Object.keys(badgesByUserId),
+                    ...(currentUserId ? [currentUserId] : []),
+                  ]))
+              ).map((memberId) => {
+                const memberIsAdmin = groupAdminsForChat(activeChat).includes(memberId);
+                const memberBadges = badgesByUserId[memberId] ?? [];
+                return (
+                  <div className="group-member-row" key={memberId}>
+                    <div className="group-member-meta">
+                      <strong>
+                        {memberId === currentUserId ? 'You' : getUserMeta(memberId).name}
+                        {memberIsAdmin ? ' · Admin' : ''}
+                      </strong>
+                      {activeGroupBadgesEnabled ? renderContributionBadgeChips(memberId) : null}
+                    </div>
+                    {activeGroupBadgesEnabled && memberBadges.length ? (
+                      <div className="group-member-badge-actions">
+                        {memberBadges.map((badge) => (
+                          <div className="group-member-badge-action" key={badge.id}>
+                            <span className={`contribution-badge-chip type-${badge.badgeType}`}>
+                              {badgeShortLabel(badge.badgeType, activeBadgeDefinitions)}
+                              <small> · {badge.source}</small>
+                            </span>
+                            {isGroupAdminForChat(activeChat) ? (
+                              <button
+                                disabled={badgesBusy}
+                                onClick={() => void revokeGroupBadge(badge.id)}
+                                type="button"
+                              >
+                                Revoke
+                              </button>
+                            ) : null}
+                            {badge.userId !== currentUserId ? (
+                              <button
+                                disabled={badgesBusy}
+                                onClick={() => void reportGroupBadge(badge.id)}
+                                type="button"
+                              >
+                                Report
+                              </button>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+
+            <section className="contribution-badges-section" aria-label="Contribution badges">
+              <div className="contribution-badges-header">
+                <strong>Contribution badges</strong>
+                {isGroupAdminForChat(activeChat) ? (
+                  <label className="contribution-badges-toggle">
+                    <input
+                      checked={activeGroupBadgesEnabled}
+                      disabled={badgesBusy || !currentUserId}
+                      onChange={(event) => void setGroupBadgesEnabled(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>Enable</span>
+                  </label>
+                ) : (
+                  <small>{activeGroupBadgesEnabled ? 'Enabled' : 'Disabled for this group'}</small>
+                )}
+              </div>
+              <p className="contribution-badges-privacy">
+                Badges recognise helpful contribution — never message volume or rankings.
+              </p>
+
+              {activeGroupBadgesEnabled ? (
+                <>
+                  <div className="contribution-badge-legend">
+                    <strong>Legend</strong>
+                    {(activeBadgeDefinitions.length
+                      ? activeBadgeDefinitions
+                      : BADGE_TYPE_OPTIONS.map((badgeType) => ({
+                          badgeType,
+                          label: badgeShortLabel(badgeType),
+                          description: '',
+                          rules: '',
+                        }))
+                    ).map((definition) => (
+                      <div className="contribution-badge-legend-item" key={definition.badgeType}>
+                        <span className={`contribution-badge-chip type-${definition.badgeType}`}>
+                          {definition.label}
+                        </span>
+                        <span>
+                          {definition.description || badgeShortLabel(definition.badgeType)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {isGroupAdminForChat(activeChat) ? (
+                    <div className="contribution-badge-admin">
+                      <strong>Award badge</strong>
+                      <div className="contribution-badge-admin-row">
+                        <select
+                          aria-label="Award badge member"
+                          onChange={(event) => setBadgeAwardTargetUserId(event.target.value)}
+                          value={badgeAwardTargetUserId}
+                        >
+                          <option value="">Select member…</option>
+                          {(activeChat.participants ?? [])
+                            .filter((memberId) => memberId !== currentUserId)
+                            .map((memberId) => (
+                              <option key={memberId} value={memberId}>
+                                {getUserMeta(memberId).name}
+                              </option>
+                            ))}
+                        </select>
+                        <select
+                          aria-label="Award badge type"
+                          onChange={(event) => setBadgeAwardType(event.target.value as BadgeType)}
+                          value={badgeAwardType}
+                        >
+                          {BADGE_TYPE_OPTIONS.map((badgeType) => (
+                            <option key={badgeType} value={badgeType}>
+                              {badgeShortLabel(badgeType, activeBadgeDefinitions)}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <input
+                        onChange={(event) => setBadgeAwardNote(event.target.value)}
+                        placeholder="Optional note"
+                        type="text"
+                        value={badgeAwardNote}
+                      />
+                      <div className="contribution-badge-admin-actions">
+                        <button disabled={badgesBusy || !badgeAwardTargetUserId} onClick={() => void awardGroupBadge()} type="button">
+                          Award
+                        </button>
+                        <button disabled={badgesBusy} onClick={() => void recomputeGroupBadges()} type="button">
+                          Recompute system badges
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+            </section>
+          </aside>
+        ) : null}
 
         {aiHelperVisible ? (
           <aside className="ai-helper-panel" aria-label="AI helper">
@@ -9259,10 +10182,13 @@ function App() {
                 <small>{message.time} · Call again · right-click to delete</small>
               </button>
             ) : (
-            <article
-              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''} ${message.automated ? 'automated' : ''} ${message.anonymous ? 'anonymous' : ''} ${focusedMessageId === message.id ? 'summary-focus' : ''}`}
-              id={`message-${message.id}`}
+            <div
+              className={`message-stack ${message.sender === 'me' ? 'mine' : 'theirs'}`}
               key={message.id}
+            >
+            <article
+              className={`message-bubble ${message.sender === 'me' ? 'mine' : 'theirs'} ${message.deletedForEveryone ? 'deleted' : ''} ${message.automated ? 'automated' : ''} ${message.anonymous ? 'anonymous' : ''} ${focusedMessageId === message.id ? 'summary-focus' : ''} ${reactionPickerMessageId === message.id ? 'picker-open' : ''}`}
+              id={`message-${message.id}`}
               onContextMenu={(event) => {
                 event.preventDefault();
                 if (!message.deletedForEveryone) {
@@ -9270,10 +10196,60 @@ function App() {
                 }
               }}
             >
+              {!message.deletedForEveryone && currentUserId ? (
+                <button
+                  aria-label="React to message"
+                  className="message-react-trigger"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setReactionPickerMessageId((current) =>
+                      current === message.id ? null : message.id,
+                    );
+                  }}
+                  type="button"
+                >
+                  ⋯
+                </button>
+              ) : null}
+              {reactionPickerMessageId === message.id ? (
+                <div className="message-reaction-picker" role="listbox" aria-label="Message reactions">
+                  {(reactionCatalog.length
+                    ? reactionCatalog
+                    : STATUS_REACTIONS.map((emoji) => ({
+                        id: emoji,
+                        emoji,
+                        label: emoji,
+                        kind: 'standard' as ReactionKind,
+                        fallbackEmoji: emoji,
+                      }))
+                  ).map((entry) => (
+                    <button
+                      aria-label={entry.label}
+                      className={`message-reaction-option kind-${entry.kind}`}
+                      key={entry.id}
+                      onClick={() => void toggleMessageReaction(message, {
+                        reactionId: entry.id === entry.emoji ? undefined : entry.id,
+                        emoji: entry.emoji,
+                      })}
+                      title={entry.label}
+                      type="button"
+                    >
+                      {entry.fallbackEmoji || entry.emoji}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               {message.anonymous ? (
                 <span className="anonymous-badge">
                   {message.sender === 'me' ? 'Anonymous' : 'Anonymous Member'}
                 </span>
+              ) : activeChat.kind === 'group' && message.senderId ? (
+                <div className="group-sender-row">
+                  <span className="group-sender-name">
+                    {message.sender === 'me' ? 'You' : getUserMeta(message.senderId).name}
+                  </span>
+                  {renderContributionBadgeChips(message.senderId, true)}
+                </div>
               ) : null}
               {message.automated ? <span className="automated-badge">Automated reply</span> : null}
               {message.documentId ? (
@@ -9414,6 +10390,38 @@ function App() {
                 </button>
               ) : null}
             </article>
+            {(() => {
+              const chips = buildReactionChips(message.reactions, reactionCatalog, currentUserId);
+              if (!chips.length) return null;
+              const animate = appSettings.reactionAnimationEnabled && !prefersReducedMotion;
+              return (
+                <div className={`message-reaction-chips ${message.sender === 'me' ? 'mine' : 'theirs'}`}>
+                  {chips.map((chip) => {
+                    const bounceKey = `${message.id}:${chip.reactionId || chip.emoji}`;
+                    const bouncing = Boolean(bouncingReactionKeys[bounceKey]);
+                    return (
+                      <button
+                        className={`message-reaction-chip ${chip.mine ? 'mine' : ''} ${
+                          animate && chip.animated && bouncing ? 'bounce' : ''
+                        }`}
+                        key={chip.key}
+                        onClick={() =>
+                          void toggleMessageReaction(message, {
+                            reactionId: chip.reactionId,
+                            emoji: chip.emoji,
+                          })
+                        }
+                        type="button"
+                      >
+                        <span>{chip.emoji}</span>
+                        <small>{chip.count}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+            </div>
             )
           ))}
         </section>
@@ -11490,6 +12498,29 @@ function App() {
           {renderSettingsToggle('Enter is send', appSettings.enterIsSend, (value) => updateAppSetting('enterIsSend', value))}
           {renderSettingsToggle('Media auto-download', appSettings.mediaAutoDownload, (value) => updateAppSetting('mediaAutoDownload', value))}
           {renderSettingsToggle('Low data mode', appSettings.lowDataMode, (value) => updateAppSetting('lowDataMode', value))}
+          {renderSettingsToggle(
+            'Reaction animations',
+            appSettings.reactionAnimationEnabled,
+            (value) => updateAppSetting('reactionAnimationEnabled', value, { syncProfile: true }),
+            'Bounce animated reaction chips (respects reduced motion)',
+          )}
+          {renderSettingsToggle(
+            'Reaction sounds',
+            appSettings.reactionSoundEnabled,
+            (value) => updateAppSetting('reactionSoundEnabled', value, { syncProfile: true }),
+            'Short cues when reacting or receiving a sound reaction — off by default',
+          )}
+          {activeChat ? (
+            <button
+              className="settings-list-row"
+              onClick={() => void toggleReactionSoundMuteForChat(activeChat.id)}
+              type="button"
+            >
+              {reactionSoundMutedChatIds.includes(activeChat.id)
+                ? `Unmute reaction sounds in ${activeChat.name}`
+                : `Mute reaction sounds in ${activeChat.name}`}
+            </button>
+          ) : null}
         </>
       );
     }
@@ -12517,6 +13548,37 @@ function App() {
         <div className="modal-overlay" onClick={() => setMessageActionTarget(null)}>
           <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
             <h3>Message</h3>
+            {!messageActionTarget.deletedForEveryone ? (
+              <div className="message-reaction-picker modal-reaction-picker" role="listbox" aria-label="React">
+                {(reactionCatalog.length
+                  ? reactionCatalog
+                  : STATUS_REACTIONS.map((emoji) => ({
+                      id: emoji,
+                      emoji,
+                      label: emoji,
+                      kind: 'standard' as ReactionKind,
+                      fallbackEmoji: emoji,
+                    }))
+                ).map((entry) => (
+                  <button
+                    aria-label={entry.label}
+                    className={`message-reaction-option kind-${entry.kind}`}
+                    key={`modal-${entry.id}`}
+                    onClick={() => {
+                      void toggleMessageReaction(messageActionTarget, {
+                        reactionId: entry.id === entry.emoji ? undefined : entry.id,
+                        emoji: entry.emoji,
+                      });
+                      setMessageActionTarget(null);
+                    }}
+                    title={entry.label}
+                    type="button"
+                  >
+                    {entry.fallbackEmoji || entry.emoji}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <button
               onClick={() => {
                 setReplyTarget(messageActionTarget);
