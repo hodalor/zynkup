@@ -65,6 +65,10 @@ type Message = {
   documentId?: string;
   documentKind?: 'quotation' | 'invoice';
   broadcastCampaignId?: string;
+  transcript?: string;
+  transcriptStatus?: 'pending' | 'ready' | 'failed' | 'unavailable';
+  transcriptLanguage?: string;
+  transcriptUpdatedAt?: string;
 };
 
 type Chat = {
@@ -626,6 +630,7 @@ const seedAutoReplyConfigs: BusinessAutoReplyConfig[] = [];
 const seedAutoReplyLogs: AutoReplyLog[] = [];
 const seedCommerceDocuments: CommerceDocument[] = [];
 const seedBroadcastCampaigns: BroadcastCampaign[] = [];
+const seedBusinessAiConfigs: BusinessAiConfig[] = [];
 const documentCounters: Record<string, number> = {};
 
 const settingsMenu = [
@@ -1008,6 +1013,68 @@ const dictateSchema = z.object({
   text: z.string().trim().max(4000).optional(),
   audioUrl: z.string().url().optional(),
 });
+
+const transcribeMessageSchema = z.object({
+  userId: z.string().min(1),
+  language: z.string().trim().min(2).max(16).optional(),
+});
+
+const translateSchema = z.object({
+  userId: z.string().min(1),
+  text: z.string().trim().min(1).max(4000),
+  messageId: z.string().min(1).max(80).optional(),
+  chatId: z.string().min(1).max(80).optional(),
+  targetLanguage: z.enum(['en', 'tw', 'ga', 'ee', 'pcm']).default('en'),
+  sourceLanguage: z.enum(['auto', 'en', 'tw', 'ga', 'ee', 'pcm']).default('auto'),
+});
+
+const assistantTaskSchema = z.object({
+  userId: z.string().min(1),
+  task: z.enum(['draft', 'rewrite', 'summarise', 'translate', 'suggest_reply', 'explain']),
+  prompt: z.string().trim().max(1000).optional(),
+  text: z.string().trim().max(4000).optional(),
+  chatId: z.string().min(1).max(80).optional(),
+  messageId: z.string().min(1).max(80).optional(),
+  tone: aiToneSchema.optional(),
+  targetLanguage: z.enum(['en', 'tw', 'ga', 'ee', 'pcm']).optional(),
+  consentToShareContext: z.boolean().default(false),
+});
+
+const businessAiConfigSchema = z.object({
+  userId: z.string().min(1),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  enabled: z.boolean().optional(),
+  autoSend: z.boolean().optional(),
+  policyText: z.string().trim().max(2000).optional(),
+  deliveryPolicy: z.string().trim().max(800).optional(),
+  refundPolicy: z.string().trim().max(800).optional(),
+  faq: z.array(z.object({
+    question: z.string().trim().min(2).max(200),
+    answer: z.string().trim().min(2).max(800),
+  })).max(40).optional(),
+});
+
+const businessAiAskSchema = z.object({
+  userId: z.string().min(1),
+  sellerUserId: z.string().min(1).optional(),
+  businessId: z.string().min(1).max(80).optional().nullable(),
+  question: z.string().trim().min(2).max(1000),
+  chatId: z.string().min(1).max(80).optional(),
+});
+
+type BusinessAiConfig = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  autoSend: boolean;
+  policyText: string;
+  deliveryPolicy: string;
+  refundPolicy: string;
+  faq: Array<{ question: string; answer: string }>;
+  createdAt: string;
+  updatedAt: string;
+};
 
 const resolveCatalogStatus = (
   status: CatalogProductStatus | undefined,
@@ -2902,6 +2969,19 @@ const persistMessage = async (message: Message) => {
 
   await seedDatabaseIfNeeded();
   await collectionsFor(db).messages.insertOne(message);
+  return message;
+};
+
+const saveMessageUpdate = async (message: Message) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedMessages.findIndex((entry) => entry.id === message.id);
+    if (index >= 0) seedMessages[index] = message;
+    else seedMessages.push(message);
+    return message;
+  }
+  await seedDatabaseIfNeeded();
+  await collectionsFor(db).messages.updateOne({ id: message.id }, { $set: message }, { upsert: true });
   return message;
 };
 
@@ -7210,6 +7290,552 @@ app.post('/api/ai/dictate', async (req, res) => {
     });
   }
   return res.status(400).json({ error: 'Provide dictated text or an audio URL.' });
+});
+
+const TRANSLATION_GLOSSARY: Record<string, Partial<Record<'en' | 'tw' | 'ga' | 'ee' | 'pcm', string>>> = {
+  hello: { en: 'Hello', tw: 'Mema wo akye', ga: 'Ojekoo', ee: 'Ndi', pcm: 'How far' },
+  thanks: { en: 'Thank you', tw: 'Medaase', ga: 'Oyiwala don', ee: 'Akpe', pcm: 'Thank you' },
+  'thank you': { en: 'Thank you', tw: 'Medaase', ga: 'Oyiwala don', ee: 'Akpe', pcm: 'Thank you' },
+  yes: { en: 'Yes', tw: 'Aane', ga: 'Hɛɛ', ee: 'Ɛ̃', pcm: 'Yes' },
+  no: { en: 'No', tw: 'Daabi', ga: 'Dabi', ee: 'Ao', pcm: 'No' },
+  please: { en: 'Please', tw: 'Mepa wo kyɛw', ga: 'Ofaine', ee: 'Taflatse', pcm: 'Abeg' },
+  goodbye: { en: 'Goodbye', tw: 'Nante yie', ga: 'Nyɔɔ', ee: 'Hede nyuie', pcm: 'I dey go' },
+  'how much': { en: 'How much?', tw: 'Ɛyɛ sɛn?', ga: 'Eji ene?', ee: 'Ga nenie?', pcm: 'How much?' },
+  'good morning': { en: 'Good morning', tw: 'Mema wo akye', ga: 'Ojekoo', ee: 'Ŋdi', pcm: 'Good morning' },
+};
+
+const glossaryTranslate = (
+  text: string,
+  targetLanguage: 'en' | 'tw' | 'ga' | 'ee' | 'pcm',
+) => {
+  const normalized = text.trim().toLowerCase().replace(/[?!.,]+$/g, '');
+  const hit = TRANSLATION_GLOSSARY[normalized];
+  if (hit?.[targetLanguage]) {
+    return {
+      translatedText: hit[targetLanguage]!,
+      method: 'glossary' as const,
+      partial: false,
+    };
+  }
+  // Soft match: replace known tokens inside longer sentences when targeting English
+  if (targetLanguage === 'en') {
+    let output = text;
+    let replaced = false;
+    for (const [phrase, map] of Object.entries(TRANSLATION_GLOSSARY)) {
+      if (!map.en) continue;
+      const pattern = new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'ig');
+      if (pattern.test(output)) {
+        output = output.replace(pattern, map.en);
+        replaced = true;
+      }
+    }
+    if (replaced) {
+      return { translatedText: output, method: 'glossary' as const, partial: true };
+    }
+  }
+  return null;
+};
+
+app.post('/api/messages/:messageId/transcribe', async (req, res) => {
+  const parseResult = transcribeMessageSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+  const message = (await readMessages()).find((entry) => entry.id === req.params.messageId);
+  if (!message) return res.status(404).json({ error: 'Message not found' });
+  const chat = (await readChats()).find((entry) => entry.id === message.chatId);
+  if (!chat || !chat.participants.includes(parseResult.data.userId)) {
+    return res.status(403).json({ error: 'You cannot transcribe this message.' });
+  }
+  if (message.kind !== 'voice') {
+    return res.status(400).json({ error: 'Only voice notes can be transcribed.' });
+  }
+  if (message.transcriptStatus === 'ready' && message.transcript) {
+    return res.json({
+      message,
+      transcript: message.transcript,
+      cached: true,
+      notice: 'Transcript was already available for this voice note.',
+    });
+  }
+
+  const hasProvider = Boolean(
+    process.env.SPEECH_TO_TEXT_API_KEY
+    || process.env.OPENAI_API_KEY
+    || process.env.GOOGLE_SPEECH_API_KEY,
+  );
+  const audioUrl = message.mediaUrls?.[0] || '';
+  if (!audioUrl) {
+    const updated: Message = {
+      ...message,
+      transcriptStatus: 'failed',
+      transcriptUpdatedAt: new Date().toISOString(),
+    };
+    await saveMessageUpdate(updated);
+    return res.status(422).json({ error: 'Voice note has no audio URL.', message: updated });
+  }
+
+  if (!hasProvider) {
+    // If sender already typed a caption into text (non-default), surface that as a caption transcript.
+    const caption = (message.text || '').trim();
+    const looksLikeCaption = caption && !/^(audio|voice( note)?)$/i.test(caption);
+    const updated: Message = {
+      ...message,
+      transcript: looksLikeCaption ? caption : undefined,
+      transcriptStatus: looksLikeCaption ? 'ready' : 'unavailable',
+      transcriptLanguage: parseResult.data.language || 'auto',
+      transcriptUpdatedAt: new Date().toISOString(),
+    };
+    await saveMessageUpdate(updated);
+    for (const participantId of chat.participants) {
+      io.to(`user:${participantId}`).emit('message:transcript', {
+        message: presentMessage(updated, participantId),
+      });
+    }
+    return res.status(looksLikeCaption ? 200 : 503).json({
+      message: updated,
+      transcript: updated.transcript || null,
+      needsProvider: !looksLikeCaption,
+      notice: looksLikeCaption
+        ? 'Showing the sender caption as text. Full speech transcription needs a provider key.'
+        : 'Speech transcription provider is not configured yet.',
+    });
+  }
+
+  // Provider key present but wiring is intentionally deferred.
+  const pending: Message = {
+    ...message,
+    transcriptStatus: 'pending',
+    transcriptUpdatedAt: new Date().toISOString(),
+  };
+  await saveMessageUpdate(pending);
+  return res.status(501).json({
+    error: 'Speech provider is configured but not wired in this build.',
+    message: pending,
+    needsProvider: true,
+  });
+});
+
+app.post('/api/ai/translate', async (req, res) => {
+  const parseResult = translateSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Add text and a target language.' });
+  }
+  const { userId, text, targetLanguage, sourceLanguage, messageId, chatId } = parseResult.data;
+  if (messageId) {
+    const message = (await readMessages()).find((entry) => entry.id === messageId);
+    if (!message) return res.status(404).json({ error: 'Message not found' });
+    const chat = (await readChats()).find((entry) => entry.id === message.chatId);
+    if (!chat || !chat.participants.includes(userId)) {
+      return res.status(403).json({ error: 'You cannot translate this message.' });
+    }
+  } else if (chatId) {
+    const chat = (await readChats()).find((entry) => entry.id === chatId);
+    if (!chat || !chat.participants.includes(userId)) {
+      return res.status(403).json({ error: 'You cannot translate in this chat.' });
+    }
+  }
+
+  const glossary = glossaryTranslate(text, targetLanguage);
+  if (glossary) {
+    return res.json({
+      translatedText: glossary.translatedText,
+      sourceLanguage: sourceLanguage === 'auto' ? 'auto' : sourceLanguage,
+      targetLanguage,
+      method: glossary.method,
+      partial: glossary.partial,
+      testedPairs: ['en↔tw', 'en↔ga', 'en↔ee', 'en↔pcm'],
+      notice: glossary.partial
+        ? 'Partial glossary translation. Review before relying on it.'
+        : 'Matched a tested glossary phrase. Review before relying on it.',
+    });
+  }
+
+  const hasProvider = Boolean(
+    process.env.TRANSLATE_API_KEY
+    || process.env.OPENAI_API_KEY
+    || process.env.GOOGLE_TRANSLATE_API_KEY,
+  );
+  if (!hasProvider) {
+    return res.json({
+      translatedText: text,
+      sourceLanguage: sourceLanguage === 'auto' ? 'auto' : sourceLanguage,
+      targetLanguage,
+      method: 'passthrough',
+      partial: true,
+      needsProvider: true,
+      testedPairs: ['en↔tw', 'en↔ga', 'en↔ee', 'en↔pcm'],
+      notice: 'Full translation needs a provider. Common phrases can still use the built-in glossary.',
+    });
+  }
+
+  return res.status(501).json({
+    error: 'Translation provider is configured but not wired in this build.',
+    needsProvider: true,
+  });
+});
+
+app.post('/api/ai/assistant', async (req, res) => {
+  const parseResult = assistantTaskSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Choose an assistant task.' });
+  }
+  const data = parseResult.data;
+  if ((data.chatId || data.messageId) && !data.consentToShareContext) {
+    return res.status(400).json({
+      error: 'Confirm consentToShareContext before sharing chat content with the assistant.',
+      requiresConsent: true,
+    });
+  }
+
+  let contextText = (data.text || data.prompt || '').trim();
+  let contextMeta: Record<string, string> = {};
+  if (data.chatId || data.messageId) {
+    if (data.messageId) {
+      const message = (await readMessages()).find((entry) => entry.id === data.messageId);
+      if (!message) return res.status(404).json({ error: 'Message not found' });
+      const chat = (await readChats()).find((entry) => entry.id === message.chatId);
+      if (!chat || !chat.participants.includes(data.userId)) {
+        return res.status(403).json({ error: 'You cannot use this message with the assistant.' });
+      }
+      contextText = message.text || contextText;
+      contextMeta = { messageId: message.id, chatId: message.chatId };
+    } else if (data.chatId) {
+      const chat = (await readChats()).find((entry) => entry.id === data.chatId);
+      if (!chat || !chat.participants.includes(data.userId)) {
+        return res.status(403).json({ error: 'You cannot use this chat with the assistant.' });
+      }
+      contextMeta = { chatId: chat.id };
+    }
+  }
+
+  if (data.task === 'rewrite') {
+    if (!contextText) return res.status(400).json({ error: 'Add text to rewrite.' });
+    const tone = data.tone || 'polite';
+    return res.json({
+      task: data.task,
+      result: rewriteWithTone(contextText, tone),
+      tone,
+      autoSend: false,
+      contextUsed: contextMeta,
+      notice: 'Review and edit before sending. The assistant never sends for you.',
+    });
+  }
+
+  if (data.task === 'suggest_reply') {
+    if (!data.chatId) return res.status(400).json({ error: 'chatId is required for suggest_reply.' });
+    const suggestions = buildSuggestedReplies(contextText || 'Hello', data.tone);
+    return res.json({
+      task: data.task,
+      suggestions,
+      autoSend: false,
+      contextUsed: contextMeta,
+      notice: 'Suggestions are drafts only.',
+    });
+  }
+
+  if (data.task === 'summarise') {
+    if (!data.chatId) return res.status(400).json({ error: 'chatId is required for summarise.' });
+    const chat = (await readChats()).find((entry) => entry.id === data.chatId);
+    if (!chat || !chat.participants.includes(data.userId)) {
+      return res.status(403).json({ error: 'You cannot summarise this chat.' });
+    }
+    const messages = (await readMessages())
+      .filter((entry) => entry.chatId === data.chatId)
+      .sort((a, b) => a.sentAt.localeCompare(b.sentAt))
+      .slice(-80);
+    const summary = buildChatSummary(messages, data.userId);
+    return res.json({
+      task: data.task,
+      summary,
+      autoSend: false,
+      contextUsed: contextMeta,
+      notice: summary.notice,
+    });
+  }
+
+  if (data.task === 'translate') {
+    if (!contextText) return res.status(400).json({ error: 'Add text to translate.' });
+    const targetLanguage = data.targetLanguage || 'en';
+    const glossary = glossaryTranslate(contextText, targetLanguage);
+    return res.json({
+      task: data.task,
+      result: glossary?.translatedText || contextText,
+      targetLanguage,
+      partial: glossary ? glossary.partial : true,
+      needsProvider: !glossary,
+      autoSend: false,
+      contextUsed: contextMeta,
+      notice: glossary
+        ? 'Glossary translation — review before relying on it.'
+        : 'No glossary match. Full MT needs a provider.',
+    });
+  }
+
+  if (data.task === 'explain') {
+    if (!contextText) return res.status(400).json({ error: 'Add text to explain.' });
+    return res.json({
+      task: data.task,
+      result: `Plain-language reading: this message is about “${contextText.slice(0, 160)}”. Check any amounts, dates or promises yourself before you reply.`,
+      autoSend: false,
+      contextUsed: contextMeta,
+      notice: 'Explanation is heuristic, not legal or financial advice.',
+    });
+  }
+
+  // draft
+  const prompt = (data.prompt || contextText || '').trim();
+  if (!prompt) return res.status(400).json({ error: 'Describe what to draft.' });
+  const tone = data.tone || 'professional';
+  const draftBase = prompt.startsWith('Draft') || prompt.startsWith('Write')
+    ? prompt
+    : `Regarding your message: ${prompt}`;
+  return res.json({
+    task: 'draft',
+    result: rewriteWithTone(draftBase, tone),
+    tone,
+    autoSend: false,
+    contextUsed: contextMeta,
+    notice: 'Draft only. Edit before sending. Never treat AI wording as a final commitment.',
+  });
+});
+
+const defaultBusinessAiConfig = (sellerUserId: string, businessId?: string | null): BusinessAiConfig => {
+  const now = new Date().toISOString();
+  return {
+    id: `bai-${sellerUserId}${businessId ? `-${businessId}` : ''}`,
+    sellerUserId,
+    businessId: businessId || null,
+    enabled: false,
+    autoSend: false,
+    policyText: '',
+    deliveryPolicy: '',
+    refundPolicy: '',
+    faq: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+};
+
+const readBusinessAiConfigs = async () => {
+  const db = await getDb();
+  if (!db) return [...seedBusinessAiConfigs];
+  return db.collection<BusinessAiConfig>('businessAiConfigs').find({}, { projection: { _id: 0 } }).toArray();
+};
+
+const saveBusinessAiConfig = async (config: BusinessAiConfig) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedBusinessAiConfigs.findIndex((entry) => entry.id === config.id);
+    if (index >= 0) seedBusinessAiConfigs[index] = config;
+    else seedBusinessAiConfigs.unshift(config);
+    return config;
+  }
+  await db.collection<BusinessAiConfig>('businessAiConfigs').updateOne(
+    { id: config.id },
+    { $set: config },
+    { upsert: true },
+  );
+  return config;
+};
+
+const getBusinessAiConfig = async (sellerUserId: string, businessId?: string | null) => {
+  const configs = await readBusinessAiConfigs();
+  if (businessId) {
+    const match = configs.find((entry) => entry.sellerUserId === sellerUserId && entry.businessId === businessId);
+    if (match) return match;
+  }
+  return configs.find((entry) => entry.sellerUserId === sellerUserId && !entry.businessId)
+    || defaultBusinessAiConfig(sellerUserId, businessId || null);
+};
+
+const answerBusinessQuestion = async (
+  config: BusinessAiConfig,
+  question: string,
+  sellerUserId: string,
+) => {
+  const q = question.toLowerCase();
+  const catalog = (await readCatalogItems()).filter(
+    (item) => item.sellerId === sellerUserId && item.takenDown !== true,
+  );
+  const businesses = await businessesForUser(sellerUserId);
+  const business = config.businessId
+    ? businesses.find((entry) => entry.id === config.businessId)
+    : businesses.find((entry) => entry.ownerUserId === sellerUserId) || businesses[0];
+
+  // FAQ exact-ish match
+  for (const entry of config.faq || []) {
+    if (entry.question && q.includes(entry.question.toLowerCase().slice(0, 24))) {
+      return {
+        answer: `Automated: ${entry.answer}`,
+        confidence: 'high' as const,
+        source: 'faq' as const,
+        escalate: false,
+      };
+    }
+  }
+
+  if (/refund|return|money back/.test(q)) {
+    if (config.refundPolicy.trim()) {
+      return {
+        answer: `Automated (refund policy): ${config.refundPolicy}`,
+        confidence: 'high' as const,
+        source: 'refund_policy' as const,
+        escalate: false,
+      };
+    }
+    return {
+      answer: 'Automated: I cannot confirm refund outcomes from approved data. A teammate will help you.',
+      confidence: 'low' as const,
+      source: 'escalation' as const,
+      escalate: true,
+    };
+  }
+
+  if (/deliver|shipping|how long|when.*arrive/.test(q)) {
+    if (config.deliveryPolicy.trim()) {
+      return {
+        answer: `Automated (delivery policy): ${config.deliveryPolicy}`,
+        confidence: 'high' as const,
+        source: 'delivery_policy' as const,
+        escalate: false,
+      };
+    }
+    return {
+      answer: 'Automated: Delivery timing is not in approved business data yet. A teammate will confirm.',
+      confidence: 'low' as const,
+      source: 'escalation' as const,
+      escalate: true,
+    };
+  }
+
+  if (/hour|open|close|are you open/.test(q)) {
+    const hours = business?.hours || config.policyText;
+    if (hours?.trim()) {
+      return {
+        answer: `Automated: Our hours are ${hours}.`,
+        confidence: 'high' as const,
+        source: 'hours' as const,
+        escalate: false,
+      };
+    }
+  }
+
+  // Catalog / stock — only from live catalog fields, never invent
+  const stockAsk = /stock|available|do you have|in stock|price|how much|cost/.test(q);
+  if (stockAsk) {
+    const matches = catalog.filter((item) => {
+      const hay = `${item.title} ${item.description} ${item.category}`.toLowerCase();
+      return question
+        .toLowerCase()
+        .split(/\s+/)
+        .filter((token) => token.length > 3)
+        .some((token) => hay.includes(token));
+    }).slice(0, 3);
+    if (!matches.length) {
+      return {
+        answer: 'Automated: I could not match that to an approved catalogue item. A teammate will confirm availability and price.',
+        confidence: 'low' as const,
+        source: 'escalation' as const,
+        escalate: true,
+      };
+    }
+    const lines = matches.map((item) => {
+      const stock = item.trackStock === false
+        ? 'stock not tracked'
+        : `${availableStock(item)} in stock`;
+      return `${item.title}: ${item.currency} ${item.price} (${stock})`;
+    });
+    return {
+      answer: `Automated (catalogue): ${lines.join(' · ')}`,
+      confidence: 'medium' as const,
+      source: 'catalog' as const,
+      escalate: false,
+      products: matches.map((item) => ({
+        id: item.id,
+        title: item.title,
+        price: item.price,
+        currency: item.currency,
+        stockQuantity: item.trackStock === false ? null : availableStock(item),
+      })),
+    };
+  }
+
+  if (config.policyText.trim() && q.length > 8) {
+    return {
+      answer: `Automated (business info): ${config.policyText.slice(0, 400)}`,
+      confidence: 'medium' as const,
+      source: 'policy' as const,
+      escalate: false,
+    };
+  }
+
+  return {
+    answer: 'Automated: I am not sure from approved business data. Connecting you to a person.',
+    confidence: 'low' as const,
+    source: 'escalation' as const,
+    escalate: true,
+  };
+};
+
+app.get('/api/ai/business', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId : null;
+  const config = await getBusinessAiConfig(userId, businessId);
+  return res.json({ config });
+});
+
+app.put('/api/ai/business', async (req, res) => {
+  const parseResult = businessAiConfigSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid business AI settings.' });
+  }
+  const existing = await getBusinessAiConfig(
+    parseResult.data.userId,
+    parseResult.data.businessId || null,
+  );
+  const now = new Date().toISOString();
+  const next: BusinessAiConfig = {
+    ...existing,
+    id: existing.id || `bai-${parseResult.data.userId}`,
+    sellerUserId: parseResult.data.userId,
+    businessId: parseResult.data.businessId === undefined ? existing.businessId : parseResult.data.businessId,
+    enabled: parseResult.data.enabled ?? existing.enabled,
+    // Never allow silent auto-send of invented commitments; keep false unless explicitly set, still never invent.
+    autoSend: false,
+    policyText: parseResult.data.policyText ?? existing.policyText,
+    deliveryPolicy: parseResult.data.deliveryPolicy ?? existing.deliveryPolicy,
+    refundPolicy: parseResult.data.refundPolicy ?? existing.refundPolicy,
+    faq: parseResult.data.faq ?? existing.faq,
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+  };
+  await saveBusinessAiConfig(next);
+  io.to(`user:${parseResult.data.userId}`).emit('businessAi:updated', { config: next });
+  return res.json({ config: next });
+});
+
+app.post('/api/ai/business/ask', async (req, res) => {
+  const parseResult = businessAiAskSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Ask a business question.' });
+  }
+  const sellerUserId = parseResult.data.sellerUserId || parseResult.data.userId;
+  const config = await getBusinessAiConfig(sellerUserId, parseResult.data.businessId || null);
+  const isOwner = parseResult.data.userId === sellerUserId;
+  if (!config.enabled && !isOwner) {
+    return res.status(403).json({ error: 'This business assistant is paused.' });
+  }
+  const result = await answerBusinessQuestion(config, parseResult.data.question, sellerUserId);
+  return res.json({
+    ...result,
+    autoSend: false,
+    disclosure: 'Automated business assistant. Answers use approved catalogue/policy data only.',
+    notice: result.escalate
+      ? 'Escalated to a human because approved data was insufficient or sensitive.'
+      : 'Review before sending to a customer. The assistant does not auto-send.',
+  });
 });
 
 app.post('/api/catalog/:itemId/feature', async (req, res) => {
