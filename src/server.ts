@@ -33,6 +33,15 @@ import {
   registerGamesApi,
   type GamesDeps,
 } from './gamesApi.js';
+import {
+  registerEventsApi,
+  type EventsDeps,
+} from './eventsApi.js';
+import {
+  registerReactionsApi,
+  resolveReactionSelection,
+  type ReactionsDeps,
+} from './reactionsApi.js';
 
 type Presence = 'online' | 'offline' | 'typing';
 type MessageKind = 'text' | 'emoji' | 'image' | 'video' | 'voice' | 'file' | 'call';
@@ -48,6 +57,12 @@ type User = {
   isBusiness: boolean;
   lastSeenAt?: string;
   photoUri?: string;
+  /** Short profile video URL (https). Cleared for viewers denied by profileVideoPrivacy / profilePhotoPrivacy. */
+  profileVideoUri?: string;
+  /** Still-frame poster for chat lists / low-data mode. */
+  profileVideoPosterUri?: string;
+  /** Duration of the profile video clip (0–6 seconds). */
+  profileVideoDurationSeconds?: number;
   username?: string;
 };
 
@@ -86,6 +101,13 @@ type Message = {
   transcriptStatus?: 'pending' | 'ready' | 'failed' | 'unavailable';
   transcriptLanguage?: string;
   transcriptUpdatedAt?: string;
+  /** Message reactions (one per user); emoji always set for static fallback. */
+  reactions?: Array<{
+    userId: string;
+    emoji: string;
+    reactionId?: string;
+    reactedAt: string;
+  }>;
 };
 
 type Chat = {
@@ -104,6 +126,11 @@ type Chat = {
   communityId?: string;
   /** Opt-in anonymous posting; synced from community room when applicable. Default false. */
   allowAnonymous?: boolean;
+  /**
+   * UserIds who muted reaction sounds in this chat.
+   * Prefer client-side per-chat mute when possible; this field syncs multi-device.
+   */
+  reactionSoundMutedBy?: string[];
 };
 
 type Contact = {
@@ -481,14 +508,30 @@ type Profile = {
   businessDescription: string;
   currency?: string;
   photoUri?: string;
+  /**
+   * Short compressed profile video (~6s max). Client uploads then PATCHes the https URL.
+   * Server-side transcode can plug in later (Cloudinary/GCS already store uploaded URLs).
+   * Clients must not autoplay with sound.
+   */
+  profileVideoUri?: string;
+  /** Still-frame poster/thumbnail for chat lists and low-data mode. */
+  profileVideoPosterUri?: string;
+  /** Clip length in whole seconds (0–6). Empty video clears this. */
+  profileVideoDurationSeconds?: number;
   lastSeenPrivacy?: 'everyone' | 'contacts' | 'nobody';
   profilePhotoPrivacy?: 'everyone' | 'contacts' | 'nobody';
+  /** When omitted, falls back to profilePhotoPrivacy. */
+  profileVideoPrivacy?: 'everyone' | 'contacts' | 'nobody';
   aboutPrivacy?: 'everyone' | 'contacts' | 'nobody';
   statusPrivacy?: 'contacts' | 'close-friends' | 'nobody';
   typingPrivacy?: 'everyone' | 'contacts' | 'nobody';
   callPrivacy?: 'everyone' | 'contacts' | 'nobody';
   groupInvitePrivacy?: 'everyone' | 'contacts' | 'nobody';
   readReceiptsEnabled?: boolean;
+  /** When true, clients may play reaction sound cues (never autoplay by default). */
+  reactionSoundEnabled?: boolean;
+  /** When false, clients should use static emoji only (reduced-motion friendly). */
+  reactionAnimationEnabled?: boolean;
   blockedUserIds?: string[];
   blocked?: boolean;
   blockedUntil?: string | null;
@@ -622,14 +665,20 @@ const emptyProfile: Profile = {
   businessDescription: '',
   currency: '',
   photoUri: '',
+  profileVideoUri: '',
+  profileVideoPosterUri: '',
+  profileVideoDurationSeconds: 0,
   lastSeenPrivacy: 'everyone',
   profilePhotoPrivacy: 'everyone',
+  profileVideoPrivacy: 'everyone',
   aboutPrivacy: 'everyone',
   statusPrivacy: 'contacts',
   typingPrivacy: 'everyone',
   callPrivacy: 'everyone',
   groupInvitePrivacy: 'everyone',
   readReceiptsEnabled: true,
+  reactionSoundEnabled: false,
+  reactionAnimationEnabled: true,
   blockedUserIds: [],
 };
 
@@ -711,6 +760,10 @@ const FIREBASE_PRIVATE_KEY = (process.env.FIREBASE_PRIVATE_KEY ?? '').replace(/\
 const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? '';
 const MAX_LINKED_DEVICES = 4;
 const LINK_REQUEST_TTL_MS = 1000 * 60 * 5;
+/** Profile video clips are short (~6s); clients compress before upload. Duration is validated on PATCH. */
+const PROFILE_VIDEO_MAX_SECONDS = 6;
+/** Soft upload cap for profile videos (~8MB). Status/chat videos may still use the general multer limit. */
+const PROFILE_VIDEO_MAX_BYTES = 8 * 1024 * 1024;
 const GCS_BUCKET = process.env.GCS_BUCKET ?? process.env.GOOGLE_CLOUD_STORAGE_BUCKET ?? '';
 const MEDIA_STORAGE_MODE: MediaStorageMode =
   process.env.MEDIA_STORAGE_PROVIDER === 'cloudinary'
@@ -764,6 +817,12 @@ const revealAuthorSchema = z.object({
   userId: z.string().min(1).optional(),
 });
 
+const httpsMediaUri = (label: string) =>
+  z.string().max(2000).refine(
+    (value) => value === '' || /^https:\/\//i.test(value),
+    `${label} must be an uploaded https URL`,
+  );
+
 const updateProfileSchema = z.object({
   name: z.string().min(2).max(80).optional(),
   username: z.string().min(3).max(30).optional(),
@@ -777,14 +836,21 @@ const updateProfileSchema = z.object({
     (value) => value === '' || /^https?:\/\//i.test(value),
     'Profile photo must be an uploaded https URL',
   ).optional(),
+  // Empty string clears the profile video and reverts UI to the static photo.
+  profileVideoUri: httpsMediaUri('Profile video').optional(),
+  profileVideoPosterUri: httpsMediaUri('Profile video poster').optional(),
+  profileVideoDurationSeconds: z.number().int().min(0).max(PROFILE_VIDEO_MAX_SECONDS).optional(),
   lastSeenPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   profilePhotoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
+  profileVideoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   aboutPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   statusPrivacy: z.enum(['contacts', 'close-friends', 'nobody']).optional(),
   typingPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   callPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   groupInvitePrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   readReceiptsEnabled: z.boolean().optional(),
+  reactionSoundEnabled: z.boolean().optional(),
+  reactionAnimationEnabled: z.boolean().optional(),
   appLockEnabled: z.boolean().optional(),
   pin: z.string().regex(/^\d{4,6}$/).optional(),
 });
@@ -1262,10 +1328,15 @@ const updateReceiptSchema = z.object({
   state: z.enum(['delivered', 'read']),
 });
 
-const reactToStatusSchema = z.object({
-  userId: z.string().min(1).optional(),
-  emoji: z.string().min(1).max(4),
-});
+const reactToStatusSchema = z
+  .object({
+    userId: z.string().min(1).optional(),
+    emoji: z.string().min(1).max(8).optional(),
+    reactionId: z.string().min(1).max(40).optional(),
+  })
+  .refine((value) => Boolean(value.emoji?.trim() || value.reactionId?.trim()), {
+    message: 'Provide emoji or reactionId',
+  });
 
 const commentOnStatusSchema = z.object({
   userId: z.string().min(1).optional(),
@@ -2151,6 +2222,30 @@ const privacyAllows = (
   return mutual;
 };
 
+/** Gate photo/video for a viewer. Video privacy falls back to profilePhotoPrivacy when unset. */
+const presentProfileMedia = (
+  profile: Profile | null | undefined,
+  viewerId: string,
+  ownerId: string,
+  mutual: boolean,
+) => {
+  const seePhoto = privacyAllows(profile?.profilePhotoPrivacy, viewerId, ownerId, mutual);
+  const seeVideo = privacyAllows(
+    profile?.profileVideoPrivacy ?? profile?.profilePhotoPrivacy,
+    viewerId,
+    ownerId,
+    mutual,
+  );
+  return {
+    photoUri: seePhoto ? (profile?.photoUri || '') : '',
+    profileVideoUri: seeVideo ? (profile?.profileVideoUri || '') : '',
+    profileVideoPosterUri: seeVideo ? (profile?.profileVideoPosterUri || '') : '',
+    profileVideoDurationSeconds: seeVideo ? (profile?.profileVideoDurationSeconds ?? 0) : 0,
+    profilePhotoPrivacy: profile?.profilePhotoPrivacy ?? 'everyone',
+    profileVideoPrivacy: profile?.profileVideoPrivacy ?? profile?.profilePhotoPrivacy ?? 'everyone',
+  };
+};
+
 const readUserByPhone = async (phone: string, countryCode?: string) => {
   const users = await readUsers();
   const profiles = await readProfiles();
@@ -2398,15 +2493,21 @@ const resolveRequestUserId = async (req: express.Request) => {
   return '';
 };
 
+const withReactionPrefs = (profile: Profile): Profile => ({
+  ...profile,
+  reactionSoundEnabled: profile.reactionSoundEnabled ?? false,
+  reactionAnimationEnabled: profile.reactionAnimationEnabled ?? true,
+});
+
 const readProfile = async (userId = DEFAULT_USER_ID) => {
   const db = await getDb();
   if (!db) {
-    return seedProfiles.find((profile) => profile.id === userId) ?? { ...emptyProfile };
+    return withReactionPrefs(seedProfiles.find((profile) => profile.id === userId) ?? { ...emptyProfile });
   }
 
   await seedDatabaseIfNeeded();
   const profile = await collectionsFor(db).profiles.findOne({ id: userId }, { projection: { _id: 0 } });
-  return profile ?? seedProfiles.find((item) => item.id === userId) ?? { ...emptyProfile };
+  return withReactionPrefs(profile ?? seedProfiles.find((item) => item.id === userId) ?? { ...emptyProfile });
 };
 
 const readChats = async () => {
@@ -2754,11 +2855,27 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
     readCatalogItems(),
     readChatRequests(),
   ]);
-  const photoByUserId = new Map(profiles.map((item) => [item.id, item.photoUri || '']));
-  const users = rawUsers.map((user) => ({
-    ...user,
-    photoUri: photoByUserId.get(user.id) || user.photoUri || '',
-  }));
+  const profileMediaByUserId = new Map(
+    profiles.map((item) => [
+      item.id,
+      {
+        photoUri: item.photoUri || '',
+        profileVideoUri: item.profileVideoUri || '',
+        profileVideoPosterUri: item.profileVideoPosterUri || '',
+        profileVideoDurationSeconds: item.profileVideoDurationSeconds ?? 0,
+      },
+    ]),
+  );
+  const users = rawUsers.map((user) => {
+    const media = profileMediaByUserId.get(user.id);
+    return {
+      ...user,
+      photoUri: media?.photoUri || user.photoUri || '',
+      profileVideoUri: media?.profileVideoUri || user.profileVideoUri || '',
+      profileVideoPosterUri: media?.profileVideoPosterUri || user.profileVideoPosterUri || '',
+      profileVideoDurationSeconds: media?.profileVideoDurationSeconds ?? user.profileVideoDurationSeconds ?? 0,
+    };
+  });
   const myBusinesses = await businessesForUser(currentUserId);
   const myBusinessIds = new Set(myBusinesses.map((business) => business.id));
   if (profile?.activeBusinessId && !myBusinessIds.has(profile.activeBusinessId)) {
@@ -2882,19 +2999,23 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       return mutualSet.has(user.id);
     };
     const seePresence = allows(theirProfile?.lastSeenPrivacy);
-    const seePhoto = allows(theirProfile?.profilePhotoPrivacy);
     const seeAbout = allows(theirProfile?.aboutPrivacy);
+    const media = presentProfileMedia(theirProfile, currentUserId, user.id, mutualSet.has(user.id));
     const known = knownUserIds.has(user.id);
     return {
       ...user,
       phone: known ? user.phone : '',
       username: known ? user.username : '',
       about: seeAbout ? user.about : '',
-      photoUri: seePhoto ? (user.photoUri || '') : '',
+      photoUri: media.photoUri,
+      profileVideoUri: media.profileVideoUri,
+      profileVideoPosterUri: media.profileVideoPosterUri,
+      profileVideoDurationSeconds: media.profileVideoDurationSeconds,
       presence: seePresence ? user.presence : 'offline',
       lastSeenAt: seePresence ? user.lastSeenAt : undefined,
       lastSeenPrivacy: theirProfile?.lastSeenPrivacy ?? 'everyone',
-      profilePhotoPrivacy: theirProfile?.profilePhotoPrivacy ?? 'everyone',
+      profilePhotoPrivacy: media.profilePhotoPrivacy,
+      profileVideoPrivacy: media.profileVideoPrivacy,
       aboutPrivacy: theirProfile?.aboutPrivacy ?? 'everyone',
     };
   });
@@ -4060,10 +4181,19 @@ const matchAutoReply = (
 const emitMessageToChat = async (message: Message, chat: Chat, sendingBusiness?: BusinessProfile | null) => {
   const senderUser = (await readUsers()).find((user) => user.id === message.senderId);
   const senderProfile = senderUser ? await readProfile(senderUser.id) : null;
+  const allContacts = senderUser ? await readContacts() : [];
   const recipientIds = new Set(chat.participants);
   sendingBusiness?.members.forEach((member) => recipientIds.add(member.userId));
   for (const participantId of recipientIds) {
     const delivered = presentMessage(message, participantId);
+    const mutual = Boolean(
+      senderUser
+      && allContacts.some((c) => c.ownerUserId === participantId && c.linkedUserId === senderUser.id)
+      && allContacts.some((c) => c.ownerUserId === senderUser.id && c.linkedUserId === participantId),
+    );
+    const media = senderUser
+      ? presentProfileMedia(senderProfile, participantId, senderUser.id, mutual)
+      : null;
     io.to(`user:${participantId}`).emit('message:new', {
       ...delivered,
       sender: delivered.senderId === 'anonymous' || !senderUser
@@ -4074,7 +4204,10 @@ const emitMessageToChat = async (message: Message, chat: Chat, sendingBusiness?:
             phone: senderUser.phone,
             username: senderProfile?.username || '',
             avatar: senderUser.avatar,
-            photoUri: senderProfile?.photoUri || '',
+            photoUri: media?.photoUri || '',
+            profileVideoUri: media?.profileVideoUri || '',
+            profileVideoPosterUri: media?.profileVideoPosterUri || '',
+            profileVideoDurationSeconds: media?.profileVideoDurationSeconds ?? 0,
           },
     });
   }
@@ -4497,7 +4630,7 @@ const updateProfile = async (userId: string, changes: Partial<Profile>) => {
       user.about = nextProfile.about;
       user.phone = nextProfile.phone;
     }
-    return { ...nextProfile };
+    return withReactionPrefs({ ...nextProfile });
   }
 
   await seedDatabaseIfNeeded();
@@ -4521,7 +4654,7 @@ const updateProfile = async (userId: string, changes: Partial<Profile>) => {
     },
   );
 
-  return nextProfile;
+  return withReactionPrefs(nextProfile);
 };
 
 const updatePresence = async (userId: string, presence: Presence) => {
@@ -5471,6 +5604,25 @@ app.get('/api/statuses', async (_req, res) => {
 
 app.post('/api/uploads', upload.array('files', 10), async (req, res) => {
   const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+  const purpose = String(req.body?.purpose || req.query?.purpose || '');
+
+  for (const file of files) {
+    const looksLikeProfileVideo =
+      purpose === 'profile-video'
+      || /profile/i.test(file.fieldname)
+      || /profile[-_]?video/i.test(file.originalname || '');
+    if (
+      file.mimetype.startsWith('video/')
+      && looksLikeProfileVideo
+      && file.size > PROFILE_VIDEO_MAX_BYTES
+    ) {
+      return res.status(400).json({
+        error: `Profile videos must be under ${Math.round(PROFILE_VIDEO_MAX_BYTES / (1024 * 1024))}MB and ~${PROFILE_VIDEO_MAX_SECONDS}s. Compress before upload.`,
+        profileVideoMaxBytes: PROFILE_VIDEO_MAX_BYTES,
+        profileVideoMaxSeconds: PROFILE_VIDEO_MAX_SECONDS,
+      });
+    }
+  }
 
   const uploadedFiles = await Promise.all(
     files.map(async (file) => {
@@ -5491,7 +5643,13 @@ app.post('/api/uploads', upload.array('files', 10), async (req, res) => {
     }),
   );
 
-  return res.status(201).json({ files: uploadedFiles });
+  // Duration is not probed here; clients PATCH profileVideoDurationSeconds (0–PROFILE_VIDEO_MAX_SECONDS).
+  // Server-side transcode can plug in later if Cloudinary/GCS URLs need re-encoding.
+  return res.status(201).json({
+    files: uploadedFiles,
+    profileVideoMaxSeconds: PROFILE_VIDEO_MAX_SECONDS,
+    profileVideoMaxBytes: PROFILE_VIDEO_MAX_BYTES,
+  });
 });
 
 app.post('/api/statuses', async (req, res) => {
@@ -5619,8 +5777,20 @@ app.post('/api/statuses/:statusId/reactions', async (req, res) => {
     });
   }
 
+  const resolved = resolveReactionSelection({
+    emoji: parseResult.data.emoji,
+    reactionId: parseResult.data.reactionId,
+  });
+  if (!resolved.ok) {
+    return res.status(400).json({ error: resolved.error });
+  }
+
   const fallbackUserId = await resolveRequestUserId(req);
-  const status = await addStatusReaction(req.params.statusId, parseResult.data.userId ?? fallbackUserId, parseResult.data.emoji);
+  const status = await addStatusReaction(
+    req.params.statusId,
+    parseResult.data.userId ?? fallbackUserId,
+    resolved.value.emoji,
+  );
   if (!status) {
     return res.status(404).json({ error: 'Status not found' });
   }
@@ -8390,6 +8560,22 @@ app.patch('/api/profile', async (req, res) => {
     changes.pinHash = null;
   }
 
+  // Empty profileVideoUri clears the clip (reverts clients to the static photo).
+  if (changes.profileVideoUri === '') {
+    changes.profileVideoPosterUri = '';
+    changes.profileVideoDurationSeconds = 0;
+  } else if (
+    typeof changes.profileVideoUri === 'string'
+    && changes.profileVideoUri
+    && changes.profileVideoDurationSeconds === undefined
+  ) {
+    // Require an explicit duration when setting a new video URL.
+    return res.status(400).json({
+      error: `profileVideoDurationSeconds (0–${PROFILE_VIDEO_MAX_SECONDS}) is required when setting a profile video`,
+      profileVideoMaxSeconds: PROFILE_VIDEO_MAX_SECONDS,
+    });
+  }
+
   const profile = await updateProfile(await resolveRequestUserId(req), changes);
   io.emit('profile:updated', profile);
 
@@ -8947,6 +9133,9 @@ app.post('/api/calls', async (req, res) => {
   await persistCall(call);
   const caller = (await readUsers()).find((user) => user.id === call.initiatorId);
   const callerProfile = caller ? await readProfile(caller.id) : null;
+  // Broadcast has no per-viewer mutual context: only expose video when privacy is everyone.
+  const videoPrivacy = callerProfile?.profileVideoPrivacy ?? callerProfile?.profilePhotoPrivacy ?? 'everyone';
+  const shareVideoOnBroadcast = videoPrivacy === 'everyone';
   const deliveredCall = {
     ...call,
     caller: caller
@@ -8957,6 +9146,11 @@ app.post('/api/calls', async (req, res) => {
           username: callerProfile?.username || '',
           avatar: caller.avatar,
           photoUri: callerProfile?.photoUri || '',
+          profileVideoUri: shareVideoOnBroadcast ? (callerProfile?.profileVideoUri || '') : '',
+          profileVideoPosterUri: shareVideoOnBroadcast ? (callerProfile?.profileVideoPosterUri || '') : '',
+          profileVideoDurationSeconds: shareVideoOnBroadcast
+            ? (callerProfile?.profileVideoDurationSeconds ?? 0)
+            : 0,
         }
       : null,
   };
@@ -9445,10 +9639,19 @@ app.post('/api/messages', async (req, res) => {
 
   const senderUser = (await readUsers()).find((user) => user.id === message.senderId);
   const senderProfile = senderUser ? await readProfile(senderUser.id) : null;
+  const allContacts = senderUser ? await readContacts() : [];
   const recipientIds = new Set(chat.participants);
   sendingBusiness?.members.forEach((member) => recipientIds.add(member.userId));
   for (const participantId of recipientIds) {
     const delivered = presentMessage(message, participantId);
+    const mutual = Boolean(
+      senderUser
+      && allContacts.some((c) => c.ownerUserId === participantId && c.linkedUserId === senderUser.id)
+      && allContacts.some((c) => c.ownerUserId === senderUser.id && c.linkedUserId === participantId),
+    );
+    const media = senderUser
+      ? presentProfileMedia(senderProfile, participantId, senderUser.id, mutual)
+      : null;
     io.to(`user:${participantId}`).emit('message:new', {
       ...delivered,
       sender: delivered.senderId === 'anonymous' || !senderUser
@@ -9459,7 +9662,10 @@ app.post('/api/messages', async (req, res) => {
             phone: senderUser.phone,
             username: senderProfile?.username || '',
             avatar: senderUser.avatar,
-            photoUri: senderProfile?.photoUri || '',
+            photoUri: media?.photoUri || '',
+            profileVideoUri: media?.profileVideoUri || '',
+            profileVideoPosterUri: media?.profileVideoPosterUri || '',
+            profileVideoDurationSeconds: media?.profileVideoDurationSeconds ?? 0,
           },
     });
   }
@@ -10027,6 +10233,25 @@ gamesDeps = {
   },
 };
 registerGamesApi(app, gamesDeps);
+
+const eventsDeps: EventsDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  readUsers: async () => (await readUsers()).map((user) => ({ id: user.id, name: user.name, avatar: user.avatar })),
+};
+registerEventsApi(app, eventsDeps);
+
+const reactionsDeps: ReactionsDeps = {
+  io,
+  resolveRequestUserId,
+  readMessages,
+  saveMessageUpdate: async (message) => saveMessageUpdate(message as Message),
+  readChats,
+  saveChatRecord: async (chat) => saveChatRecord(chat as Chat),
+  presentMessage: (message, viewerId) => presentMessage(message as Message, viewerId),
+};
+registerReactionsApi(app, reactionsDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
