@@ -20,7 +20,7 @@ const money = (amount, currency) => `${currency || ''} ${Number(amount || 0).toL
 function Login({ onLogin }) {
   const [email, setEmail] = useState('admin@zynkup.app');
   const [password, setPassword] = useState('');
-  const [apiBase, setApiBase] = useState(loadSession()?.apiBase || import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000');
+  const [apiBase, setApiBase] = useState(loadSession()?.apiBase || import.meta.env.VITE_API_BASE_URL || 'https://zynkup-api-597625475865.europe-west9.run.app');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 

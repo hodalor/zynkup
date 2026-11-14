@@ -16,7 +16,7 @@ export const clearSession = () => localStorage.removeItem(STORAGE_KEY);
 
 export async function api(path, options = {}, session) {
   const current = session || loadSession();
-  const base = (current?.apiBase || import.meta.env.VITE_API_BASE_URL || 'http://localhost:4000').replace(/\/$/, '');
+  const base = (current?.apiBase || import.meta.env.VITE_API_BASE_URL || 'https://zynkup-api-597625475865.europe-west9.run.app').replace(/\/$/, '');
   const response = await fetch(`${base}${path}`, {
     ...options,
     headers: {
