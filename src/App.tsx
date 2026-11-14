@@ -479,6 +479,8 @@ type CommunityAuditEvent = {
 };
 
 type CallState = 'ringing' | 'ongoing' | 'completed' | 'missed' | 'declined';
+type CallConnectionUiState = 'connecting' | 'connected' | 'reconnecting' | 'failed' | 'closed';
+type CallQuality = 'good' | 'fair' | 'poor';
 
 type CallItem = {
   id: string;
@@ -1212,8 +1214,53 @@ const formatDurationLabel = (seconds: number) => {
   return `${minutes}:${remainder}`;
 };
 
+/** Fallback STUN-only config for voice rooms and when ICE fetch fails. Never hardcode TURN secrets. */
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+];
+
 const WEBRTC_CONFIGURATION: RTCConfiguration = {
-  iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+  iceServers: FALLBACK_ICE_SERVERS,
+  iceCandidatePoolSize: 4,
+};
+
+const buildFallbackRtcConfig = (): RTCConfiguration => ({
+  iceServers: FALLBACK_ICE_SERVERS,
+  iceCandidatePoolSize: 4,
+});
+
+const mapRtcStatesToCallConnection = (
+  connectionState: RTCPeerConnectionState,
+  iceConnectionState: RTCIceConnectionState,
+): CallConnectionUiState => {
+  if (connectionState === 'failed' || iceConnectionState === 'failed') return 'failed';
+  if (connectionState === 'closed' || iceConnectionState === 'closed') return 'closed';
+  if (connectionState === 'disconnected' || iceConnectionState === 'disconnected') {
+    return 'reconnecting';
+  }
+  if (
+    connectionState === 'connected'
+    && (iceConnectionState === 'connected' || iceConnectionState === 'completed')
+  ) {
+    return 'connected';
+  }
+  // new / connecting / checking — not "Connected" and not a recovery banner yet
+  return 'connecting';
+};
+
+const classifyCallQuality = (rttMs?: number, packetLossPct?: number): CallQuality => {
+  const rtt = rttMs ?? 0;
+  const loss = packetLossPct ?? 0;
+  if (rtt >= 400 || loss >= 8) return 'poor';
+  if (rtt >= 200 || loss >= 3) return 'fair';
+  return 'good';
+};
+
+const callQualityLabel = (quality: CallQuality | null) => {
+  if (quality === 'good') return 'Good';
+  if (quality === 'fair') return 'Fair';
+  if (quality === 'poor') return 'Poor';
+  return null;
 };
 
 const getChatTitle = (chat: any, userId: string, userList: AppUser[]) => {
@@ -1618,6 +1665,11 @@ function App() {
   const [callMuted, setCallMuted] = useState(false);
   const [callCameraOff, setCallCameraOff] = useState(false);
   const [remoteCameraOff, setRemoteCameraOff] = useState(false);
+  const [callLinkState, setCallLinkState] = useState<CallConnectionUiState | null>(null);
+  const [callQuality, setCallQuality] = useState<CallQuality | null>(null);
+  const [callAudioOnly, setCallAudioOnly] = useState(false);
+  const [peerScreenSharing, setPeerScreenSharing] = useState(false);
+  const [localScreenSharing, setLocalScreenSharing] = useState(false);
   const [mediaViewer, setMediaViewer] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
@@ -1825,6 +1877,15 @@ function App() {
   const selectedEventIdRef = useRef('');
   selectedEventIdRef.current = selectedEventId;
   const callMediaStreamRef = useRef<MediaStream | null>(null);
+  const callRtcConfigRef = useRef<RTCConfiguration | null>(null);
+  const callIceRestartCountRef = useRef(0);
+  const callIceRestartInFlightRef = useRef(false);
+  const callAudioOnlyRef = useRef(false);
+  const callLinkStateRef = useRef<CallConnectionUiState | null>(null);
+  const callQualityRef = useRef<CallQuality | null>(null);
+  const callCameraTrackRef = useRef<MediaStreamTrack | null>(null);
+  const callScreenTrackRef = useRef<MediaStreamTrack | null>(null);
+  const callMetricsTimerRef = useRef<number | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const applyBootstrapRef = useRef<(payload: any) => void>(() => undefined);
@@ -1916,12 +1977,36 @@ function App() {
     }
   };
 
+  const resetCallReliabilityUi = () => {
+    callIceRestartCountRef.current = 0;
+    callIceRestartInFlightRef.current = false;
+    callRtcConfigRef.current = null;
+    callAudioOnlyRef.current = false;
+    callLinkStateRef.current = null;
+    callQualityRef.current = null;
+    callCameraTrackRef.current = null;
+    if (callScreenTrackRef.current) {
+      callScreenTrackRef.current.stop();
+      callScreenTrackRef.current = null;
+    }
+    if (callMetricsTimerRef.current) {
+      window.clearInterval(callMetricsTimerRef.current);
+      callMetricsTimerRef.current = null;
+    }
+    setCallLinkState(null);
+    setCallQuality(null);
+    setCallAudioOnly(false);
+    setPeerScreenSharing(false);
+    setLocalScreenSharing(false);
+  };
+
   const closePeerConnection = () => {
     peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop());
     peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
     callMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     callMediaStreamRef.current = null;
+    resetCallReliabilityUi();
     setLocalCallStream(null);
     setRemoteCallStream(null);
   };
@@ -1939,6 +2024,7 @@ function App() {
         throw new Error('camera');
       }
       existing.addTrack(videoTrack);
+      callCameraTrackRef.current = videoTrack;
       callMediaStreamRef.current = existing;
       setLocalCallStream(new MediaStream(existing.getTracks()));
       return existing;
@@ -1948,6 +2034,10 @@ function App() {
       audio: true,
       video: kind === 'video' ? { facingMode: 'user' } : false,
     });
+    const cameraTrack = stream.getVideoTracks()[0];
+    if (cameraTrack) {
+      callCameraTrackRef.current = cameraTrack;
+    }
     callMediaStreamRef.current = stream;
     setLocalCallStream(stream);
     return stream;
@@ -1963,18 +2053,276 @@ function App() {
     });
   };
 
+  const emitCallConnection = (
+    callId: string,
+    state: CallConnectionUiState,
+    quality?: CallQuality | null,
+    peerUserId?: string,
+  ) => {
+    callLinkStateRef.current = state;
+    setCallLinkState(state);
+    const payload: {
+      callId: string;
+      userId: string;
+      state: CallConnectionUiState;
+      quality?: CallQuality;
+    } = {
+      callId,
+      userId: currentUserIdRef.current || currentUserId,
+      state,
+    };
+    if (quality) {
+      payload.quality = quality;
+    }
+    socketRef.current?.emit('call:connection', payload);
+    void peerUserId;
+  };
+
+  const fetchCallRtcConfiguration = async (): Promise<RTCConfiguration> => {
+    if (callRtcConfigRef.current) {
+      return callRtcConfigRef.current;
+    }
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/calls/ice-servers`);
+      if (response.ok) {
+        const payload = await response.json();
+        const iceServers = Array.isArray(payload?.iceServers) && payload.iceServers.length > 0
+          ? (payload.iceServers as RTCIceServer[])
+          : FALLBACK_ICE_SERVERS;
+        const config: RTCConfiguration = { iceServers, iceCandidatePoolSize: 4 };
+        callRtcConfigRef.current = config;
+        return config;
+      }
+    } catch {
+      // STUN-only fallback below
+    }
+    const fallback = buildFallbackRtcConfig();
+    callRtcConfigRef.current = fallback;
+    return fallback;
+  };
+
+  const applyLocalVideoSendEnabled = (enabled: boolean) => {
+    const connection = peerConnectionRef.current;
+    const cameraTrack = callCameraTrackRef.current
+      || callMediaStreamRef.current?.getVideoTracks().find((track) => track !== callScreenTrackRef.current)
+      || null;
+    if (cameraTrack && !callScreenTrackRef.current) {
+      cameraTrack.enabled = enabled && !callCameraOff;
+    }
+    connection?.getSenders().forEach((sender) => {
+      if (sender.track?.kind === 'video' && sender.track !== callScreenTrackRef.current) {
+        sender.track.enabled = enabled && !callCameraOff;
+      }
+    });
+  };
+
+  const setCallAudioOnlyMode = (enabled: boolean) => {
+    callAudioOnlyRef.current = enabled;
+    setCallAudioOnly(enabled);
+    applyLocalVideoSendEnabled(!enabled);
+  };
+
+  const attemptIceRestart = async (call: CallItem) => {
+    const connection = peerConnectionRef.current;
+    if (!connection || callIceRestartInFlightRef.current) {
+      return;
+    }
+    if (callIceRestartCountRef.current >= 2) {
+      emitCallConnection(call.id, 'failed', callQualityRef.current, call.peerUserId);
+      setCallError('Connection failed. End the call and try again.');
+      return;
+    }
+    callIceRestartInFlightRef.current = true;
+    callIceRestartCountRef.current += 1;
+    emitCallConnection(call.id, 'reconnecting', callQualityRef.current, call.peerUserId);
+    emitCallSignal(call.id, 'ice-restart', { attempt: callIceRestartCountRef.current }, call.peerUserId);
+    try {
+      if (typeof connection.restartIce === 'function') {
+        connection.restartIce();
+      }
+      if (connection.signalingState === 'stable') {
+        const offer = await connection.createOffer({
+          iceRestart: true,
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: call.kind === 'video' && !callAudioOnlyRef.current,
+        });
+        await connection.setLocalDescription(offer);
+        emitCallSignal(call.id, 'offer', offer, call.peerUserId);
+      }
+    } catch {
+      emitCallConnection(call.id, 'failed', callQualityRef.current, call.peerUserId);
+      setCallError('Connection failed. End the call and try again.');
+    } finally {
+      window.setTimeout(() => {
+        callIceRestartInFlightRef.current = false;
+      }, 2500);
+    }
+  };
+
+  const sampleAndPostCallMetrics = async (call: CallItem) => {
+    const connection = peerConnectionRef.current;
+    if (!connection || call.state !== 'ongoing') return;
+    try {
+      const stats = await connection.getStats();
+      let rttMs: number | undefined;
+      let packetLoss: number | undefined;
+      let bitrateKbps: number | undefined;
+      let bytesReceived = 0;
+      stats.forEach((report) => {
+        if (report.type === 'candidate-pair' && (report as RTCStats & { state?: string }).state === 'succeeded') {
+          const pair = report as RTCStats & { currentRoundTripTime?: number; availableOutgoingBitrate?: number };
+          if (typeof pair.currentRoundTripTime === 'number') {
+            rttMs = Math.round(pair.currentRoundTripTime * 1000);
+          }
+          if (typeof pair.availableOutgoingBitrate === 'number') {
+            bitrateKbps = Math.round(pair.availableOutgoingBitrate / 1000);
+          }
+        }
+        if (report.type === 'inbound-rtp') {
+          const inbound = report as RTCStats & {
+            packetsLost?: number;
+            packetsReceived?: number;
+            bytesReceived?: number;
+          };
+          const lost = inbound.packetsLost ?? 0;
+          const received = inbound.packetsReceived ?? 0;
+          const total = lost + received;
+          if (total > 0) {
+            packetLoss = Math.min(100, Math.round((lost / total) * 1000) / 10);
+          }
+          if (typeof inbound.bytesReceived === 'number') {
+            bytesReceived += inbound.bytesReceived;
+          }
+        }
+      });
+      if (bitrateKbps == null && bytesReceived > 0) {
+        bitrateKbps = undefined;
+      }
+      const quality = classifyCallQuality(rttMs, packetLoss);
+      callQualityRef.current = quality;
+      setCallQuality(quality);
+      if (quality === 'poor' && call.kind === 'video' && !callAudioOnlyRef.current) {
+        setCallAudioOnlyMode(true);
+        showToast('Switched to audio only for a more stable call.');
+      }
+      const userId = currentUserIdRef.current || currentUserId;
+      await fetch(`${API_BASE_URL}/api/calls/${encodeURIComponent(call.id)}/metrics`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId,
+          rttMs,
+          packetLoss,
+          bitrateKbps,
+          quality,
+        }),
+      }).catch(() => undefined);
+      if (callLinkStateRef.current === 'connected' || callLinkStateRef.current === 'reconnecting') {
+        emitCallConnection(call.id, callLinkStateRef.current, quality, call.peerUserId);
+      }
+    } catch {
+      // ignore stats failures
+    }
+  };
+
+  const emitScreenShareNotice = (callId: string, active: boolean, peerUserId?: string) => {
+    socketRef.current?.emit('call:screen-share', {
+      callId,
+      userId: currentUserIdRef.current || currentUserId,
+      active,
+    });
+    void peerUserId;
+  };
+
+  const stopLocalScreenShare = async () => {
+    const call = activeCallRef.current;
+    const connection = peerConnectionRef.current;
+    const screenTrack = callScreenTrackRef.current;
+    if (screenTrack) {
+      screenTrack.stop();
+      callScreenTrackRef.current = null;
+    }
+    setLocalScreenSharing(false);
+    if (call) {
+      emitScreenShareNotice(call.id, false, call.peerUserId);
+    }
+    if (!connection || !call) return;
+    const cameraTrack = callCameraTrackRef.current
+      || callMediaStreamRef.current?.getVideoTracks().find((track) => track.readyState === 'live')
+      || null;
+    const sender = connection.getSenders().find((item) => item.track?.kind === 'video' || item.track == null);
+    if (sender && cameraTrack && !callAudioOnlyRef.current) {
+      await sender.replaceTrack(cameraTrack);
+      cameraTrack.enabled = !callCameraOff;
+    } else if (sender && (!cameraTrack || callAudioOnlyRef.current)) {
+      await sender.replaceTrack(null);
+    }
+    if (callMediaStreamRef.current) {
+      setLocalCallStream(new MediaStream(callMediaStreamRef.current.getTracks()));
+    }
+  };
+
+  const startLocalScreenShare = async () => {
+    const call = activeCallRef.current;
+    const connection = peerConnectionRef.current;
+    if (!call || !connection || typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      showToast('Screen sharing is not available here.');
+      return;
+    }
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const screenTrack = display.getVideoTracks()[0];
+      if (!screenTrack) {
+        showToast('Could not start screen share.');
+        return;
+      }
+      callScreenTrackRef.current = screenTrack;
+      const sender = connection.getSenders().find((item) => item.track?.kind === 'video')
+        || connection.getSenders().find((item) => !item.track);
+      if (sender) {
+        await sender.replaceTrack(screenTrack);
+      } else {
+        connection.addTrack(screenTrack, display);
+      }
+      setLocalScreenSharing(true);
+      emitScreenShareNotice(call.id, true, call.peerUserId);
+      screenTrack.onended = () => {
+        void stopLocalScreenShare();
+      };
+      if (connection.signalingState === 'stable') {
+        const offer = await connection.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true,
+        });
+        await connection.setLocalDescription(offer);
+        emitCallSignal(call.id, 'offer', offer, call.peerUserId);
+      }
+    } catch {
+      showToast('Screen share was cancelled.');
+    }
+  };
+
   const ensurePeerConnection = async (call: CallItem) => {
     if (peerConnectionRef.current) {
       return peerConnectionRef.current;
     }
 
-    const connection = new RTCPeerConnection(WEBRTC_CONFIGURATION);
+    const rtcConfig = await fetchCallRtcConfiguration();
+    const connection = new RTCPeerConnection(rtcConfig);
     const remoteStream = new MediaStream();
     setRemoteCallStream(remoteStream);
+    callIceRestartCountRef.current = 0;
+    emitCallConnection(call.id, 'connecting', null, call.peerUserId);
+
     connection.ontrack = (event) => {
       event.streams[0]?.getTracks().forEach((track) => {
-        remoteStream.addTrack(track);
+        if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) {
+          remoteStream.addTrack(track);
+        }
       });
+      if (!event.streams[0] && event.track && !remoteStream.getTracks().some((existing) => existing.id === event.track.id)) {
+        remoteStream.addTrack(event.track);
+      }
       setRemoteCallStream(new MediaStream(remoteStream.getTracks()));
     };
     connection.onicecandidate = (event) => {
@@ -1982,8 +2330,53 @@ function App() {
         emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), call.peerUserId);
       }
     };
+
+    const publishConnectionState = () => {
+      const ice = connection.iceConnectionState;
+      const conn = connection.connectionState;
+      const mapped = mapRtcStatesToCallConnection(conn, ice);
+
+      if (mapped === 'connected') {
+        callIceRestartCountRef.current = 0;
+        callIceRestartInFlightRef.current = false;
+        setCallError(null);
+        if (callLinkStateRef.current !== 'connected') {
+          emitCallConnection(call.id, 'connected', callQualityRef.current, call.peerUserId);
+        }
+        return;
+      }
+
+      if (mapped === 'connecting') {
+        if (callLinkStateRef.current !== 'connecting' && callLinkStateRef.current !== 'connected') {
+          emitCallConnection(call.id, 'connecting', callQualityRef.current, call.peerUserId);
+        }
+        return;
+      }
+
+      if (mapped === 'closed') {
+        if (callLinkStateRef.current !== 'closed') {
+          emitCallConnection(call.id, 'closed', callQualityRef.current, call.peerUserId);
+        }
+        return;
+      }
+
+      // failed / reconnecting — attempt ICE restart a couple of times
+      if (ice === 'failed' || ice === 'disconnected' || conn === 'failed' || conn === 'disconnected') {
+        if (callLinkStateRef.current !== 'reconnecting' && callLinkStateRef.current !== 'failed') {
+          emitCallConnection(call.id, 'reconnecting', callQualityRef.current, call.peerUserId);
+        }
+        void attemptIceRestart(call);
+      }
+    };
+
+    connection.onconnectionstatechange = publishConnectionState;
+    connection.oniceconnectionstatechange = publishConnectionState;
+
     const localStream = await ensureCallMedia(call.kind);
     localStream.getTracks().forEach((track) => connection.addTrack(track, localStream));
+    if (callAudioOnlyRef.current) {
+      applyLocalVideoSendEnabled(false);
+    }
     peerConnectionRef.current = connection;
     return connection;
   };
@@ -3294,6 +3687,26 @@ function App() {
         void enableVideoOnCall().catch(() => setCallError('The camera did not start.'));
         return;
       }
+      if (signalType === 'ice-restart') {
+        // Peer is renegotiating; wait for their offer (or create one if stable).
+        void (async () => {
+          try {
+            const connection = await ensurePeerConnection(currentCall);
+            if (connection.signalingState === 'stable' && currentCall.initiatorId === currentUserIdRef.current) {
+              const offer = await connection.createOffer({
+                iceRestart: true,
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: currentCall.kind === 'video' && !callAudioOnlyRef.current,
+              });
+              await connection.setLocalDescription(offer);
+              emitCallSignal(callId, 'offer', offer, fromUserId);
+            }
+          } catch {
+            // offer path will surface errors if renegotiation fails
+          }
+        })();
+        return;
+      }
 
       void (async () => {
         try {
@@ -3318,6 +3731,50 @@ function App() {
           setCallError('Call signaling lost sync. Please retry the call.');
         }
       })();
+    });
+    socket.on('call:connection', (event: {
+      callId?: string;
+      userId?: string;
+      state?: CallConnectionUiState;
+      quality?: CallQuality;
+    }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== event.callId || event.userId === currentUserIdRef.current) {
+        return;
+      }
+      if (event.quality === 'good' || event.quality === 'fair' || event.quality === 'poor') {
+        callQualityRef.current = event.quality;
+        setCallQuality(event.quality);
+      }
+      // Peer reconnecting does not flip our local link banner unless we also lost media.
+      if (event.state === 'failed') {
+        setCallError((current) => current || 'Peer reported a connection problem.');
+      }
+    });
+    socket.on('call:metrics', (event: {
+      callId?: string;
+      userId?: string;
+      quality?: CallQuality;
+    }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== event.callId || event.userId === currentUserIdRef.current) {
+        return;
+      }
+      if (event.quality === 'good' || event.quality === 'fair' || event.quality === 'poor') {
+        callQualityRef.current = event.quality;
+        setCallQuality(event.quality);
+      }
+    });
+    socket.on('call:screen-share', (event: {
+      callId?: string;
+      userId?: string;
+      active?: boolean;
+    }) => {
+      const currentCall = activeCallRef.current;
+      if (!currentCall || currentCall.id !== event.callId || event.userId === currentUserIdRef.current) {
+        return;
+      }
+      setPeerScreenSharing(Boolean(event.active));
     });
     socket.on('updates:refresh', (feed) => {
       setUpdatesFeed(feed);
@@ -3657,6 +4114,8 @@ function App() {
     }
 
     setCallError(null);
+    setPeerScreenSharing(false);
+    void fetchCallRtcConfiguration();
     socketRef.current.emit('call:join', { callId: activeCall.id, userId: currentUserId });
     if (activeCall.state === 'ringing' || activeCall.state === 'ongoing') {
       void ensureCallMedia(activeCall.kind).catch(() => {
@@ -3669,6 +4128,31 @@ function App() {
       closePeerConnection();
     };
   }, [activeCall, currentUserId]);
+
+  useEffect(() => {
+    if (!activeCall || activeCall.state !== 'ongoing') {
+      if (callMetricsTimerRef.current) {
+        window.clearInterval(callMetricsTimerRef.current);
+        callMetricsTimerRef.current = null;
+      }
+      return;
+    }
+
+    void sampleAndPostCallMetrics(activeCall);
+    callMetricsTimerRef.current = window.setInterval(() => {
+      const call = activeCallRef.current;
+      if (call && call.state === 'ongoing') {
+        void sampleAndPostCallMetrics(call);
+      }
+    }, 5000);
+
+    return () => {
+      if (callMetricsTimerRef.current) {
+        window.clearInterval(callMetricsTimerRef.current);
+        callMetricsTimerRef.current = null;
+      }
+    };
+  }, [activeCall?.id, activeCall?.state]);
 
   useEffect(() => {
     if (!incomingCall || incomingCall.state !== 'ringing' || incomingCall.initiatorId === currentUserId) {
@@ -3742,6 +4226,9 @@ function App() {
     const stream = await ensureCallMedia('video');
     const videoTrack = stream.getVideoTracks().find((track) => track.readyState === 'live');
     if (!videoTrack) throw new Error('camera');
+    callCameraTrackRef.current = videoTrack;
+    callAudioOnlyRef.current = false;
+    setCallAudioOnly(false);
     videoTrack.enabled = true;
     const sender = connection.getSenders().find((item) => item.track?.kind === 'video');
     if (sender) {
@@ -3768,6 +4255,15 @@ function App() {
     setCallMuted(false);
     setCallCameraOff(false);
     setRemoteCameraOff(false);
+    setCallAudioOnly(false);
+    callAudioOnlyRef.current = false;
+    setCallQuality(null);
+    setCallLinkState(null);
+    setPeerScreenSharing(false);
+    setLocalScreenSharing(false);
+    callRtcConfigRef.current = null;
+    callIceRestartCountRef.current = 0;
+    void fetchCallRtcConfiguration();
     try {
       await ensureCallMedia(kind);
       setCallError(null);
@@ -13686,12 +14182,29 @@ function App() {
           photoUri: peer?.photoUri,
           profileVideoPosterUri: peer?.profileVideoPosterUri,
         });
-        const localVideoLive = Boolean(localCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live')) && !callCameraOff;
+        const localVideoLive = Boolean(localCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live')) && !callCameraOff && !callAudioOnly;
         const remoteVideoLive = Boolean(remoteCallStream?.getVideoTracks().some((track) => track.enabled && track.readyState === 'live' && !track.muted)) && !remoteCameraOff;
-        const showRemoteVideo = activeCall.kind === 'video' && remoteVideoLive;
+        const showRemoteVideo = activeCall.kind === 'video' && remoteVideoLive && !callAudioOnly;
         const showLocalVideo = activeCall.kind === 'video' && localVideoLive;
         const canAnswer = activeCall.state === 'ringing' && activeCall.initiatorId !== currentUserId;
         const answered = activeCall.state === 'ongoing';
+        const qualityText = callQualityLabel(callQuality);
+        let statusLabel: string;
+        if (!answered) {
+          statusLabel = canAnswer
+            ? `Incoming ${activeCall.kind === 'video' ? 'video' : 'voice'} call`
+            : 'Ringing...';
+        } else if (callLinkState === 'reconnecting') {
+          statusLabel = 'Reconnecting…';
+        } else if (callLinkState === 'failed') {
+          statusLabel = 'Connection failed';
+        } else if (callLinkState === 'connecting' || callLinkState == null) {
+          statusLabel = 'Connecting…';
+        } else {
+          statusLabel = formatDurationLabel(activeCallSeconds);
+        }
+        const showReconnectBanner = answered && callLinkState === 'reconnecting';
+        const showFailedBanner = answered && callLinkState === 'failed';
         return (
           <div className="call-stage">
             {showRemoteVideo ? (
@@ -13701,7 +14214,7 @@ function App() {
                 {peerPhoto ? <img alt="" src={peerPhoto} /> : <span>{(activeCall.peerName || '?').slice(0, 1).toUpperCase()}</span>}
               </div>
             )}
-            {activeCall.kind === 'video' && (showLocalVideo || profile.photoUrl) ? (
+            {activeCall.kind === 'video' && (showLocalVideo || profile.photoUrl) && !callAudioOnly ? (
               <div className="call-stage-pip">
                 {showLocalVideo ? (
                   <video autoPlay muted playsInline ref={localVideoRef} />
@@ -13712,19 +14225,57 @@ function App() {
             ) : null}
             <div className="call-stage-top">
               <strong>{activeCall.peerName}</strong>
-              <span>
-                {answered
-                  ? formatDurationLabel(activeCallSeconds)
-                  : canAnswer
-                    ? `Incoming ${activeCall.kind === 'video' ? 'video' : 'voice'} call`
-                    : 'Ringing...'}
-              </span>
+              <span>{statusLabel}</span>
+              {answered && qualityText ? (
+                <span className={`call-quality-chip call-quality-${callQuality}`}>{qualityText}</span>
+              ) : null}
+              {callAudioOnly && answered ? <span className="call-audio-only-chip">Audio only</span> : null}
               {callError ? <em>{callError}</em> : null}
             </div>
+            {showReconnectBanner ? (
+              <div className="call-reliability-banner reconnecting" role="status">Reconnecting…</div>
+            ) : null}
+            {showFailedBanner ? (
+              <div className="call-reliability-banner failed" role="alert">Connection failed</div>
+            ) : null}
+            {peerScreenSharing ? (
+              <div className="call-screen-share-notice" role="status">Sharing screen</div>
+            ) : null}
+            {localScreenSharing ? (
+              <div className="call-screen-share-notice local" role="status">You are sharing your screen</div>
+            ) : null}
             <div className="call-stage-actions">
               <button disabled={!answered} onClick={() => setCallAudioMuted(!callMuted)} type="button">{callMuted ? 'Unmute' : 'Mute'}</button>
               {activeCall.kind === 'video' ? (
-                <button disabled={!answered} onClick={() => setCallVideoEnabled(callCameraOff)} type="button">{callCameraOff ? 'Camera' : 'Cam off'}</button>
+                <>
+                  <button
+                    disabled={!answered || callAudioOnly}
+                    onClick={() => setCallVideoEnabled(callCameraOff)}
+                    type="button"
+                  >
+                    {callCameraOff ? 'Camera' : 'Cam off'}
+                  </button>
+                  <button
+                    disabled={!answered}
+                    onClick={() => setCallAudioOnlyMode(!callAudioOnly)}
+                    type="button"
+                  >
+                    {callAudioOnly ? 'Video on' : 'Audio only'}
+                  </button>
+                  <button
+                    disabled={!answered}
+                    onClick={() => {
+                      if (localScreenSharing) {
+                        void stopLocalScreenShare();
+                      } else {
+                        void startLocalScreenShare();
+                      }
+                    }}
+                    type="button"
+                  >
+                    {localScreenSharing ? 'Stop share' : 'Share'}
+                  </button>
+                </>
               ) : (
                 <button disabled={!answered} onClick={() => {
                   emitCallSignal(activeCall.id, 'video-upgrade', { from: currentUserId }, activeCall.peerUserId);
