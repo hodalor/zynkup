@@ -312,6 +312,18 @@ export default function App() {
           <>
             <Cards items={[['Messages', rows.length], ['Calls', data?.calls?.length || 0], ['Latest sender', rows[0]?.senderName || '—'], ['Latest call', data?.calls?.[0]?.state || '—']]} />
             <Table columns={[{ key: 'sentAt', label: 'When', render: (row) => new Date(row.sentAt).toLocaleString() }, { key: 'senderName', label: 'From' }, { key: 'kind', label: 'Kind' }, { key: 'text', label: 'Preview' }]} rows={rows} onRow={(row) => setModal({ kind: 'detail', row })} />
+            <h3>Event log</h3>
+            <Table
+              columns={[
+                { key: 'createdAt', label: 'When', render: (row) => row.createdAt ? new Date(row.createdAt).toLocaleString() : '' },
+                { key: 'level', label: 'Level' },
+                { key: 'area', label: 'Area' },
+                { key: 'message', label: 'What happened' },
+                { key: 'detail', label: 'Detail' },
+              ]}
+              rows={data?.events || []}
+              onRow={(row) => setModal({ kind: 'detail', row })}
+            />
             <h3>Calls</h3>
             <Table
               columns={[

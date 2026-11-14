@@ -32,6 +32,7 @@ type Message = {
   replyToMessageId?: string;
   replyPreview?: string;
   callKind?: 'audio' | 'video';
+  callState?: 'missed' | 'declined' | 'completed';
   deletedForEveryone?: boolean;
 };
 
@@ -63,15 +64,160 @@ type CallItem = {
   peerName: string;
 };
 
+type CatalogProductStatus = 'draft' | 'active' | 'archived' | 'out_of_stock';
+
+type CatalogVariant = {
+  id?: string;
+  name: string;
+  options: string[];
+};
+
 type CatalogItem = {
   id: string;
+  sellerId: string;
   title: string;
   price: string;
+  priceAmount: number;
+  currency: string;
   seller: string;
   category: string;
   description: string;
   imageUrl: string;
+  imageUrls: string[];
+  stockQuantity: number;
+  trackStock: boolean;
+  costPrice: number | null;
+  lowStockThreshold: number;
+  status: CatalogProductStatus;
+  variants: CatalogVariant[];
+  isPublic: boolean;
+  availabilityUpdatedAt: string;
 };
+
+type OrderState =
+  | 'pending_payment'
+  | 'paid'
+  | 'processing'
+  | 'dispatched'
+  | 'completed'
+  | 'cancelled'
+  | 'refunded';
+
+type CommerceOrder = {
+  id: string;
+  buyerUserId: string;
+  sellerUserId: string;
+  totalAmount: number;
+  currency: string;
+  state: OrderState;
+  items: Array<{ title: string; quantity: number; price: number }>;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SaleReceipt = {
+  id: string;
+  receiptNumber: string;
+  orderId: string;
+  buyerName: string;
+  sellerName: string;
+  businessName: string;
+  totalAmount: number;
+  currency: string;
+  state: string;
+  items: Array<{ title: string; quantity: number; price: number }>;
+  paymentMethod?: string;
+  paymentReference?: string;
+  issuedAt: string;
+  createdAt: string;
+};
+
+type SalesDashboard = {
+  period: string;
+  periodStart?: string;
+  periodEnd?: string;
+  currency: string;
+  lastUpdatedAt?: string;
+  estimated?: boolean;
+  canSeeFinance: boolean;
+  metrics?: {
+    pendingOrders?: number;
+    confirmedSalesCount?: number;
+    lowStockCount?: number;
+    grossSales?: number;
+    refunds?: number;
+    netSales?: number;
+    cashReceived?: number;
+    costOfGoodsSold?: number | null;
+    grossProfit?: number | null;
+    grossProfitAvailable?: boolean;
+    grossProfitNote?: string;
+  };
+  topProducts?: Array<{ catalogItemId?: string; title: string; units: number; revenue?: number }>;
+  lowStock?: Array<{ id: string; title: string; stockQuantity: number; lowStockThreshold: number }>;
+};
+
+type InventoryAlert = {
+  id: string;
+  catalogItemId?: string;
+  title?: string;
+  stockQuantity?: number;
+  lowStockThreshold?: number;
+  reviewedAt?: string | null;
+  createdAt?: string;
+};
+
+type MarketingConsent = 'unknown' | 'opted_in' | 'opted_out';
+
+type CustomerNote = {
+  id: string;
+  text: string;
+  byUserId: string;
+  createdAt: string;
+};
+
+type BusinessCustomer = {
+  id: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  customerUserId?: string | null;
+  displayName: string;
+  phone?: string;
+  tags: string[];
+  notes: CustomerNote[];
+  followUpAt?: string | null;
+  followUpNote?: string;
+  marketingConsent: MarketingConsent;
+  orderIds: string[];
+  lastOrderAt?: string | null;
+  orderCount: number;
+  totalSpent: number;
+  currency?: string;
+  chatId?: string | null;
+  deletedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type CustomerOrderSummary = {
+  id: string;
+  state: string;
+  totalAmount: number;
+  currency: string;
+  createdAt: string;
+  itemTitle?: string;
+};
+
+type CustomerPreference = {
+  customerId: string;
+  sellerUserId: string;
+  businessId?: string | null;
+  marketingConsent: MarketingConsent;
+  marketingConsentUpdatedAt?: string | null;
+  displayNameOnSellerSide?: string;
+};
+
+type BusinessHubTab = 'catalog' | 'dashboard' | 'orders' | 'receipts' | 'inventory' | 'customers';
 
 type StatusItem = {
   id: string;
@@ -169,10 +315,10 @@ const DEFAULT_APP_SETTINGS = {
 
 const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top' },
-  { id: 'business', title: 'Business tools', subtitle: 'Catalog and seller shortcuts' },
+  { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, sales, orders, and inventory' },
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations' },
   { id: 'account', title: 'Account', subtitle: 'Profile and security' },
-  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, status' },
+  { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, marketing' },
   { id: 'chats', title: 'Chats', subtitle: 'Enter is send and media' },
   { id: 'notifications', title: 'Notifications', subtitle: 'Message alerts and previews' },
   { id: 'storage', title: 'Storage and data', subtitle: 'Network usage and cache' },
@@ -192,6 +338,35 @@ const formatClock = (value: string) => {
     ? value
     : parsed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 };
+
+const mapCatalogItemFromServer = (item: any, usersList: AppUser[] = [], fallbackSeller = 'Seller'): CatalogItem => {
+  const currency = item.currency ?? 'GHS';
+  const priceAmount = Number(item.priceAmount ?? item.price ?? 0);
+  return {
+    id: item.id,
+    sellerId: item.sellerId ?? '',
+    title: item.title ?? '',
+    price: `${currency} ${priceAmount}`,
+    priceAmount,
+    currency,
+    seller: usersList.find((user) => user.id === item.sellerId)?.name ?? fallbackSeller,
+    category: item.category ?? '',
+    description: item.description ?? '',
+    imageUrl: item.imageUrls?.[0] ?? item.imageUrl ?? '',
+    imageUrls: item.imageUrls ?? (item.imageUrl ? [item.imageUrl] : []),
+    stockQuantity: item.stockQuantity ?? 0,
+    trackStock: item.trackStock !== false,
+    costPrice: item.costPrice == null ? null : Number(item.costPrice),
+    lowStockThreshold: item.lowStockThreshold ?? 2,
+    status: (item.status as CatalogProductStatus) || (item.takenDown ? 'archived' : 'active'),
+    variants: item.variants ?? [],
+    isPublic: Boolean(item.isPublic),
+    availabilityUpdatedAt: item.availabilityUpdatedAt || item.updatedAt || '',
+  };
+};
+
+const isCatalogLowStock = (item: CatalogItem) =>
+  item.trackStock !== false && Number(item.stockQuantity ?? 0) <= Number(item.lowStockThreshold ?? 2);
 
 const formatRelative = (value: string | null) => {
   if (!value) {
@@ -268,8 +443,43 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   replyToMessageId: message.replyToMessageId,
   replyPreview: message.replyPreview,
   callKind: message.callKind,
+  callState: message.callState,
   deletedForEveryone: Boolean(message.deletedForEveryone),
 });
+
+const describeCallMessage = (message: Message) => {
+  const video = message.callKind === 'video';
+  const noun = video ? 'video call' : 'voice call';
+  const state = message.callState
+    || (/missed/i.test(message.text || '') ? 'missed' : /declined/i.test(message.text || '') ? 'declined' : 'completed');
+  const outgoing = message.sender === 'me';
+  const label = !outgoing && state === 'missed'
+    ? `Missed ${noun}`
+    : !outgoing && state === 'declined'
+      ? `Declined ${noun}`
+      : `${outgoing ? 'Outgoing' : 'Incoming'} ${noun}`;
+  return { label, alert: state === 'missed' || state === 'declined', arrow: outgoing ? '↗' : '↙' };
+};
+
+let webAudioContext: AudioContext | null = null;
+const playWebCue = (kind: 'message' | 'call') => {
+  const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!Ctx) return;
+  if (!webAudioContext) webAudioContext = new Ctx();
+  const ctx = webAudioContext;
+  void ctx.resume().catch(() => undefined);
+  const oscillator = ctx.createOscillator();
+  const gain = ctx.createGain();
+  oscillator.type = 'sine';
+  oscillator.frequency.value = kind === 'call' ? 740 : 988;
+  gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + (kind === 'call' ? 0.7 : 0.18));
+  oscillator.connect(gain);
+  gain.connect(ctx.destination);
+  oscillator.start();
+  oscillator.stop(ctx.currentTime + (kind === 'call' ? 0.72 : 0.2));
+};
 
 const mapCallFromServer = (call: any, userId: string, userList: AppUser[]): CallItem => {
   const peerUserId = (call.participantIds ?? []).find((participantId: string) => participantId !== userId);
@@ -353,9 +563,29 @@ function App() {
     about: 'Seller, founder, and product operator.',
     phone: '+260765453163',
     photoUrl: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80',
+    currency: 'GHS',
   });
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
   const [settingsPanel, setSettingsPanel] = useState<SettingsPanelId>('account');
+  const [businessHubTab, setBusinessHubTab] = useState<BusinessHubTab>('catalog');
+  const [salesDashboard, setSalesDashboard] = useState<SalesDashboard | null>(null);
+  const [salesDashboardPeriod, setSalesDashboardPeriod] = useState<'today' | '7d' | '30d'>('7d');
+  const [commerceOrders, setCommerceOrders] = useState<CommerceOrder[]>([]);
+  const [saleReceipts, setSaleReceipts] = useState<SaleReceipt[]>([]);
+  const [receiptDetail, setReceiptDetail] = useState<SaleReceipt | null>(null);
+  const [inventoryAlerts, setInventoryAlerts] = useState<InventoryAlert[]>([]);
+  const [businessCustomers, setBusinessCustomers] = useState<BusinessCustomer[]>([]);
+  const [selectedCustomer, setSelectedCustomer] = useState<BusinessCustomer | null>(null);
+  const [customerOrders, setCustomerOrders] = useState<CustomerOrderSummary[]>([]);
+  const [customerForm, setCustomerForm] = useState({
+    displayName: '',
+    phone: '',
+    tags: '',
+    note: '',
+    followUpAt: '',
+  });
+  const [customerNoteDraft, setCustomerNoteDraft] = useState('');
+  const [customerPrefs, setCustomerPrefs] = useState<CustomerPreference[]>([]);
   const [favoriteChatIds, setFavoriteChatIds] = useState<string[]>([]);
   const [mutedChatIds, setMutedChatIds] = useState<string[]>([]);
   const [archivedChatIds, setArchivedChatIds] = useState<string[]>([]);
@@ -371,6 +601,13 @@ function App() {
     price: '',
     category: 'Fashion',
     description: '',
+    stockQuantity: '1',
+    costPrice: '',
+    lowStockThreshold: '2',
+    trackStock: true,
+    status: 'active' as 'active' | 'draft',
+    variantName: '',
+    variantOptions: '',
   });
   const [messagesByChat, setMessagesByChat] = useState<Record<string, Message[]>>({});
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
@@ -384,6 +621,12 @@ function App() {
   const typingTimeoutRef = useRef<number | null>(null);
   const toastTimeoutRef = useRef<number | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const currentUserIdRef = useRef('');
+  const selectedChatIdRef = useRef('');
+  const activeViewRef = useRef<View>('chats');
+  currentUserIdRef.current = currentUserId;
+  selectedChatIdRef.current = selectedChatId;
+  activeViewRef.current = activeView;
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const callMediaStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -427,6 +670,9 @@ function App() {
   }, [archivedChatIds, chatItems, chatSearchQuery, favoriteChatIds, showArchivedChats]);
   const filteredCatalogItems = useMemo(() => {
     return catalogItems.filter((item) => {
+      if (item.status === 'archived' || item.status === 'draft') {
+        return false;
+      }
       const matchesCategory = catalogCategory === 'All' || item.category === catalogCategory;
       const query = catalogSearch.trim().toLowerCase();
       const matchesSearch =
@@ -437,6 +683,16 @@ function App() {
       return matchesCategory && matchesSearch;
     });
   }, [catalogCategory, catalogItems, catalogSearch]);
+
+  const ownCatalogItems = useMemo(
+    () => catalogItems.filter((item) => item.sellerId === currentUserId),
+    [catalogItems, currentUserId],
+  );
+
+  const lowStockOwnItems = useMemo(
+    () => ownCatalogItems.filter((item) => item.status !== 'archived' && isCatalogLowStock(item)),
+    [ownCatalogItems],
+  );
 
   const attachStreamToVideo = (element: HTMLVideoElement | null, stream: MediaStream | null) => {
     if (!element) {
@@ -696,6 +952,7 @@ function App() {
           about: payload.profile.about ?? current.about,
           phone: payload.profile.phone ?? current.phone,
           photoUrl: payload.profile.photoUri || current.photoUrl,
+          currency: payload.profile.currency || current.currency,
         }));
       }
       showToast('Settings saved');
@@ -855,6 +1112,7 @@ function App() {
         (payload.profile?.avatar?.startsWith?.('http')
           ? payload.profile.avatar
           : 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=500&q=80'),
+      currency: payload.profile?.currency || 'GHS',
     });
     if (payload.profile) {
       setAppSettings((current) => {
@@ -892,15 +1150,7 @@ function App() {
       ),
     );
     setCatalogItems(
-      (payload.catalogItems ?? []).map((item: any) => ({
-        id: item.id,
-        title: item.title,
-        price: `${item.currency ?? 'ZMW'} ${item.price}`,
-        seller: payload.users?.find?.((user: any) => user.id === item.sellerId)?.name ?? 'Seller',
-        category: item.category,
-        description: item.description,
-        imageUrl: item.imageUrls?.[0] ?? '',
-      })),
+      (payload.catalogItems ?? []).map((item: any) => mapCatalogItemFromServer(item, nextUsers)),
     );
     const nextCalls = (payload.calls ?? []).map((call: any) => mapCallFromServer(call, payload.currentUserId ?? '', nextUsers));
     setCalls(nextCalls);
@@ -1208,7 +1458,7 @@ function App() {
 
       if (message.senderId !== currentUserId) {
         const pageVisible = typeof document === 'undefined' || document.visibilityState === 'visible';
-        const viewingChat = pageVisible && activeView === 'chats' && message.chatId === selectedChatId;
+        const viewingChat = pageVisible && activeViewRef.current === 'chats' && message.chatId === selectedChatIdRef.current;
         const settings = appSettingsRef.current;
         void syncReceiptState(
           message.id,
@@ -1223,12 +1473,14 @@ function App() {
           const preview = settings.showNotificationPreview
             ? message.text || 'New message'
             : 'New message';
+          playWebCue('message');
           if (Notification.permission === 'granted') {
             new Notification('ZynkUp', { body: preview });
           } else {
             showToast(preview);
           }
         } else if (settings.messageNotifications && !viewingChat && !mutedChatIdsRef.current.includes(message.chatId)) {
+          playWebCue('message');
           showToast(settings.showNotificationPreview ? message.text || 'New message' : 'New message');
         }
       }
@@ -1303,18 +1555,62 @@ function App() {
       });
     });
     socket.on('catalog:itemCreated', (item) => {
-      setCatalogItems((current) => [
-        {
-          id: item.id,
-          title: item.title,
-          price: `${item.currency ?? 'ZMW'} ${item.price}`,
-          seller: profile.name,
-          category: item.category,
-          description: item.description,
-          imageUrl: item.imageUrls?.[0] ?? '',
-        },
-        ...current,
-      ]);
+      setCatalogItems((current) => {
+        if (current.some((entry) => entry.id === item.id)) {
+          return current;
+        }
+        return [mapCatalogItemFromServer(item, users, profile.name), ...current];
+      });
+    });
+    socket.on('catalog:itemUpdated', (item) => {
+      if (!item?.id) return;
+      setCatalogItems((current) => {
+        const mapped = mapCatalogItemFromServer(item, users);
+        const exists = current.some((entry) => entry.id === item.id);
+        if (!exists) {
+          return [mapped, ...current];
+        }
+        return current.map((entry) =>
+          entry.id === item.id
+            ? {
+                ...entry,
+                ...mapped,
+                seller: mapped.seller !== 'Seller' ? mapped.seller : entry.seller,
+              }
+            : entry,
+        );
+      });
+    });
+    socket.on('order:created', ({ order }: { order: CommerceOrder }) => {
+      if (!order?.id) return;
+      setCommerceOrders((current) => [order, ...current.filter((entry) => entry.id !== order.id)]);
+      if (order.sellerUserId === currentUserIdRef.current) {
+        showToast(`New order ${order.id}`);
+      }
+    });
+    socket.on('order:updated', ({ order }: { order: CommerceOrder }) => {
+      if (!order?.id) return;
+      setCommerceOrders((current) => current.map((entry) => (entry.id === order.id ? order : entry)));
+    });
+    socket.on('receipt:created', ({ receipt }: { receipt: SaleReceipt }) => {
+      if (!receipt?.id) return;
+      setSaleReceipts((current) => [receipt, ...current.filter((entry) => entry.id !== receipt.id)]);
+      setReceiptDetail((current) => (current?.id === receipt.id ? receipt : current));
+    });
+    socket.on('inventory:alert', (alert: InventoryAlert) => {
+      if (!alert?.id) return;
+      setInventoryAlerts((current) => [alert, ...current.filter((entry) => entry.id !== alert.id)]);
+      showToast(alert.title ? `Low stock: ${alert.title}` : 'Inventory alert');
+    });
+    socket.on('customer:updated', ({ customer }: { customer: BusinessCustomer }) => {
+      if (!customer?.id) return;
+      if (customer.deletedAt) {
+        setBusinessCustomers((current) => current.filter((entry) => entry.id !== customer.id));
+        setSelectedCustomer((current) => (current?.id === customer.id ? null : current));
+        return;
+      }
+      setBusinessCustomers((current) => [customer, ...current.filter((entry) => entry.id !== customer.id)]);
+      setSelectedCustomer((current) => (current?.id === customer.id ? customer : current));
     });
     socket.on('call:created', (call) => {
       if ((call.participantIds ?? []).includes(currentUserId)) {
@@ -1322,8 +1618,19 @@ function App() {
       }
     });
     socket.on('call:incoming', (call) => {
-      if ((call.participantIds ?? []).includes(currentUserId)) {
-        upsertCall(call);
+      if ((call.participantIds ?? []).includes(currentUserIdRef.current)) {
+        upsertCall(call, currentUserIdRef.current);
+        if (call.initiatorId !== currentUserIdRef.current && call.state === 'ringing') {
+          playWebCue('call');
+          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            new Notification(call.caller?.name || 'ZynkUp', { body: call.kind === 'video' ? 'Incoming video call' : 'Incoming voice call' });
+          }
+        }
+      }
+    });
+    socket.on('call:hidden', ({ callId, userId }) => {
+      if (callId && userId === currentUserIdRef.current) {
+        setCalls((current) => current.filter((item) => item.id !== callId));
       }
     });
     socket.on('call:updated', (call) => {
@@ -1433,18 +1740,35 @@ function App() {
       upsertStatus(status);
     });
 
+    const joinUser = () => {
+      const userId = currentUserIdRef.current;
+      if (!userId) return;
+      const focused = document.visibilityState === 'visible';
+      socket.emit('user:join', { userId, focused });
+      socket.emit('user:focus', { focused });
+      socket.emit('presence:update', { userId, presence: focused ? 'online' : 'offline' });
+    };
+    currentUserIdRef.current = currentUserId;
+    socket.on('connect', joinUser);
+    joinUser();
+    const onVisibility = () => {
+      socket.emit('user:focus', { focused: document.visibilityState === 'visible' });
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     if (currentUserId) {
       socket.emit('presence:update', { userId: currentUserId, presence: 'online' });
     }
 
     return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
       if (currentUserId) {
+        socket.emit('user:focus', { focused: false });
         socket.emit('presence:update', { userId: currentUserId, presence: 'offline' });
       }
       socket.disconnect();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeView, currentDeviceId, currentUserId, ensurePeerConnection, profile.name, reconcileIncomingMessage, selectedChatId, upsertCall, upsertStatus, users]);
+  }, [currentUserId]);
 
   useEffect(() => {
     try {
@@ -1608,6 +1932,15 @@ function App() {
       closePeerConnection();
     };
   }, [activeCall, currentUserId]);
+
+  useEffect(() => {
+    if (!incomingCall || incomingCall.state !== 'ringing' || incomingCall.initiatorId === currentUserId) {
+      return undefined;
+    }
+    playWebCue('call');
+    const timer = window.setInterval(() => playWebCue('call'), 1600);
+    return () => window.clearInterval(timer);
+  }, [incomingCall, currentUserId]);
 
   function upsertCall(incomingCallItem: any, overrideUserId?: string, overrideUsers?: AppUser[]) {
     const mapped = mapCallFromServer(incomingCallItem, overrideUserId ?? currentUserId, overrideUsers ?? users);
@@ -1793,12 +2126,23 @@ function App() {
     setReplyTarget(null);
   };
 
+  const moneyLabel = (amount: number | null | undefined, currency = profile.currency || 'GHS') =>
+    `${currency} ${Number(amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
   const addCatalogItem = async () => {
     if (!catalogForm.title.trim() || !catalogForm.price.trim()) {
       return;
     }
 
     const imageUrls = await uploadFiles(catalogAssetFiles).catch(() => []);
+    const variantOptions = catalogForm.variantOptions
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const variants =
+      catalogForm.variantName.trim() && variantOptions.length
+        ? [{ id: `v${Date.now()}`, name: catalogForm.variantName.trim(), options: variantOptions }]
+        : [];
 
     fetch(`${API_BASE_URL}/api/catalog`, {
       method: 'POST',
@@ -1807,9 +2151,16 @@ function App() {
         sellerId: currentUserId,
         title: catalogForm.title.trim(),
         price: Number.parseFloat(catalogForm.price) || 0,
-        currency: 'ZMW',
+        currency: profile.currency || 'GHS',
         category: catalogForm.category,
         description: catalogForm.description.trim() || 'New product from this seller.',
+        stockQuantity: Number.parseInt(catalogForm.stockQuantity, 10) || 0,
+        trackStock: catalogForm.trackStock,
+        costPrice: catalogForm.costPrice.trim() === '' ? null : Number.parseFloat(catalogForm.costPrice),
+        lowStockThreshold: Number.parseInt(catalogForm.lowStockThreshold, 10) || 2,
+        status: catalogForm.status,
+        variants,
+        isPublic: catalogForm.status === 'active',
         imageUrls: imageUrls.length
           ? imageUrls
           : ['https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=900&q=80'],
@@ -1821,8 +2172,487 @@ function App() {
       price: '',
       category: 'Fashion',
       description: '',
+      stockQuantity: '1',
+      costPrice: '',
+      lowStockThreshold: '2',
+      trackStock: true,
+      status: 'active',
+      variantName: '',
+      variantOptions: '',
     });
     setCatalogAssetFiles([]);
+    showToast(catalogForm.status === 'draft' ? 'Product saved as draft' : 'Catalog item published');
+  };
+
+  const applyCatalogItemUpdate = (item: any) => {
+    if (!item?.id) return;
+    setCatalogItems((current) => {
+      const mapped = mapCatalogItemFromServer(item, users);
+      const exists = current.some((entry) => entry.id === item.id);
+      if (!exists) return [mapped, ...current];
+      return current.map((entry) =>
+        entry.id === item.id
+          ? { ...entry, ...mapped, seller: mapped.seller !== 'Seller' ? mapped.seller : entry.seller }
+          : entry,
+      );
+    });
+  };
+
+  const adjustCatalogStock = async (item: CatalogItem, delta: number) => {
+    if (!currentUserId || !delta) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(item.id)}/stock-adjust`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          delta,
+          reason: delta > 0 ? 'restock' : 'manual_adjust',
+          lowStockThreshold: item.lowStockThreshold,
+        }),
+      });
+      if (response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        if (payload.item) {
+          applyCatalogItemUpdate(payload.item);
+          return;
+        }
+      }
+      const nextStock = Math.max(0, (item.stockQuantity ?? 0) + delta);
+      const patchResponse = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stockQuantity: nextStock }),
+      });
+      if (!patchResponse.ok) {
+        showToast('Could not update stock');
+        return;
+      }
+      const payload = await patchResponse.json();
+      applyCatalogItemUpdate(payload.item);
+    } catch {
+      showToast('Network error while updating stock');
+    }
+  };
+
+  const setCatalogItemStatus = async (item: CatalogItem, status: CatalogProductStatus) => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/catalog/${encodeURIComponent(item.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) {
+        showToast('Could not update product status');
+        return;
+      }
+      const payload = await response.json();
+      applyCatalogItemUpdate(payload.item);
+      showToast(status === 'archived' ? 'Product archived' : `Product set to ${status}`);
+    } catch {
+      showToast('Could not update product status');
+    }
+  };
+
+  const loadSalesDashboard = async (period: 'today' | '7d' | '30d' = salesDashboardPeriod) => {
+    if (!currentUserId) return;
+    try {
+      const query = new URLSearchParams({ userId: currentUserId, period });
+      const response = await fetch(`${API_BASE_URL}/api/sales/dashboard?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load sales dashboard');
+        return;
+      }
+      setSalesDashboard(payload);
+      setSalesDashboardPeriod((payload.period as 'today' | '7d' | '30d') || period);
+    } catch {
+      showToast('Could not load sales dashboard');
+    }
+  };
+
+  const loadCommerceOrders = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/orders?userId=${encodeURIComponent(currentUserId)}&role=seller`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load orders');
+        return;
+      }
+      setCommerceOrders(payload.orders ?? []);
+    } catch {
+      showToast('Could not load orders');
+    }
+  };
+
+  const updateOrderState = async (orderId: string, state: OrderState) => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/orders/${encodeURIComponent(orderId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, state }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update order');
+        return;
+      }
+      if (payload.order) {
+        setCommerceOrders((current) =>
+          current.map((entry) => (entry.id === payload.order.id ? payload.order : entry)),
+        );
+      }
+      if (payload.receipt) {
+        setSaleReceipts((current) => [payload.receipt, ...current.filter((entry) => entry.id !== payload.receipt.id)]);
+      }
+      showToast(`Order marked ${state.replace(/_/g, ' ')}`);
+    } catch {
+      showToast('Could not update order');
+    }
+  };
+
+  const loadSaleReceipts = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/receipts?userId=${encodeURIComponent(currentUserId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load receipts');
+        return;
+      }
+      setSaleReceipts(payload.receipts ?? []);
+    } catch {
+      showToast('Could not load receipts');
+    }
+  };
+
+  const openReceiptDetail = async (receiptId: string) => {
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/receipts/${encodeURIComponent(receiptId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const local = saleReceipts.find((entry) => entry.id === receiptId) ?? null;
+        setReceiptDetail(local);
+        return;
+      }
+      setReceiptDetail(payload.receipt ?? null);
+    } catch {
+      setReceiptDetail(saleReceipts.find((entry) => entry.id === receiptId) ?? null);
+    }
+  };
+
+  const loadInventoryAlerts = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/inventory/alerts?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setInventoryAlerts([]);
+        return;
+      }
+      setInventoryAlerts(payload.alerts ?? []);
+    } catch {
+      setInventoryAlerts([]);
+    }
+  };
+
+  const reviewInventoryAlert = async (alertId: string) => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/inventory/alerts/${encodeURIComponent(alertId)}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      if (!response.ok) {
+        showToast('Could not mark alert reviewed');
+        return;
+      }
+      setInventoryAlerts((current) =>
+        current.map((entry) =>
+          entry.id === alertId ? { ...entry, reviewedAt: new Date().toISOString() } : entry,
+        ),
+      );
+      showToast('Alert marked reviewed');
+    } catch {
+      showToast('Could not mark alert reviewed');
+    }
+  };
+
+  const loadBusinessCustomers = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load customers');
+        return;
+      }
+      setBusinessCustomers(payload.customers ?? []);
+    } catch {
+      showToast('Could not load customers');
+    }
+  };
+
+  const loadCustomerDetail = async (customerId: string) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not open customer');
+        return;
+      }
+      setSelectedCustomer(payload.customer ?? null);
+      setCustomerOrders(payload.orders ?? []);
+      setCustomerNoteDraft('');
+    } catch {
+      showToast('Could not open customer');
+    }
+  };
+
+  const createBusinessCustomer = async () => {
+    if (!currentUserId) return;
+    const displayName = customerForm.displayName.trim();
+    if (!displayName) {
+      showToast('Add a customer name');
+      return;
+    }
+    const tags = customerForm.tags
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    const followUpRaw = customerForm.followUpAt.trim();
+    const followUpAt = followUpRaw
+      ? new Date(followUpRaw).toISOString()
+      : undefined;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          displayName,
+          phone: customerForm.phone.trim() || undefined,
+          tags: tags.length ? tags : undefined,
+          note: customerForm.note.trim() || undefined,
+          followUpAt,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save customer');
+        return;
+      }
+      if (payload.customer) {
+        setBusinessCustomers((current) => [
+          payload.customer,
+          ...current.filter((entry) => entry.id !== payload.customer.id),
+        ]);
+      }
+      setCustomerForm({ displayName: '', phone: '', tags: '', note: '', followUpAt: '' });
+      showToast(payload.existing ? 'Customer record updated' : 'Customer saved');
+    } catch {
+      showToast('Could not save customer');
+    }
+  };
+
+  const updateBusinessCustomer = async (
+    customerId: string,
+    patch: {
+      displayName?: string;
+      tags?: string[];
+      followUpAt?: string | null;
+      followUpNote?: string;
+      marketingConsent?: 'unknown' | 'opted_out';
+    },
+  ) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, ...patch }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update customer');
+        return;
+      }
+      if (payload.customer) {
+        setSelectedCustomer(payload.customer);
+        setBusinessCustomers((current) => [
+          payload.customer,
+          ...current.filter((entry) => entry.id !== payload.customer.id),
+        ]);
+      }
+      showToast('Customer updated');
+    } catch {
+      showToast('Could not update customer');
+    }
+  };
+
+  const addCustomerNote = async (customerId: string) => {
+    const text = customerNoteDraft.trim();
+    if (!currentUserId || !customerId || !text) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}/notes`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, text }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not add note');
+        return;
+      }
+      if (payload.customer) {
+        setSelectedCustomer(payload.customer);
+        setBusinessCustomers((current) => [
+          payload.customer,
+          ...current.filter((entry) => entry.id !== payload.customer.id),
+        ]);
+      }
+      setCustomerNoteDraft('');
+      showToast('Note added');
+    } catch {
+      showToast('Could not add note');
+    }
+  };
+
+  const deleteBusinessCustomer = async (customerId: string) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/customers/${encodeURIComponent(customerId)}?userId=${encodeURIComponent(currentUserId)}`,
+        { method: 'DELETE' },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not delete customer');
+        return;
+      }
+      setBusinessCustomers((current) => current.filter((entry) => entry.id !== customerId));
+      setSelectedCustomer(null);
+      setCustomerOrders([]);
+      showToast('Customer record removed');
+    } catch {
+      showToast('Could not delete customer');
+    }
+  };
+
+  const loadCustomerPreferences = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/me/customer-preferences?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setCustomerPrefs(payload.preferences ?? []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const updateMyMarketingPreference = async (
+    customerId: string,
+    marketingConsent: 'opted_in' | 'opted_out',
+  ) => {
+    if (!currentUserId || !customerId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/me/customer-preferences`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, customerId, marketingConsent }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update preference');
+        return;
+      }
+      setCustomerPrefs((current) =>
+        current.map((entry) =>
+          entry.customerId === customerId
+            ? {
+                ...entry,
+                marketingConsent: payload.preference?.marketingConsent || marketingConsent,
+                marketingConsentUpdatedAt:
+                  payload.preference?.marketingConsentUpdatedAt || entry.marketingConsentUpdatedAt,
+              }
+            : entry,
+        ),
+      );
+      showToast(marketingConsent === 'opted_in' ? 'Opted in to marketing' : 'Opted out of marketing');
+    } catch {
+      showToast('Could not update preference');
+    }
+  };
+
+  const shareSalesReport = async () => {
+    if (!salesDashboard) return;
+    const lines = [
+      `ZynkUp sales report (${salesDashboard.period})`,
+      `Currency ${salesDashboard.currency}`,
+      `Pending orders ${salesDashboard.metrics?.pendingOrders ?? 0}`,
+      `Confirmed sales ${salesDashboard.metrics?.confirmedSalesCount ?? 0}`,
+      salesDashboard.canSeeFinance
+        ? `Gross sales ${salesDashboard.metrics?.grossSales} · Net sales ${salesDashboard.metrics?.netSales} · Cash received ${salesDashboard.metrics?.cashReceived}`
+        : null,
+      `Low stock ${salesDashboard.metrics?.lowStockCount ?? 0}`,
+    ].filter(Boolean) as string[];
+    const text = lines.join('\n');
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        showToast('Report copied');
+        return;
+      }
+    } catch {
+      // fall through
+    }
+    showToast(text, 4000);
+  };
+
+  const sellerOrderActions = (order: CommerceOrder): Array<[OrderState, string]> => {
+    if (order.sellerUserId !== currentUserId) return [];
+    switch (order.state) {
+      case 'pending_payment':
+        return [
+          ['paid', 'Mark paid'],
+          ['cancelled', 'Cancel'],
+        ];
+      case 'paid':
+        return [
+          ['processing', 'Processing'],
+          ['cancelled', 'Cancel'],
+        ];
+      case 'processing':
+        return [
+          ['dispatched', 'Dispatched'],
+          ['cancelled', 'Cancel'],
+        ];
+      case 'dispatched':
+        return [['completed', 'Completed']];
+      default:
+        return [];
+    }
   };
 
   const openAttachmentChooser = () => {
@@ -2269,13 +3099,19 @@ function App() {
           {messages.map((message) => (
             message.kind === 'call' ? (
               <button
-                className="call-thread"
+                className={`call-thread ${describeCallMessage(message).alert ? 'missed' : ''}`}
                 key={message.id}
                 onClick={() => void startCall(message.callKind === 'video' ? 'video' : 'audio', activeChat.peerUserId)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  if (window.confirm('Delete this call from the chat?')) {
+                    void deleteMessage(message, 'me');
+                  }
+                }}
                 type="button"
               >
-                <strong>{message.text || 'Call'}</strong>
-                <small>{message.time} · Call again</small>
+                <strong>{describeCallMessage(message).arrow} {describeCallMessage(message).label}</strong>
+                <small>{message.time} · Call again · right-click to delete</small>
               </button>
             ) : (
             <article
@@ -2384,13 +3220,20 @@ function App() {
       </header>
       <section className="calls-list">
         {calls.length ? calls.map((call) => {
-          const missed = call.direction === 'incoming' && (call.state === 'missed' || call.state === 'declined');
+          const unanswered = call.state === 'missed' || call.state === 'declined';
+          const directionLabel = call.direction === 'outgoing'
+            ? 'Outgoing'
+            : call.state === 'declined'
+              ? 'Declined'
+              : call.state === 'missed'
+                ? 'Missed'
+                : 'Incoming';
           return (
-          <article className={`call-history-row ${missed ? 'missed' : ''}`} key={call.id}>
+          <article className={`call-history-row ${unanswered ? 'missed' : ''}`} key={call.id}>
             <div>
               <strong>{call.peerName}</strong>
               <small>
-                {call.direction === 'outgoing' ? 'Outgoing' : missed ? 'Missed' : 'Incoming'}
+                {directionLabel}
                 {' · '}
                 {call.kind === 'video' ? 'Video' : 'Voice'}
                 {' · '}
@@ -2402,6 +3245,19 @@ function App() {
               type="button"
             >
               {call.kind === 'video' ? 'Video call' : 'Voice call'}
+            </button>
+            <button
+              onClick={() => {
+                setCalls((current) => current.filter((item) => item.id !== call.id));
+                void fetch(`${API_BASE_URL}/api/calls/${encodeURIComponent(call.id)}`, {
+                  method: 'DELETE',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ userId: currentUserId }),
+                });
+              }}
+              type="button"
+            >
+              Delete
             </button>
           </article>
           );
@@ -2450,16 +3306,6 @@ function App() {
           ref={statusInputRef}
           type="file"
         />
-        <input
-          accept="image/*"
-          className="hidden-input"
-          multiple
-          onChange={(event) => {
-            setCatalogAssetFiles(Array.from(event.target.files ?? []));
-          }}
-          ref={catalogInputRef}
-          type="file"
-        />
       </div>
 
       <section className="catalog-grid">
@@ -2469,12 +3315,20 @@ function App() {
             <div className="catalog-card-body">
               <strong>{item.title}</strong>
               <span className="catalog-price">{item.price}</span>
-              <small>{item.seller}</small>
+              <small>
+                {item.seller}
+                {' · '}
+                {item.status || 'active'}
+                {item.trackStock === false ? ' · Stock not tracked' : ` · Stock ${item.stockQuantity ?? 0}`}
+              </small>
+              {isCatalogLowStock(item) ? <span className="low-stock-badge">Low stock</span> : null}
               <p>{item.description}</p>
               <button
                 onClick={() => {
                   setActiveView('chats');
-                  const seller = users.find((user) => user.name === item.seller && user.id !== currentUserId);
+                  const seller =
+                    users.find((user) => user.id === item.sellerId && user.id !== currentUserId) ||
+                    users.find((user) => user.name === item.seller && user.id !== currentUserId);
                   if (seller) {
                     void createDirectChat(seller.id, `Hi, I want to buy ${item.title}. `);
                   } else {
@@ -2545,18 +3399,597 @@ function App() {
       );
     }
     if (settingsPanel === 'business') {
+      const tabs: Array<{ id: BusinessHubTab; label: string }> = [
+        { id: 'catalog', label: 'Catalog' },
+        { id: 'dashboard', label: 'Dashboard' },
+        { id: 'orders', label: 'Orders' },
+        { id: 'receipts', label: 'Receipts' },
+        { id: 'inventory', label: 'Inventory' },
+        { id: 'customers', label: 'Customers' },
+      ];
+      const consentLabel = (consent: MarketingConsent) =>
+        consent === 'opted_in' ? 'Opted in' : consent === 'opted_out' ? 'Opted out' : 'Unknown';
+      const isFollowUpDue = (followUpAt?: string | null) =>
+        Boolean(followUpAt && new Date(followUpAt).getTime() <= Date.now());
       return (
         <>
-          <button className="settings-list-row" onClick={() => setActiveView('catalog')} type="button">Open catalog</button>
-          <div className="business-panel">
-            <h3>Add Catalog Item</h3>
-            <button onClick={() => catalogInputRef.current?.click()} type="button">Upload Catalog Images</button>
-            <input onChange={(event) => setCatalogForm((current) => ({ ...current, title: event.target.value }))} placeholder="Product title" value={catalogForm.title} />
-            <input onChange={(event) => setCatalogForm((current) => ({ ...current, price: event.target.value }))} placeholder="Price" value={catalogForm.price} />
-            <input onChange={(event) => setCatalogForm((current) => ({ ...current, category: event.target.value }))} placeholder="Category" value={catalogForm.category} />
-            <textarea onChange={(event) => setCatalogForm((current) => ({ ...current, description: event.target.value }))} placeholder="Description" value={catalogForm.description} />
-            <button onClick={() => void addCatalogItem()} type="button">Add To Catalog</button>
+          <button className="settings-list-row" onClick={() => setActiveView('catalog')} type="button">
+            Open public catalog
+          </button>
+          <div className="business-tabs">
+            {tabs.map((tab) => (
+              <button
+                className={businessHubTab === tab.id ? 'active' : ''}
+                key={tab.id}
+                onClick={() => {
+                  setBusinessHubTab(tab.id);
+                  if (tab.id === 'dashboard') void loadSalesDashboard(salesDashboardPeriod);
+                  if (tab.id === 'orders') void loadCommerceOrders();
+                  if (tab.id === 'receipts') void loadSaleReceipts();
+                  if (tab.id === 'inventory') void loadInventoryAlerts();
+                  if (tab.id === 'customers') void loadBusinessCustomers();
+                }}
+                type="button"
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
+
+          {businessHubTab === 'catalog' ? (
+            <div className="business-panel">
+              <h3>Add Catalog Item</h3>
+              <button onClick={() => catalogInputRef.current?.click()} type="button">
+                Upload Catalog Images
+                {catalogAssetFiles.length ? ` (${catalogAssetFiles.length})` : ''}
+              </button>
+              <input
+                onChange={(event) => setCatalogForm((current) => ({ ...current, title: event.target.value }))}
+                placeholder="Product title"
+                value={catalogForm.title}
+              />
+              <input
+                onChange={(event) => setCatalogForm((current) => ({ ...current, price: event.target.value }))}
+                placeholder={`Price (${profile.currency || 'GHS'})`}
+                value={catalogForm.price}
+              />
+              <input
+                onChange={(event) =>
+                  setCatalogForm((current) => ({
+                    ...current,
+                    stockQuantity: event.target.value.replace(/[^\d]/g, ''),
+                  }))
+                }
+                placeholder="Stock quantity"
+                value={catalogForm.stockQuantity}
+              />
+              <input
+                onChange={(event) => setCatalogForm((current) => ({ ...current, costPrice: event.target.value }))}
+                placeholder={`Cost price (${profile.currency || 'GHS'})`}
+                value={catalogForm.costPrice}
+              />
+              <input
+                onChange={(event) =>
+                  setCatalogForm((current) => ({
+                    ...current,
+                    lowStockThreshold: event.target.value.replace(/[^\d]/g, ''),
+                  }))
+                }
+                placeholder="Low stock threshold"
+                value={catalogForm.lowStockThreshold}
+              />
+              <label className="settings-toggle-row">
+                <span>
+                  <strong>Track stock</strong>
+                  <small>Turn off if you do not count units for this product.</small>
+                </span>
+                <input
+                  checked={catalogForm.trackStock}
+                  onChange={(event) =>
+                    setCatalogForm((current) => ({ ...current, trackStock: event.target.checked }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              <input
+                onChange={(event) => setCatalogForm((current) => ({ ...current, category: event.target.value }))}
+                placeholder="Category"
+                value={catalogForm.category}
+              />
+              <textarea
+                onChange={(event) => setCatalogForm((current) => ({ ...current, description: event.target.value }))}
+                placeholder="Description"
+                value={catalogForm.description}
+              />
+              <input
+                onChange={(event) => setCatalogForm((current) => ({ ...current, variantName: event.target.value }))}
+                placeholder="Variant name (e.g. Storage, Colour)"
+                value={catalogForm.variantName}
+              />
+              <input
+                onChange={(event) =>
+                  setCatalogForm((current) => ({ ...current, variantOptions: event.target.value }))
+                }
+                placeholder="Options, comma-separated (e.g. 64GB, 128GB)"
+                value={catalogForm.variantOptions}
+              />
+              <div className="catalog-chips">
+                {(['active', 'draft'] as const).map((status) => (
+                  <button
+                    className={catalogForm.status === status ? 'active' : ''}
+                    key={status}
+                    onClick={() => setCatalogForm((current) => ({ ...current, status }))}
+                    type="button"
+                  >
+                    {status}
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => void addCatalogItem()} type="button">
+                {catalogForm.status === 'draft' ? 'Save draft' : 'Add To Catalog'}
+              </button>
+
+              <h3>Your products</h3>
+              {ownCatalogItems.length ? null : <p>No products yet. Add your first item above.</p>}
+              {ownCatalogItems.map((item) => (
+                <div className="business-product-row" key={item.id}>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <small>
+                      {item.price} · {item.status || 'active'}
+                      {item.trackStock === false ? ' · Stock not tracked' : ` · Stock ${item.stockQuantity ?? 0}`}
+                    </small>
+                    {isCatalogLowStock(item) ? <span className="low-stock-badge">Low stock</span> : null}
+                  </div>
+                  <div className="business-product-actions">
+                    <button onClick={() => void adjustCatalogStock(item, -1)} type="button">
+                      −
+                    </button>
+                    <button onClick={() => void adjustCatalogStock(item, 1)} type="button">
+                      +
+                    </button>
+                    {(item.status || 'active') !== 'archived' ? (
+                      <button onClick={() => void setCatalogItemStatus(item, 'archived')} type="button">
+                        Archive
+                      </button>
+                    ) : (
+                      <button onClick={() => void setCatalogItemStatus(item, 'active')} type="button">
+                        Activate
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'dashboard' ? (
+            <div className="business-panel">
+              <h3>Sales dashboard</h3>
+              <div className="catalog-chips">
+                {(
+                  [
+                    ['today', 'Today'],
+                    ['7d', '7 days'],
+                    ['30d', '30 days'],
+                  ] as const
+                ).map(([id, label]) => (
+                  <button
+                    className={salesDashboardPeriod === id ? 'active' : ''}
+                    key={id}
+                    onClick={() => {
+                      setSalesDashboardPeriod(id);
+                      void loadSalesDashboard(id);
+                    }}
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {salesDashboard ? (
+                <>
+                  <p>
+                    {salesDashboard.periodStart
+                      ? new Date(salesDashboard.periodStart).toLocaleDateString()
+                      : ''}
+                    {' – '}
+                    {salesDashboard.periodEnd
+                      ? new Date(salesDashboard.periodEnd).toLocaleDateString()
+                      : ''}
+                    {' · '}
+                    {salesDashboard.currency}
+                    {salesDashboard.estimated ? ' · Estimated' : ' · Live'}
+                  </p>
+                  <div className="metric-grid">
+                    <button
+                      className="metric-card"
+                      onClick={() => {
+                        setBusinessHubTab('orders');
+                        void loadCommerceOrders();
+                      }}
+                      type="button"
+                    >
+                      <strong>{salesDashboard.metrics?.pendingOrders ?? 0}</strong>
+                      <span>Pending orders</span>
+                    </button>
+                    <button
+                      className="metric-card"
+                      onClick={() => {
+                        setBusinessHubTab('receipts');
+                        void loadSaleReceipts();
+                      }}
+                      type="button"
+                    >
+                      <strong>{salesDashboard.metrics?.confirmedSalesCount ?? 0}</strong>
+                      <span>Confirmed sales</span>
+                    </button>
+                    <button
+                      className="metric-card"
+                      onClick={() => {
+                        setBusinessHubTab('inventory');
+                        void loadInventoryAlerts();
+                      }}
+                      type="button"
+                    >
+                      <strong>{salesDashboard.metrics?.lowStockCount ?? 0}</strong>
+                      <span>Low stock</span>
+                    </button>
+                  </div>
+                  {salesDashboard.canSeeFinance ? (
+                    <>
+                      <h3>Sales figures</h3>
+                      <p>Gross sales {moneyLabel(salesDashboard.metrics?.grossSales, salesDashboard.currency)}</p>
+                      <p>
+                        Refunds {moneyLabel(salesDashboard.metrics?.refunds, salesDashboard.currency)}
+                        {' · '}
+                        Net sales {moneyLabel(salesDashboard.metrics?.netSales, salesDashboard.currency)}
+                      </p>
+                      <p>
+                        Cash received {moneyLabel(salesDashboard.metrics?.cashReceived, salesDashboard.currency)}
+                        {' (confirmed payments only)'}
+                      </p>
+                      {salesDashboard.metrics?.grossProfitAvailable ? (
+                        <p>
+                          After cost of goods {moneyLabel(salesDashboard.metrics?.grossProfit, salesDashboard.currency)}
+                          {' · COGS '}
+                          {moneyLabel(salesDashboard.metrics?.costOfGoodsSold, salesDashboard.currency)}
+                        </p>
+                      ) : (
+                        <p>After-cost figure unavailable — add cost prices on products first.</p>
+                      )}
+                      {salesDashboard.metrics?.grossProfitNote ? (
+                        <small>{salesDashboard.metrics.grossProfitNote}</small>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p>Financial totals are limited to owners and managers.</p>
+                  )}
+                  <button onClick={() => void shareSalesReport()} type="button">
+                    Copy / share report
+                  </button>
+                </>
+              ) : (
+                <p>Loading sales figures…</p>
+              )}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'orders' ? (
+            <div className="business-panel">
+              <h3>Seller orders</h3>
+              <button onClick={() => void loadCommerceOrders()} type="button">
+                Refresh
+              </button>
+              {commerceOrders.length ? null : <p>No seller orders yet.</p>}
+              {commerceOrders.map((order) => (
+                <div className="business-product-row" key={order.id}>
+                  <div>
+                    <strong>{order.id}</strong>
+                    <small>
+                      {order.state.replace(/_/g, ' ')} · {moneyLabel(order.totalAmount, order.currency)}
+                    </small>
+                    <small>
+                      {(order.items || []).map((entry) => `${entry.title} ×${entry.quantity}`).join(', ')}
+                    </small>
+                  </div>
+                  <div className="business-product-actions">
+                    {sellerOrderActions(order).map(([state, label]) => (
+                      <button key={state} onClick={() => void updateOrderState(order.id, state)} type="button">
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'receipts' ? (
+            <div className="business-panel">
+              <h3>Receipts</h3>
+              <button onClick={() => void loadSaleReceipts()} type="button">
+                Refresh
+              </button>
+              {saleReceipts.length ? null : <p>No receipts yet.</p>}
+              {saleReceipts.map((receipt) => (
+                <button
+                  className="settings-list-row"
+                  key={receipt.id}
+                  onClick={() => void openReceiptDetail(receipt.id)}
+                  type="button"
+                >
+                  <span>
+                    {receipt.receiptNumber}
+                    <small>
+                      {' '}
+                      · {receipt.state} · {moneyLabel(receipt.totalAmount, receipt.currency)}
+                    </small>
+                  </span>
+                  <strong>View</strong>
+                </button>
+              ))}
+              {receiptDetail ? (
+                <div className="receipt-detail">
+                  <h3>{receiptDetail.receiptNumber}</h3>
+                  <p>{receiptDetail.businessName || receiptDetail.sellerName}</p>
+                  <p>Buyer: {receiptDetail.buyerName}</p>
+                  <p>
+                    {receiptDetail.state} ·{' '}
+                    {new Date(receiptDetail.issuedAt || receiptDetail.createdAt).toLocaleString()}
+                  </p>
+                  {(receiptDetail.items || []).map((entry, index) => (
+                    <p key={`${receiptDetail.id}-${index}`}>
+                      {entry.title} ×{entry.quantity} · {moneyLabel(entry.price, receiptDetail.currency)}
+                    </p>
+                  ))}
+                  <p>
+                    Total {moneyLabel(receiptDetail.totalAmount, receiptDetail.currency)}
+                  </p>
+                  <p>
+                    Payment: {receiptDetail.paymentMethod || '—'} · {receiptDetail.paymentReference || '—'}
+                  </p>
+                  <button onClick={() => setReceiptDetail(null)} type="button">
+                    Close detail
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'inventory' ? (
+            <div className="business-panel">
+              <h3>Low stock products</h3>
+              {lowStockOwnItems.length ? null : <p>Stock looks fine right now.</p>}
+              {lowStockOwnItems.map((item) => (
+                <div className="business-product-row" key={item.id}>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <small>
+                      {item.stockQuantity} left · alert at {item.lowStockThreshold}
+                    </small>
+                    <span className="low-stock-badge">Low stock</span>
+                  </div>
+                  <div className="business-product-actions">
+                    <button onClick={() => void adjustCatalogStock(item, 1)} type="button">
+                      + Stock
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <h3>Inventory alerts</h3>
+              <button onClick={() => void loadInventoryAlerts()} type="button">
+                Refresh alerts
+              </button>
+              {inventoryAlerts.length ? null : <p>No open inventory alerts.</p>}
+              {inventoryAlerts.map((alert) => (
+                <div className="business-product-row" key={alert.id}>
+                  <div>
+                    <strong>{alert.title || alert.catalogItemId || alert.id}</strong>
+                    <small>
+                      {alert.stockQuantity != null ? `${alert.stockQuantity} left` : 'Alert'}
+                      {alert.lowStockThreshold != null ? ` · threshold ${alert.lowStockThreshold}` : ''}
+                      {alert.reviewedAt ? ' · reviewed' : ' · open'}
+                    </small>
+                  </div>
+                  <div className="business-product-actions">
+                    {!alert.reviewedAt ? (
+                      <button onClick={() => void reviewInventoryAlert(alert.id)} type="button">
+                        Mark reviewed
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'customers' ? (
+            <div className="business-panel">
+              <h3>Customers</h3>
+              <button onClick={() => void loadBusinessCustomers()} type="button">
+                Refresh
+              </button>
+              <p>
+                {businessCustomers.length} customers
+                {' · '}
+                {businessCustomers.filter((entry) => isFollowUpDue(entry.followUpAt)).length} follow-ups due
+                {' · '}
+                {businessCustomers.filter((entry) => entry.marketingConsent === 'opted_in').length} opted in
+              </p>
+
+              <h3>Add customer</h3>
+              <input
+                onChange={(event) =>
+                  setCustomerForm((current) => ({ ...current, displayName: event.target.value }))
+                }
+                placeholder="Display name"
+                value={customerForm.displayName}
+              />
+              <input
+                onChange={(event) =>
+                  setCustomerForm((current) => ({ ...current, phone: event.target.value }))
+                }
+                placeholder="Phone (optional)"
+                value={customerForm.phone}
+              />
+              <input
+                onChange={(event) =>
+                  setCustomerForm((current) => ({ ...current, tags: event.target.value }))
+                }
+                placeholder="Tags, comma-separated"
+                value={customerForm.tags}
+              />
+              <textarea
+                onChange={(event) =>
+                  setCustomerForm((current) => ({ ...current, note: event.target.value }))
+                }
+                placeholder="First note (optional)"
+                value={customerForm.note}
+              />
+              <label>
+                <span>Follow-up</span>
+                <input
+                  onChange={(event) =>
+                    setCustomerForm((current) => ({ ...current, followUpAt: event.target.value }))
+                  }
+                  type="datetime-local"
+                  value={customerForm.followUpAt}
+                />
+              </label>
+              <button onClick={() => void createBusinessCustomer()} type="button">
+                Save customer
+              </button>
+
+              {businessCustomers.length ? null : <p>No customers yet. Add one above.</p>}
+              {businessCustomers.map((customer) => (
+                <button
+                  className="settings-list-row"
+                  key={customer.id}
+                  onClick={() => void loadCustomerDetail(customer.id)}
+                  type="button"
+                >
+                  <span>
+                    {customer.displayName}
+                    <small>
+                      {' '}
+                      · {customer.orderCount || 0} orders ·{' '}
+                      {moneyLabel(customer.totalSpent, customer.currency || profile.currency)}
+                      {(customer.tags || []).length
+                        ? ` · ${(customer.tags || []).slice(0, 3).join(', ')}`
+                        : ''}
+                    </small>
+                    <span className={`consent-badge consent-${customer.marketingConsent || 'unknown'}`}>
+                      {consentLabel(customer.marketingConsent || 'unknown')}
+                    </span>
+                    {isFollowUpDue(customer.followUpAt) ? (
+                      <span className="follow-up-badge">Follow-up due</span>
+                    ) : null}
+                  </span>
+                  <strong>Open</strong>
+                </button>
+              ))}
+
+              {selectedCustomer ? (
+                <div className="receipt-detail customer-detail">
+                  <h3>{selectedCustomer.displayName}</h3>
+                  <p>
+                    {selectedCustomer.phone || 'No phone'}
+                    {' · '}
+                    {consentLabel(selectedCustomer.marketingConsent || 'unknown')}
+                  </p>
+                  <p>
+                    {(selectedCustomer.tags || []).length
+                      ? (selectedCustomer.tags || []).join(', ')
+                      : 'No tags'}
+                  </p>
+                  <p>
+                    Follow-up:{' '}
+                    {selectedCustomer.followUpAt
+                      ? new Date(selectedCustomer.followUpAt).toLocaleString()
+                      : 'Not set'}
+                    {selectedCustomer.followUpNote ? ` · ${selectedCustomer.followUpNote}` : ''}
+                  </p>
+
+                  <h3>Purchase history</h3>
+                  {customerOrders.length ? null : <p>No linked orders yet.</p>}
+                  {customerOrders.map((order) => (
+                    <p key={order.id}>
+                      {order.itemTitle || order.id} · {order.state.replace(/_/g, ' ')} ·{' '}
+                      {moneyLabel(order.totalAmount, order.currency)} ·{' '}
+                      {new Date(order.createdAt).toLocaleDateString()}
+                    </p>
+                  ))}
+
+                  <h3>Notes</h3>
+                  {(selectedCustomer.notes || []).length ? null : <p>No notes yet.</p>}
+                  {(selectedCustomer.notes || []).map((note) => (
+                    <p key={note.id}>
+                      {note.text}
+                      <small> · {new Date(note.createdAt).toLocaleString()}</small>
+                    </p>
+                  ))}
+                  <textarea
+                    onChange={(event) => setCustomerNoteDraft(event.target.value)}
+                    placeholder="Add a note"
+                    value={customerNoteDraft}
+                  />
+                  <button onClick={() => void addCustomerNote(selectedCustomer.id)} type="button">
+                    Add note
+                  </button>
+
+                  <div className="business-product-actions">
+                    <button
+                      onClick={() => {
+                        const next = window.prompt(
+                          'Follow-up date/time (YYYY-MM-DDTHH:mm or leave blank to clear)',
+                          selectedCustomer.followUpAt
+                            ? selectedCustomer.followUpAt.slice(0, 16)
+                            : '',
+                        );
+                        if (next === null) return;
+                        const trimmed = next.trim();
+                        void updateBusinessCustomer(selectedCustomer.id, {
+                          followUpAt: trimmed ? new Date(trimmed).toISOString() : null,
+                        });
+                      }}
+                      type="button"
+                    >
+                      Set follow-up
+                    </button>
+                    {selectedCustomer.marketingConsent !== 'opted_out' ? (
+                      <button
+                        onClick={() =>
+                          void updateBusinessCustomer(selectedCustomer.id, {
+                            marketingConsent: 'opted_out',
+                          })
+                        }
+                        type="button"
+                      >
+                        Mark opted out
+                      </button>
+                    ) : null}
+                    <button
+                      className="danger"
+                      onClick={() => void deleteBusinessCustomer(selectedCustomer.id)}
+                      type="button"
+                    >
+                      Delete
+                    </button>
+                    <button
+                      onClick={() => {
+                        setSelectedCustomer(null);
+                        setCustomerOrders([]);
+                      }}
+                      type="button"
+                    >
+                      Close detail
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </>
       );
     }
@@ -2601,6 +4034,49 @@ function App() {
             (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
             'If off, you won’t send or see read ticks',
           )}
+          <div className="business-panel">
+            <h3>Marketing preferences</h3>
+            <p>Businesses that keep a CRM record for you can send marketing only if you opt in.</p>
+            <button onClick={() => void loadCustomerPreferences()} type="button">
+              Refresh preferences
+            </button>
+            {customerPrefs.length ? null : <p>No business CRM records linked to your account.</p>}
+            {customerPrefs.map((pref) => (
+              <div className="business-product-row" key={pref.customerId}>
+                <div>
+                  <strong>{pref.displayNameOnSellerSide || pref.sellerUserId}</strong>
+                  <small>
+                    {pref.marketingConsent === 'opted_in'
+                      ? 'Opted in'
+                      : pref.marketingConsent === 'opted_out'
+                        ? 'Opted out'
+                        : 'Not set'}
+                  </small>
+                  <span className={`consent-badge consent-${pref.marketingConsent || 'unknown'}`}>
+                    {pref.marketingConsent === 'opted_in'
+                      ? 'Opted in'
+                      : pref.marketingConsent === 'opted_out'
+                        ? 'Opted out'
+                        : 'Unknown'}
+                  </span>
+                </div>
+                <div className="business-product-actions">
+                  <button
+                    onClick={() => void updateMyMarketingPreference(pref.customerId, 'opted_in')}
+                    type="button"
+                  >
+                    Opt in
+                  </button>
+                  <button
+                    onClick={() => void updateMyMarketingPreference(pref.customerId, 'opted_out')}
+                    type="button"
+                  >
+                    Opt out
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </>
       );
     }
@@ -2744,7 +4220,10 @@ function App() {
             <button
               className={settingsPanel === section.id ? 'active' : ''}
               key={section.id}
-              onClick={() => setSettingsPanel(section.id)}
+              onClick={() => {
+                setSettingsPanel(section.id);
+                if (section.id === 'privacy') void loadCustomerPreferences();
+              }}
               type="button"
             >
               <strong>{section.title}</strong>
@@ -2882,6 +4361,16 @@ function App() {
 
   return (
     <div className="desktop-shell">
+      <input
+        accept="image/*"
+        className="hidden-input"
+        multiple
+        onChange={(event) => {
+          setCatalogAssetFiles(Array.from(event.target.files ?? []));
+        }}
+        ref={catalogInputRef}
+        type="file"
+      />
       <aside className="rail">
         <div className="rail-icons">
           <button className={`rail-button rail-badged ${activeView === 'chats' ? 'active' : ''}`} onClick={() => setActiveView('chats')} type="button">

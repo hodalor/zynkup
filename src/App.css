@@ -821,6 +821,146 @@
   background: #0d121a;
 }
 
+.business-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+
+.business-tabs button {
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 0;
+  background: #0d121a;
+  color: #dbe5ea;
+  cursor: pointer;
+}
+
+.business-tabs button.active {
+  background: #3b82f6;
+  color: #edf4ff;
+  font-weight: 700;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.metric-card {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid #1d2634;
+  background: #111822;
+  color: #edf4ff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.metric-card strong {
+  font-size: 1.4rem;
+}
+
+.metric-card span {
+  color: #acb3b9;
+  font-size: 0.85rem;
+}
+
+.low-stock-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(248, 113, 113, 0.16);
+  color: #fca5a5;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.consent-badge,
+.follow-up-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-left: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.consent-unknown {
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+}
+
+.consent-opted_in {
+  background: rgba(52, 211, 153, 0.16);
+  color: #6ee7b7;
+}
+
+.consent-opted_out {
+  background: rgba(248, 113, 113, 0.16);
+  color: #fca5a5;
+}
+
+.follow-up-badge {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fcd34d;
+}
+
+.customer-detail {
+  margin-top: 8px;
+}
+
+.business-product-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px 0;
+  border-top: 1px solid #1d2634;
+}
+
+.business-product-row > div:first-child {
+  display: grid;
+  gap: 6px;
+}
+
+.business-product-row small {
+  color: #acb3b9;
+}
+
+.business-product-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.business-product-actions button {
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 0;
+  background: #172228;
+  color: #edf4ff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.receipt-detail {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid #1d2634;
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1638,6 +1778,13 @@
 
 .call-thread small {
   color: #5f7a74;
+}
+
+.call-thread.missed,
+.call-thread.missed strong,
+.call-thread.missed small {
+  background: #fdeceb;
+  color: #d4544c;
 }
 
 .call-stage {
