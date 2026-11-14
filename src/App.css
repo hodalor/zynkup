@@ -608,8 +608,24 @@
   color: #9fb0b7;
 }
 
+.receipt-badge.pending {
+  color: #9fb0b7;
+  letter-spacing: 0;
+  font-weight: 600;
+}
+
 .receipt-badge.read {
   color: #60a5fa;
+}
+
+.outbox-banner {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: #eef3f6;
+  color: #4a5d66;
+  font-size: 0.86rem;
+  text-align: center;
 }
 
 .message-image-button {

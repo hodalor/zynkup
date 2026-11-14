@@ -4,7 +4,25 @@ import { io, Socket } from 'socket.io-client';
 import './App.css';
 
 type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games' | 'events';
-type ReceiptState = 'sent' | 'delivered' | 'read';
+type ReceiptState = 'pending' | 'sent' | 'delivered' | 'read';
+
+type OutboxMessageBody = {
+  chatId: string;
+  senderId: string;
+  clientRef: string;
+  kind: string;
+  text: string;
+  mediaUrls?: string[];
+  replyToMessageId?: string;
+  replyPreview?: string;
+  anonymous?: boolean;
+  durationSeconds?: number;
+};
+
+type OutboxEntry = {
+  clientRef: string;
+  body: OutboxMessageBody;
+};
 type SettingsPanelId =
   | 'favorites'
   | 'business'
@@ -1040,6 +1058,96 @@ const FAVORITES_STORAGE_KEY = 'zynkup-web-favorite-chats';
 const MUTED_CHATS_STORAGE_KEY = 'zynkup-web-muted-chats';
 const ARCHIVED_CHATS_STORAGE_KEY = 'zynkup-web-archived-chats';
 const REACTION_SOUND_MUTED_STORAGE_KEY = 'zynkup-web-reaction-sound-muted-chats';
+const OUTBOX_STORAGE_KEY = 'zynkup-web-outbox';
+const OUTBOX_BACKOFF_MS = [2000, 5000, 15000, 30000];
+const WAITING_FOR_CONNECTION = 'Waiting for connection';
+
+const isPaymentOutboxBody = (body: OutboxMessageBody | Record<string, unknown>) => {
+  const kind = String((body as OutboxMessageBody).kind || '');
+  if (/pay|momo|payment|checkout|order-pay/i.test(kind)) {
+    return true;
+  }
+  const record = body as Record<string, unknown>;
+  return Boolean(record.paymentAction || record.paymentReference || record.paymentMethod);
+};
+
+const readStoredOutbox = (): OutboxEntry[] => {
+  try {
+    const raw = localStorage.getItem(OUTBOX_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((entry): entry is OutboxEntry =>
+      Boolean(
+        entry
+        && typeof entry.clientRef === 'string'
+        && entry.body
+        && typeof entry.body === 'object'
+        && typeof entry.body.chatId === 'string'
+        && typeof entry.body.clientRef === 'string'
+        && !isPaymentOutboxBody(entry.body),
+      ),
+    );
+  } catch {
+    return [];
+  }
+};
+
+const messageFromOutboxEntry = (entry: OutboxEntry, userId: string): Message => {
+  const kindRaw = entry.body.kind;
+  const kind: Message['kind'] =
+    kindRaw === 'image'
+    || kindRaw === 'voice'
+    || kindRaw === 'file'
+    || kindRaw === 'video'
+    || kindRaw === 'call'
+      ? kindRaw
+      : 'text';
+  const mediaUrl = entry.body.mediaUrls?.[0];
+  return {
+    id: `local-${entry.clientRef}`,
+    clientRef: entry.clientRef,
+    sender: 'me',
+    senderId: typeof entry.body.senderId === 'string' ? entry.body.senderId : userId,
+    kind,
+    text: typeof entry.body.text === 'string' ? entry.body.text : '',
+    time: WAITING_FOR_CONNECTION,
+    imageUrl: kind === 'image' ? mediaUrl : undefined,
+    audioUrl: kind === 'voice' ? mediaUrl : undefined,
+    videoUrl: kind === 'video' ? mediaUrl : undefined,
+    durationLabel: entry.body.durationSeconds
+      ? `0:${String(entry.body.durationSeconds).padStart(2, '0')}`
+      : undefined,
+    receiptState: 'pending',
+    replyToMessageId: entry.body.replyToMessageId,
+    replyPreview: entry.body.replyPreview,
+    anonymous: Boolean(entry.body.anonymous),
+  };
+};
+
+const mergeOutboxIntoMessages = (
+  base: Record<string, Message[]>,
+  entries: OutboxEntry[],
+  userId: string,
+): Record<string, Message[]> => {
+  const next: Record<string, Message[]> = { ...base };
+  entries.forEach((entry) => {
+    const chatId = entry.body.chatId;
+    if (!chatId || isPaymentOutboxBody(entry.body)) {
+      return;
+    }
+    const list = next[chatId] ?? [];
+    if (list.some((item) => item.clientRef === entry.clientRef)) {
+      return;
+    }
+    next[chatId] = [...list, messageFromOutboxEntry(entry, userId)];
+  });
+  return next;
+};
 const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const STATUS_REACTIONS = ['❤️', '👍', '👎', '🔥', '😂'];
@@ -1857,6 +1965,12 @@ function App() {
   const recordingTimerRef = useRef<number | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const toastTimeoutRef = useRef<number | null>(null);
+  const outboxRef = useRef<OutboxEntry[]>([]);
+  const outboxFlushLockRef = useRef(false);
+  const outboxBackoffAttemptRef = useRef(0);
+  const outboxBackoffTimerRef = useRef<number | null>(null);
+  const flushOutboxRef = useRef<() => void>(() => undefined);
+  const [outboxCount, setOutboxCount] = useState(0);
   const socketRef = useRef<Socket | null>(null);
   const currentUserIdRef = useRef('');
   const selectedChatIdRef = useRef('');
@@ -2529,6 +2643,124 @@ function App() {
     toastTimeoutRef.current = window.setTimeout(() => setToastMessage(''), duration);
   };
 
+  const rememberOutbox = (items: OutboxEntry[]) => {
+    const safe = items.filter((entry) => entry?.clientRef && entry.body && !isPaymentOutboxBody(entry.body));
+    outboxRef.current = safe;
+    setOutboxCount(safe.length);
+    try {
+      localStorage.setItem(OUTBOX_STORAGE_KEY, JSON.stringify(safe));
+    } catch {
+      // Quota / private mode — keep in-memory queue only.
+    }
+  };
+
+  const clearOutbox = () => {
+    if (outboxBackoffTimerRef.current) {
+      window.clearTimeout(outboxBackoffTimerRef.current);
+      outboxBackoffTimerRef.current = null;
+    }
+    outboxBackoffAttemptRef.current = 0;
+    rememberOutbox([]);
+  };
+
+  const scheduleOutboxRetry = () => {
+    if (outboxBackoffTimerRef.current) {
+      window.clearTimeout(outboxBackoffTimerRef.current);
+    }
+    const delay = OUTBOX_BACKOFF_MS[
+      Math.min(outboxBackoffAttemptRef.current, OUTBOX_BACKOFF_MS.length - 1)
+    ];
+    outboxBackoffAttemptRef.current += 1;
+    outboxBackoffTimerRef.current = window.setTimeout(() => {
+      outboxBackoffTimerRef.current = null;
+      flushOutboxRef.current();
+    }, delay);
+  };
+
+  const flushOutbox = async () => {
+    if (outboxFlushLockRef.current) {
+      return;
+    }
+    if (!outboxRef.current.length) {
+      outboxBackoffAttemptRef.current = 0;
+      return;
+    }
+    outboxFlushLockRef.current = true;
+    let networkFailed = false;
+    try {
+      const queue = [...outboxRef.current];
+      for (const entry of queue) {
+        if (isPaymentOutboxBody(entry.body)) {
+          rememberOutbox(outboxRef.current.filter((item) => item.clientRef !== entry.clientRef));
+          continue;
+        }
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(entry.body),
+          });
+          if (!response.ok) {
+            if (response.status === 400 || response.status === 429) {
+              const failed = await response.json().catch(() => ({} as { error?: string }));
+              showToast(failed.error || 'Message was not sent.');
+              rememberOutbox(outboxRef.current.filter((item) => item.clientRef !== entry.clientRef));
+              setMessagesByChat((current) => ({
+                ...current,
+                [entry.body.chatId]: (current[entry.body.chatId] ?? []).filter(
+                  (item) => item.clientRef !== entry.clientRef,
+                ),
+              }));
+            } else {
+              networkFailed = true;
+            }
+            continue;
+          }
+          const payload = await response.json().catch(() => ({} as { message?: any; anonymousRemaining?: number }));
+          if (payload.message) {
+            reconcileIncomingMessage(entry.body.chatId, payload.message);
+          }
+          if (typeof payload.anonymousRemaining === 'number') {
+            setAnonymousRemaining(payload.anonymousRemaining);
+          }
+          rememberOutbox(outboxRef.current.filter((item) => item.clientRef !== entry.clientRef));
+        } catch {
+          networkFailed = true;
+        }
+      }
+    } finally {
+      outboxFlushLockRef.current = false;
+    }
+    if (networkFailed && outboxRef.current.length) {
+      scheduleOutboxRetry();
+    } else if (!outboxRef.current.length) {
+      outboxBackoffAttemptRef.current = 0;
+    }
+  };
+  flushOutboxRef.current = () => {
+    void flushOutbox();
+  };
+
+  const queueOutgoing = (body: OutboxMessageBody) => {
+    if (!body.clientRef || isPaymentOutboxBody(body)) {
+      return;
+    }
+    const entry: OutboxEntry = { clientRef: body.clientRef, body };
+    const next = [
+      ...outboxRef.current.filter((item) => item.clientRef !== body.clientRef),
+      entry,
+    ];
+    rememberOutbox(next);
+    void flushOutbox();
+  };
+
+  const rehydrateOutboxIntoThread = (entries = outboxRef.current, userId = currentUserId) => {
+    if (!entries.length) {
+      return;
+    }
+    setMessagesByChat((current) => mergeOutboxIntoMessages(current, entries, userId));
+  };
+
   const persistAppSettings = async (nextSettings: typeof DEFAULT_APP_SETTINGS) => {
     appSettingsRef.current = nextSettings;
     setAppSettings(nextSettings);
@@ -2727,6 +2959,7 @@ function App() {
     if (!window.confirm('Clear all local chat history on this browser?')) {
       return;
     }
+    clearOutbox();
     setMessagesByChat({});
     setChatItems((current) => current.map((chat) => ({ ...chat, preview: 'No messages yet', unread: 0, time: '' })));
     showToast('Chat history cleared');
@@ -2998,13 +3231,16 @@ function App() {
     setSelectedChatId((current) =>
       nextChats.some((chat: Chat) => chat.id === current) ? current : nextChats[0]?.id ?? '',
     );
+    const serverMessages = Object.fromEntries(
+      Object.entries(payload.messagesByChat ?? {}).map(([chatId, messageList]) => [
+        chatId,
+        (messageList as any[]).map((message) => mapServerMessage(message, payload.currentUserId ?? '')),
+      ]),
+    );
     setMessagesByChat(
-      Object.fromEntries(
-        Object.entries(payload.messagesByChat ?? {}).map(([chatId, messageList]) => [
-          chatId,
-          (messageList as any[]).map((message) => mapServerMessage(message, payload.currentUserId ?? '')),
-        ]),
-      ),
+      payload.authRequired
+        ? serverMessages
+        : mergeOutboxIntoMessages(serverMessages, outboxRef.current, payload.currentUserId ?? ''),
     );
     setCatalogItems(
       (payload.catalogItems ?? []).map((item: any) => mapCatalogItemFromServer(item, nextUsers)),
@@ -3019,6 +3255,7 @@ function App() {
     setStatuses(payload.statuses ?? []);
     setUpdatesFeed(payload.updatesFeed ?? []);
     if (payload.authRequired) {
+      clearOutbox();
       setLinkStatus((current) => (current === 'pin_required' ? current : 'idle'));
       setDesktopPin('');
       setLinkedDevices([]);
@@ -3883,18 +4120,32 @@ function App() {
       socket.emit('presence:update', { userId, presence: focused ? 'online' : 'offline' });
     };
     currentUserIdRef.current = currentUserId;
-    socket.on('connect', joinUser);
+    const onSocketConnect = () => {
+      joinUser();
+      flushOutboxRef.current();
+    };
+    socket.on('connect', onSocketConnect);
     joinUser();
     const onVisibility = () => {
-      socket.emit('user:focus', { focused: document.visibilityState === 'visible' });
+      const visible = document.visibilityState === 'visible';
+      socket.emit('user:focus', { focused: visible });
+      if (visible) {
+        flushOutboxRef.current();
+      }
+    };
+    const onOnline = () => {
+      flushOutboxRef.current();
     };
     document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('online', onOnline);
     if (currentUserId) {
       socket.emit('presence:update', { userId: currentUserId, presence: 'online' });
     }
+    flushOutboxRef.current();
 
     return () => {
       document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('online', onOnline);
       if (currentUserId) {
         socket.emit('user:focus', { focused: false });
         socket.emit('presence:update', { userId: currentUserId, presence: 'offline' });
@@ -3956,6 +4207,13 @@ function App() {
       }
     } catch {
       // Keep defaults.
+    }
+    const storedOutbox = readStoredOutbox();
+    if (storedOutbox.length) {
+      outboxRef.current = storedOutbox;
+      setOutboxCount(storedOutbox.length);
+      rehydrateOutboxIntoThread(storedOutbox, currentUserIdRef.current);
+      flushOutboxRef.current();
     }
     if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
       void Notification.requestPermission().catch(() => undefined);
@@ -4344,15 +4602,17 @@ function App() {
     }
 
     const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
+    const clientRef = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const text = messageDraft.trim();
     const optimistic: Message = {
-      id: `local-${Date.now()}`,
-      clientRef: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: `local-${clientRef}`,
+      clientRef,
       sender: 'me',
       senderId: currentUserId,
       kind: 'text',
-      text: messageDraft.trim(),
-      time: 'Now',
-      receiptState: 'sent',
+      text,
+      time: WAITING_FOR_CONNECTION,
+      receiptState: 'pending',
       replyToMessageId: replyTarget?.id,
       replyPreview: replyTarget?.text?.slice(0, 140),
       anonymous: sendAnonymous,
@@ -4363,40 +4623,17 @@ function App() {
       [activeChat.id]: [...(current[activeChat.id] ?? []), optimistic],
     }));
     emitTyping(false);
-    const chatId = activeChat.id;
-    fetch(`${API_BASE_URL}/api/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId,
-        senderId: currentUserId,
-        clientRef: optimistic.clientRef,
-        kind: 'text',
-        text: messageDraft.trim(),
-        mediaUrls: [],
-        replyToMessageId: replyTarget?.id,
-        replyPreview: replyTarget?.text?.slice(0, 140),
-        anonymous: sendAnonymous,
-      }),
-    })
-      .then(async (response) => {
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          showToast(payload.error || 'Could not send message');
-          return;
-        }
-        if (typeof payload.anonymousRemaining === 'number') {
-          setAnonymousRemaining(payload.anonymousRemaining);
-          showToast(
-            `${payload.anonymousRemaining} anonymous message${payload.anonymousRemaining === 1 ? '' : 's'} left today in this room`,
-            2800,
-          );
-        }
-        if (payload.message) {
-          reconcileIncomingMessage(chatId, payload.message);
-        }
-      })
-      .catch(() => undefined);
+    queueOutgoing({
+      chatId: activeChat.id,
+      senderId: currentUserId,
+      clientRef,
+      kind: 'text',
+      text,
+      mediaUrls: [],
+      replyToMessageId: replyTarget?.id,
+      replyPreview: replyTarget?.text?.slice(0, 140),
+      anonymous: sendAnonymous,
+    });
     setMessageDraft('');
     setReplyTarget(null);
   };
@@ -5987,16 +6224,17 @@ function App() {
     const objectUrl = URL.createObjectURL(file);
     const clientRef = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
+    const kind = file.type.startsWith('image/') ? 'image' as const : 'file' as const;
     const message: Message = {
-      id: `m${Date.now()}`,
+      id: `local-${clientRef}`,
       clientRef,
       sender: 'me',
       senderId: currentUserId,
-      kind: file.type.startsWith('image/') ? 'image' : 'file',
+      kind,
       text: file.name,
-      time: 'Now',
-      imageUrl: file.type.startsWith('image/') ? objectUrl : undefined,
-      receiptState: 'sent',
+      time: WAITING_FOR_CONNECTION,
+      imageUrl: kind === 'image' ? objectUrl : undefined,
+      receiptState: 'pending',
       anonymous: sendAnonymous,
     };
 
@@ -6007,34 +6245,15 @@ function App() {
     event.target.value = '';
     const uploadedUrls = await uploadFiles([file]).catch(() => []);
     const chatId = activeChat.id;
-
-    fetch(`${API_BASE_URL}/api/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chatId,
-        senderId: currentUserId,
-        clientRef,
-        kind: file.type.startsWith('image/') ? 'image' : 'file',
-        text: file.name,
-        mediaUrls: uploadedUrls.length ? uploadedUrls : [objectUrl],
-        anonymous: sendAnonymous,
-      }),
-    })
-      .then(async (response) => {
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          showToast(payload.error || 'Could not send attachment');
-          return;
-        }
-        if (typeof payload.anonymousRemaining === 'number') {
-          setAnonymousRemaining(payload.anonymousRemaining);
-        }
-        if (payload.message) {
-          reconcileIncomingMessage(chatId, payload.message);
-        }
-      })
-      .catch(() => undefined);
+    queueOutgoing({
+      chatId,
+      senderId: currentUserId,
+      clientRef,
+      kind,
+      text: file.name,
+      mediaUrls: uploadedUrls.length ? uploadedUrls : [objectUrl],
+      anonymous: sendAnonymous,
+    });
   };
 
   const insertEmoji = (emoji: string) => {
@@ -6076,51 +6295,46 @@ function App() {
           [chatId]: [
             ...(current[chatId] ?? []),
             {
-              id: `m${Date.now()}`,
+              id: `local-${clientRef}`,
               clientRef,
               sender: 'me' as const,
               senderId: currentUserId,
               kind: 'voice' as const,
               text: 'Voice note',
-              time: 'Now',
+              time: WAITING_FOR_CONNECTION,
               audioUrl,
               durationLabel: formatDurationLabel(durationSeconds),
-              receiptState: 'sent' as const,
+              receiptState: 'pending' as const,
               anonymous: sendAnonymous,
             },
           ],
         }));
         const file = new File([blob], `voice-${Date.now()}.webm`, { type: 'audio/webm' });
         uploadFiles([file])
-          .then((uploadedUrls) =>
-            fetch(`${API_BASE_URL}/api/messages`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chatId,
-                senderId: currentUserId,
-                clientRef,
-                kind: 'voice',
-                text: 'Voice note',
-                mediaUrls: uploadedUrls.length ? uploadedUrls : [audioUrl],
-                durationSeconds,
-                anonymous: sendAnonymous,
-              }),
-            }).then(async (response) => {
-              const payload = await response.json().catch(() => ({}));
-              if (!response.ok) {
-                showToast(payload.error || 'Could not send voice note');
-                return;
-              }
-              if (typeof payload.anonymousRemaining === 'number') {
-                setAnonymousRemaining(payload.anonymousRemaining);
-              }
-              if (payload.message) {
-                reconcileIncomingMessage(chatId, payload.message);
-              }
-            }),
-          )
-          .catch(() => undefined);
+          .then((uploadedUrls) => {
+            queueOutgoing({
+              chatId,
+              senderId: currentUserId,
+              clientRef,
+              kind: 'voice',
+              text: 'Voice note',
+              mediaUrls: uploadedUrls.length ? uploadedUrls : [audioUrl],
+              durationSeconds,
+              anonymous: sendAnonymous,
+            });
+          })
+          .catch(() => {
+            queueOutgoing({
+              chatId,
+              senderId: currentUserId,
+              clientRef,
+              kind: 'voice',
+              text: 'Voice note',
+              mediaUrls: [audioUrl],
+              durationSeconds,
+              anonymous: sendAnonymous,
+            });
+          });
         if (recordingTimerRef.current) {
           window.clearInterval(recordingTimerRef.current);
           recordingTimerRef.current = null;
@@ -6236,6 +6450,14 @@ function App() {
   const renderReceipt = (message: Message) => {
     if (message.sender !== 'me') {
       return null;
+    }
+
+    if (message.receiptState === 'pending') {
+      return (
+        <span className="receipt-badge pending" title={WAITING_FOR_CONNECTION} aria-label={WAITING_FOR_CONNECTION}>
+          ◌
+        </span>
+      );
     }
 
     const glyph = message.receiptState === 'sent' ? '✓' : '✓✓';
@@ -10659,6 +10881,13 @@ function App() {
         ) : null}
 
         <section className="desktop-canvas">
+          {outboxCount > 0 ? (
+            <div className="outbox-banner" role="status">
+              {outboxCount === 1
+                ? '1 message waiting for connection'
+                : `${outboxCount} messages waiting for connection`}
+            </div>
+          ) : null}
           {messages.map((message) => (
             message.kind === 'call' ? (
               <button
@@ -10870,8 +11099,12 @@ function App() {
                 );
               })()}
               <div className="message-meta">
-                <span>{message.time}</span>
-                {appSettings.readReceiptsEnabled ? renderReceipt(message) : null}
+                <span>
+                  {message.receiptState === 'pending' ? WAITING_FOR_CONNECTION : message.time}
+                </span>
+                {message.receiptState === 'pending' || appSettings.readReceiptsEnabled
+                  ? renderReceipt(message)
+                  : null}
               </div>
               {message.anonymous
               && !message.deletedForEveryone
@@ -13040,7 +13273,23 @@ function App() {
             (value) => updateAppSetting('dataSaver', value),
             'Show still profile photos instead of short looping videos',
           )}
-          <button className="settings-list-row" onClick={() => { setCatalogAssetFiles([]); setStatusAssetFiles([]); showToast('Local media cache cleared'); }} type="button">
+          <button
+            className="settings-list-row"
+            onClick={() => {
+              setCatalogAssetFiles([]);
+              setStatusAssetFiles([]);
+              clearOutbox();
+              setMessagesByChat((current) => {
+                const next: Record<string, Message[]> = {};
+                Object.entries(current).forEach(([chatId, list]) => {
+                  next[chatId] = list.filter((message) => message.receiptState !== 'pending');
+                });
+                return next;
+              });
+              showToast('Local media cache and outgoing queue cleared');
+            }}
+            type="button"
+          >
             Clear cache
           </button>
         </>
