@@ -164,7 +164,7 @@ const DEFAULT_APP_SETTINGS = {
 };
 const SETTINGS_MENU = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top', icon: '★' },
-  { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, broadcast', icon: '⌂' },
+  { id: 'business', title: 'Business tools', subtitle: 'Catalog, quotes, customers, broadcast', icon: '⌂' },
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations', icon: '▤' },
   { id: 'account', title: 'Account', subtitle: 'Security, phone number, delete account', icon: '◎' },
   { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, lock, block, disappearing', icon: '◌' },
@@ -413,6 +413,14 @@ const VOICE_RECORDER_AUDIO_SET = {
   AVSampleRateKeyIOS: 44100,
 };
 
+const TRANSLATE_TARGET_OPTIONS = [
+  { code: 'en', label: 'English' },
+  { code: 'tw', label: 'Twi' },
+  { code: 'ga', label: 'Ga' },
+  { code: 'ee', label: 'Ewe' },
+  { code: 'pcm', label: 'Pidgin' },
+];
+
 const fetchWithTimeout = async (url, options = {}, timeoutMs = BOOTSTRAP_TIMEOUT_MS) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -519,6 +527,33 @@ function AppContent() {
   const [showArchivedChats, setShowArchivedChats] = useState(false);
   const [replyTarget, setReplyTarget] = useState(null);
   const [messageActionTarget, setMessageActionTarget] = useState(null);
+  const [aiSuggestions, setAiSuggestions] = useState([]);
+  const [aiRewriteVariants, setAiRewriteVariants] = useState([]);
+  const [aiRewriteTone, setAiRewriteTone] = useState('polite');
+  const [aiAssistBusy, setAiAssistBusy] = useState(false);
+  const [aiHelperSheetVisible, setAiHelperSheetVisible] = useState(false);
+  const [aiHelperTask, setAiHelperTask] = useState('draft');
+  const [aiHelperPrompt, setAiHelperPrompt] = useState('');
+  const [aiHelperConsent, setAiHelperConsent] = useState(false);
+  const [aiHelperTargetLang, setAiHelperTargetLang] = useState('en');
+  const [aiHelperBusy, setAiHelperBusy] = useState(false);
+  const [aiHelperPayload, setAiHelperPayload] = useState(null);
+  const [messageTranslations, setMessageTranslations] = useState({});
+  const [translateBusyId, setTranslateBusyId] = useState('');
+  const [translatePickerId, setTranslatePickerId] = useState('');
+  const [transcribeBusyId, setTranscribeBusyId] = useState('');
+  const [summarySheetVisible, setSummarySheetVisible] = useState(false);
+  const [summaryScope, setSummaryScope] = useState('unread');
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  const [summaryResult, setSummaryResult] = useState(null);
+  const [dictateSheetVisible, setDictateSheetVisible] = useState(false);
+  const [dictateDraft, setDictateDraft] = useState('');
+  const [dictateBusy, setDictateBusy] = useState(false);
+  const [scamWarningBanner, setScamWarningBanner] = useState(null);
+  const [orderDeliveryDraft, setOrderDeliveryDraft] = useState({
+    deliveryReference: '',
+    fulfilmentNote: '',
+  });
   const [peerTypingByChat, setPeerTypingByChat] = useState({});
   const [chatCameraVisible, setChatCameraVisible] = useState(false);
   const [feedbackDraft, setFeedbackDraft] = useState('');
@@ -578,8 +613,39 @@ function AppContent() {
   const [statusProductSeller, setStatusProductSeller] = useState(null);
   const [statusOrderQuantity, setStatusOrderQuantity] = useState('1');
   const [statusVariantPicks, setStatusVariantPicks] = useState({});
-  const [businessPanel, setBusinessPanel] = useState(''); // '' | catalog | customers | receipts | broadcast | orders | profile | dashboard | inventory
+  const [businessPanel, setBusinessPanel] = useState(''); // '' | catalog | customers | receipts | broadcast | documents | orders | profile | dashboard | inventory | autoreplies | businessai
+  const [autoReplyConfig, setAutoReplyConfig] = useState(null);
+  const [autoReplyLogs, setAutoReplyLogs] = useState([]);
+  const [autoReplyRuleDraft, setAutoReplyRuleDraft] = useState({ keywords: '', response: '' });
+  const [businessAiConfig, setBusinessAiConfig] = useState(null);
+  const [businessAiFaqDraft, setBusinessAiFaqDraft] = useState({ question: '', answer: '' });
+  const [businessAiAskDraft, setBusinessAiAskDraft] = useState('');
+  const [businessAiAskResult, setBusinessAiAskResult] = useState(null);
+  const [businessAiBusy, setBusinessAiBusy] = useState(false);
   const [broadcastDraft, setBroadcastDraft] = useState('');
+  const [broadcastSegment, setBroadcastSegment] = useState('opted_in');
+  const [broadcastCampaigns, setBroadcastCampaigns] = useState([]);
+  const [broadcastAudiencePreview, setBroadcastAudiencePreview] = useState({
+    opted_in: 0,
+    repeat_buyers: 0,
+    all_customers: 0,
+  });
+  const [commerceDocuments, setCommerceDocuments] = useState([]);
+  const [selectedDocument, setSelectedDocument] = useState(null);
+  const [documentKindFilter, setDocumentKindFilter] = useState('all');
+  const [documentForm, setDocumentForm] = useState({
+    kind: 'quotation',
+    customerName: '',
+    customerPhone: '',
+    lineTitle: '',
+    lineQty: '1',
+    linePrice: '',
+    discountAmount: '',
+    taxAmount: '',
+    notes: '',
+    expiresAt: '',
+    dueAt: '',
+  });
   const [commerceOrders, setCommerceOrders] = useState([]);
   const [saleReceipts, setSaleReceipts] = useState([]);
   const [orderDetail, setOrderDetail] = useState(null);
@@ -695,6 +761,7 @@ function AppContent() {
   const phoneAuthProviderRef = useRef(''); // 'firebase' | 'backend'
   const forgotPinFlowRef = useRef(false);
   const toastTimeoutRef = useRef(null);
+  const presentScamWarningRef = useRef(() => undefined);
   const appSettingsRef = useRef(DEFAULT_APP_SETTINGS);
   const currentUserIdRef = useRef('');
   const pinHoldingRef = useRef(false);
@@ -951,6 +1018,30 @@ function AppContent() {
     }
   };
 
+  const presentScamWarning = (chatId, messageId, warning) => {
+    if (!warning?.risky) {
+      return;
+    }
+    const signals = warning.signals || [];
+    const pinAsk = signals.some((entry) => entry.code === 'pin_request');
+    const advice = warning.advice
+      || (pinAsk
+        ? 'Never share MoMo PINs or OTPs.'
+        : 'Be careful with this message.');
+    const label = pinAsk
+      ? `Security tip: this message may ask for a PIN/OTP. ${advice}`
+      : `Security tip (${warning.severity || 'risk'}): ${advice}`;
+    if (
+      chatScreenRef.current === 'detail'
+      && selectedChatIdRef.current
+      && selectedChatIdRef.current === chatId
+    ) {
+      setScamWarningBanner({ chatId, messageId, warning });
+    }
+    showToast(label, 'error', pinAsk ? 5600 : 4200);
+  };
+  presentScamWarningRef.current = presentScamWarning;
+
   const persistAppSettings = async (nextSettings) => {
     appSettingsRef.current = nextSettings;
     setAppSettings(nextSettings);
@@ -1108,6 +1199,8 @@ function AppContent() {
       durationLabel: message.durationSeconds ? getAudioDurationLabel(message.durationSeconds * 1000) : undefined,
       durationSeconds: message.durationSeconds,
       catalogItemId: message.catalogItemId,
+      documentId: message.documentId,
+      documentKind: message.documentKind,
       receiptId: message.receiptId,
       receiptState: message.state,
       senderId: message.senderId,
@@ -1119,6 +1212,10 @@ function AppContent() {
       deletedForEveryone: deleted,
       callKind: message.callKind,
       callState: message.callState,
+      transcript: message.transcript,
+      transcriptStatus: message.transcriptStatus,
+      transcriptLanguage: message.transcriptLanguage,
+      transcriptUpdatedAt: message.transcriptUpdatedAt,
     };
   };
 
@@ -2635,6 +2732,9 @@ function AppContent() {
     void loadInventoryAlerts(currentUserId);
     void loadBusinessCustomers(currentUserId);
     void loadCustomerPreferences(currentUserId);
+    void loadAutoReplyConfig(currentUserId);
+    void loadCommerceDocuments(currentUserId);
+    void loadBroadcastCampaigns(currentUserId);
   }, [currentUserId, authRequired]);
 
   useEffect(() => {
@@ -3045,6 +3145,12 @@ function AppContent() {
       }
       reconcileIncomingMessage(message.chatId, message);
     });
+    socket.on('message:scamWarning', ({ chatId, messageId, warning }) => {
+      if (!warning?.risky || !chatId) {
+        return;
+      }
+      presentScamWarningRef.current(chatId, messageId, warning);
+    });
     socket.on('typing:update', ({ chatId, userId, typing }) => {
       if (!chatId || userId === currentUserIdRef.current) {
         return;
@@ -3273,6 +3379,35 @@ function AppContent() {
       setBusinessCustomers((current) => [customer, ...current.filter((entry) => entry.id !== customer.id)]);
       setSelectedCustomer((current) => (current?.id === customer.id ? customer : current));
     });
+    socket.on('autoReply:updated', ({ config }) => {
+      if (config) setAutoReplyConfig(config);
+    });
+    socket.on('businessAi:updated', ({ config }) => {
+      if (config) setBusinessAiConfig(config);
+    });
+    socket.on('document:updated', ({ document }) => {
+      if (!document?.id) return;
+      setCommerceDocuments((current) => [document, ...current.filter((entry) => entry.id !== document.id)]);
+      setSelectedDocument((current) => (current?.id === document.id ? document : current));
+    });
+    socket.on('broadcast:updated', ({ campaign }) => {
+      if (!campaign?.id) return;
+      setBroadcastCampaigns((current) => [campaign, ...current.filter((entry) => entry.id !== campaign.id)]);
+    });
+    socket.on('autoReply:sent', ({ log, message: autoMessage }) => {
+      if (log?.id) {
+        setAutoReplyLogs((current) => [log, ...current.filter((entry) => entry.id !== log.id)].slice(0, 100));
+      }
+      if (autoMessage?.chatId && autoMessage?.id) {
+        setMessagesByChat((current) => ({
+          ...current,
+          [autoMessage.chatId]: [...(current[autoMessage.chatId] || []).filter((entry) => entry.id !== autoMessage.id), {
+            ...autoMessage,
+            mine: autoMessage.senderId === currentUserId,
+          }],
+        }));
+      }
+    });
     socket.on('message:receiptUpdated', (message) => {
       setMessagesByChat((current) => ({
         ...current,
@@ -3285,6 +3420,12 @@ function AppContent() {
             : item,
         ),
       }));
+    });
+    socket.on('message:transcript', ({ message }) => {
+      if (!message?.chatId || !message?.id) {
+        return;
+      }
+      reconcileIncomingMessage(message.chatId, message);
     });
     socket.on('status:updated', (status) => {
       upsertStatus(status);
@@ -3734,6 +3875,9 @@ function AppContent() {
     chatListTab,
     settingsPanel,
     chatMenuVisible,
+    summarySheetVisible,
+    dictateSheetVisible,
+    aiHelperSheetVisible,
     peerProfileVisible,
     avatarPrompt,
     photoPreview,
@@ -3826,6 +3970,18 @@ function AppContent() {
       }
       if (state.chatMenuVisible) {
         setChatMenuVisible(false);
+        return true;
+      }
+      if (state.summarySheetVisible) {
+        setSummarySheetVisible(false);
+        return true;
+      }
+      if (state.dictateSheetVisible) {
+        setDictateSheetVisible(false);
+        return true;
+      }
+      if (state.aiHelperSheetVisible) {
+        setAiHelperSheetVisible(false);
         return true;
       }
       if (state.mediaViewer) {
@@ -4141,6 +4297,13 @@ function AppContent() {
           if (payload.message) {
             reconcileIncomingMessage(body.chatId, payload.message);
           }
+          if (payload.scamWarning?.risky) {
+            presentScamWarning(
+              body.chatId,
+              payload.message?.id || entry.clientRef,
+              payload.scamWarning,
+            );
+          }
           await rememberOutbox(outboxRef.current.filter((item) => item.clientRef !== entry.clientRef));
         } catch {
           // Leave the message pending until the network returns.
@@ -4179,6 +4342,14 @@ function AppContent() {
     }
     setSelectedChatId(chatId);
     setMessageDraft(identityDraftsRef.current[chatId] || '');
+    setAiSuggestions([]);
+    setAiRewriteVariants([]);
+    setSummaryResult(null);
+    setSummarySheetVisible(false);
+    setDictateSheetVisible(false);
+    setAiHelperSheetVisible(false);
+    setAiHelperPayload(null);
+    setScamWarningBanner((current) => (current?.chatId === chatId ? current : null));
     setChatScreen('detail');
   };
 
@@ -4196,6 +4367,14 @@ function AppContent() {
     }
     setSelectedChatId(chatId);
     setMessageDraft(identityDraftsRef.current[chatId] || '');
+    setAiSuggestions([]);
+    setAiRewriteVariants([]);
+    setSummaryResult(null);
+    setSummarySheetVisible(false);
+    setDictateSheetVisible(false);
+    setAiHelperSheetVisible(false);
+    setAiHelperPayload(null);
+    setScamWarningBanner((current) => (current?.chatId === chatId ? current : null));
     setChatScreen('detail');
   };
 
@@ -4494,13 +4673,20 @@ function AppContent() {
     }
   };
 
-  const updateCommerceOrderState = async (order, nextState) => {
+  const updateCommerceOrderState = async (order, nextState, extras = {}) => {
     if (!order?.id || !currentUserId) return;
     try {
+      const body = { userId: currentUserId, state: nextState };
+      if (extras.deliveryReference !== undefined) {
+        body.deliveryReference = extras.deliveryReference || null;
+      }
+      if (extras.fulfilmentNote !== undefined) {
+        body.fulfilmentNote = extras.fulfilmentNote || null;
+      }
       const response = await fetch(`${API_BASE_URL}/api/orders/${encodeURIComponent(order.id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUserId, state: nextState }),
+        body: JSON.stringify(body),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -4509,6 +4695,10 @@ function AppContent() {
       }
       setCommerceOrders((current) => current.map((entry) => (entry.id === payload.order.id ? payload.order : entry)));
       setOrderDetail(payload.order);
+      setOrderDeliveryDraft({
+        deliveryReference: payload.order?.deliveryReference || '',
+        fulfilmentNote: payload.order?.fulfilmentNote || '',
+      });
       if (payload.receipt) {
         setSaleReceipts((current) => [payload.receipt, ...current.filter((item) => item.id !== payload.receipt.id)]);
         showToast(`Paid. Receipt ${payload.receipt.receiptNumber} issued.`, 'success', 4200);
@@ -4518,6 +4708,23 @@ function AppContent() {
     } catch {
       showToast('Could not update the order.', 'error');
     }
+  };
+
+  const openOrderDetail = (order) => {
+    setOrderDetail(order);
+    setOrderDeliveryDraft({
+      deliveryReference: order?.deliveryReference || '',
+      fulfilmentNote: order?.fulfilmentNote || '',
+    });
+  };
+
+  const runSellerOrderAction = (order, nextState) => {
+    const extras = {};
+    if (nextState === 'dispatched' || order?.state === 'dispatched' || nextState === 'completed') {
+      extras.deliveryReference = orderDeliveryDraft.deliveryReference.trim();
+      extras.fulfilmentNote = orderDeliveryDraft.fulfilmentNote.trim();
+    }
+    void updateCommerceOrderState(order, nextState, extras);
   };
 
   const orderStateLabel = (state) => String(state || '').replace(/_/g, ' ');
@@ -4606,6 +4813,373 @@ function AppContent() {
     }
   };
 
+  const clearAiAssist = () => {
+    setAiSuggestions([]);
+    setAiRewriteVariants([]);
+  };
+
+  const openAiHelperSheet = (task = 'draft') => {
+    setAiHelperTask(task);
+    setAiHelperPrompt(messageDraft || '');
+    setAiHelperConsent(false);
+    setAiHelperPayload(null);
+    setAiHelperSheetVisible(true);
+  };
+
+  const applyAiHelperToDraft = (text) => {
+    const next = String(text || '').trim();
+    if (!next) {
+      showToast('Nothing to put in the draft.', 'info');
+      return;
+    }
+    setMessageDraft(next);
+    clearAiAssist();
+    setAiHelperSheetVisible(false);
+    showToast('Added to draft. Nothing was sent.', 'info', 2600);
+  };
+
+  const runAiHelper = async () => {
+    if (!currentUserId || aiHelperBusy) return;
+    const needsChat = aiHelperTask === 'suggest_reply' || aiHelperTask === 'summarise';
+    const shareContext = needsChat || aiHelperConsent;
+    if (shareContext && !aiHelperConsent) {
+      showToast('Tick consent to share chat context with the assistant.', 'info', 3200);
+      return;
+    }
+    if (needsChat && !selectedChatId) {
+      showToast('Open a chat first.', 'info');
+      return;
+    }
+    setAiHelperBusy(true);
+    setAiHelperPayload(null);
+    try {
+      const body = {
+        userId: currentUserId,
+        task: aiHelperTask,
+        prompt: aiHelperPrompt.trim() || undefined,
+        text: aiHelperPrompt.trim() || messageDraft.trim() || undefined,
+        tone: aiRewriteTone || undefined,
+        targetLanguage: aiHelperTask === 'translate' ? aiHelperTargetLang : undefined,
+        consentToShareContext: shareContext ? true : false,
+      };
+      if (shareContext && selectedChatId) {
+        body.chatId = selectedChatId;
+      }
+      if (shareContext && replyTarget?.id) {
+        body.messageId = replyTarget.id;
+      }
+      const response = await fetch(`${API_BASE_URL}/api/ai/assistant`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (payload.requiresConsent) {
+          showToast(payload.error || 'Consent required to share chat context.', 'info', 3600);
+        } else {
+          showToast(payload.error || 'AI helper failed.', 'error');
+        }
+        return;
+      }
+      setAiHelperPayload(payload);
+      if (payload.suggestions?.length) {
+        setAiSuggestions(payload.suggestions.slice(0, 4));
+        setAiRewriteVariants([]);
+      }
+      if (payload.result && (aiHelperTask === 'draft' || aiHelperTask === 'rewrite' || aiHelperTask === 'translate')) {
+        // Keep in sheet for review — never auto-send.
+      }
+      if (payload.notice) {
+        showToast(payload.notice, 'info', 3200);
+      }
+    } catch {
+      showToast('AI helper failed.', 'error');
+    } finally {
+      setAiHelperBusy(false);
+    }
+  };
+
+  const requestSuggestedReplies = async () => {
+    if (!selectedChatId || !currentUserId || aiAssistBusy) {
+      return;
+    }
+    setAiAssistBusy(true);
+    setAiRewriteVariants([]);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/suggest-replies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          chatId: selectedChatId,
+          messageId: replyTarget?.id || undefined,
+          tone: aiRewriteTone || 'polite',
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not suggest replies.', 'error');
+        return;
+      }
+      const suggestions = (payload.suggestions || []).slice(0, 4);
+      setAiSuggestions(suggestions);
+      if (payload.notice) {
+        showToast(payload.notice, 'info', 3200);
+      }
+      if (!suggestions.length) {
+        showToast('No suggestions available.', 'info');
+      }
+    } catch {
+      showToast('Could not suggest replies.', 'error');
+    } finally {
+      setAiAssistBusy(false);
+    }
+  };
+
+  const requestRewriteDraft = async () => {
+    const text = messageDraft.trim();
+    if (!text || !currentUserId || aiAssistBusy) {
+      if (!text) {
+        showToast('Type a message first, then rewrite.', 'info');
+      }
+      return;
+    }
+    setAiAssistBusy(true);
+    setAiSuggestions([]);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/rewrite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          tone: aiRewriteTone || 'polite',
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not rewrite.', 'error');
+        return;
+      }
+      const variants = payload.variants || [];
+      setAiRewriteVariants(variants);
+      if (variants.length === 1) {
+        setMessageDraft(variants[0].text);
+        clearAiAssist();
+        showToast('Draft rewritten. Review before sending.', 'success', 2600);
+      } else if (variants.length > 1) {
+        showToast(payload.notice || 'Pick a rewrite. Nothing is sent automatically.', 'info', 3200);
+      } else {
+        showToast('No rewrite variants returned.', 'info');
+      }
+    } catch {
+      showToast('Could not rewrite.', 'error');
+    } finally {
+      setAiAssistBusy(false);
+    }
+  };
+
+  const applyAiSuggestion = (text) => {
+    if (!text) return;
+    setMessageDraft(text);
+    clearAiAssist();
+    showToast('Suggestion added to draft. Nothing was sent.', 'info', 2200);
+  };
+
+  const requestVoiceTranscript = async (message) => {
+    if (!message?.id || !currentUserId || transcribeBusyId === message.id) {
+      return;
+    }
+    setTranscribeBusyId(message.id);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}/transcribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      const nextMessage = payload.message;
+      if (nextMessage?.id) {
+        reconcileIncomingMessage(nextMessage.chatId || message.chatId || selectedChatId, nextMessage);
+      }
+      if (payload.needsProvider) {
+        showToast(payload.notice || 'Speech transcription is not set up yet.', 'info', 3600);
+      } else if (!response.ok) {
+        showToast(payload.error || 'Could not transcribe this voice note.', 'error');
+      } else if (payload.notice && !payload.cached) {
+        showToast(payload.notice, 'info', 2600);
+      }
+    } catch {
+      showToast('Could not transcribe this voice note.', 'error');
+    } finally {
+      setTranscribeBusyId('');
+    }
+  };
+
+  const requestMessageTranslation = async (message, targetLanguage = 'en') => {
+    const text = (message?.text || '').trim();
+    if (!text || !currentUserId || !message?.id || translateBusyId === message.id) {
+      if (!text) {
+        showToast('Nothing to translate on this message.', 'info');
+      }
+      return;
+    }
+    setTranslateBusyId(message.id);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/translate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          targetLanguage,
+          sourceLanguage: 'auto',
+          messageId: message.id,
+          chatId: selectedChatId || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok && !payload.translatedText) {
+        showToast(payload.error || 'Could not translate.', 'error');
+        return;
+      }
+      if (payload.translatedText) {
+        setMessageTranslations((current) => ({
+          ...current,
+          [message.id]: {
+            translatedText: payload.translatedText,
+            targetLanguage: payload.targetLanguage || targetLanguage,
+            method: payload.method,
+            partial: Boolean(payload.partial),
+            needsProvider: Boolean(payload.needsProvider),
+            notice: payload.notice || '',
+          },
+        }));
+      }
+      if (payload.needsProvider || payload.partial) {
+        showToast(payload.notice || 'Translation may be incomplete.', 'info', 3200);
+      } else if (payload.notice) {
+        showToast(payload.notice, 'info', 2200);
+      }
+    } catch {
+      showToast('Could not translate.', 'error');
+    } finally {
+      setTranslateBusyId('');
+    }
+  };
+
+  const pickTranslateLanguage = (message) => {
+    if (!message?.id) {
+      return;
+    }
+    setMessageActionTarget(null);
+    setTranslatePickerId(message.id);
+  };
+
+  const scrollToMessageId = (messageId) => {
+    if (!messageId) {
+      return;
+    }
+    const node = messageNodeRefs.current[messageId];
+    const scroller = threadRef.current;
+    if (!node || !scroller?.scrollTo) {
+      showToast('That message is not in the open thread.', 'info');
+      return;
+    }
+    stickToLatestRef.current = false;
+    node.measureLayout(
+      scroller,
+      (_x, y) => scroller.scrollTo({ y: Math.max(0, y - 24), animated: true }),
+      () => showToast('Could not jump to that message.', 'info'),
+    );
+  };
+
+  const requestChatSummary = async (scope = 'unread') => {
+    if (!selectedChatId || !currentUserId || summaryBusy) {
+      return;
+    }
+    setSummaryScope(scope);
+    setSummarySheetVisible(true);
+    setSummaryBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/summarize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          chatId: selectedChatId,
+          scope,
+          limit: scope === 'recent' ? 80 : 120,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not summarise this chat.', 'error');
+        return;
+      }
+      setSummaryResult(payload);
+    } catch {
+      showToast('Could not summarise this chat.', 'error');
+    } finally {
+      setSummaryBusy(false);
+    }
+  };
+
+  const openDictateSheet = () => {
+    setDictateDraft(messageDraft);
+    setDictateSheetVisible(true);
+  };
+
+  const useDictateInComposer = (text) => {
+    const next = String(text || '').trim();
+    if (!next) {
+      showToast('Add dictation text first.', 'info');
+      return;
+    }
+    setMessageDraft(next);
+    setDictateSheetVisible(false);
+    showToast('Draft filled. Review before send — nothing was sent.', 'info', 2800);
+  };
+
+  const normalizeDictateDraft = async () => {
+    const text = dictateDraft.trim();
+    if (!text || !currentUserId || dictateBusy) {
+      if (!text) {
+        showToast('Speak with the keyboard mic, or paste text first.', 'info');
+      }
+      return;
+    }
+    setDictateBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/dictate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not normalize dictation.', 'error');
+        return;
+      }
+      const next = String(payload.text || text).trim();
+      setDictateDraft(next);
+      setMessageDraft(next);
+      showToast(
+        payload.notice || 'Draft updated. Review before send — nothing was sent.',
+        'success',
+        3000,
+      );
+    } catch {
+      showToast('Could not normalize dictation.', 'error');
+    } finally {
+      setDictateBusy(false);
+    }
+  };
+
   const sendMessage = () => {
     if (!messageDraft.trim() || !selectedChatId) {
       return;
@@ -4657,6 +5231,7 @@ function AppContent() {
     setMessageDraft('');
     setReplyTarget(null);
     setEmojiTrayVisible(false);
+    clearAiAssist();
 
     if (kind === 'emoji') {
       playEmojiMessage(message);
@@ -5062,6 +5637,184 @@ function AppContent() {
     }
   };
 
+  const loadAutoReplyConfig = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auto-replies?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutoReplyConfig(payload.config || null);
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadAutoReplyLogs = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auto-replies/logs?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutoReplyLogs(payload.logs || []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const saveAutoReplyConfig = async (patch = {}) => {
+    if (!currentUserId) return;
+    const base = autoReplyConfig || {};
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auto-replies`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          enabled: base.enabled,
+          greetingEnabled: base.greetingEnabled,
+          greetingText: base.greetingText,
+          awayEnabled: base.awayEnabled,
+          awayText: base.awayText,
+          hoursText: base.hoursText,
+          humanHandoverKeywords: base.humanHandoverKeywords,
+          rules: base.rules || [],
+          cooldownSeconds: base.cooldownSeconds,
+          ...patch,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save auto-replies.', 'error');
+        return;
+      }
+      setAutoReplyConfig(payload.config || null);
+      showToast('Auto-replies saved.', 'success');
+    } catch {
+      showToast('Could not save auto-replies.', 'error');
+    }
+  };
+
+  const addAutoReplyRule = async () => {
+    const keywords = autoReplyRuleDraft.keywords
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const response = autoReplyRuleDraft.response.trim();
+    if (!keywords.length || !response) {
+      showToast('Add keywords and a response.', 'error');
+      return;
+    }
+    const rules = [
+      ...(autoReplyConfig?.rules || []),
+      { id: `rule-${Date.now()}`, keywords, response, enabled: true },
+    ];
+    setAutoReplyRuleDraft({ keywords: '', response: '' });
+    await saveAutoReplyConfig({ rules });
+  };
+
+  const removeAutoReplyRule = async (ruleId) => {
+    const rules = (autoReplyConfig?.rules || []).filter((rule) => rule.id !== ruleId);
+    await saveAutoReplyConfig({ rules });
+  };
+
+  const loadBusinessAiConfig = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const query = new URLSearchParams({ userId });
+      if (activeBusinessId) query.set('businessId', activeBusinessId);
+      const response = await fetch(`${API_BASE_URL}/api/ai/business?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setBusinessAiConfig(payload.config || null);
+    } catch {
+      // ignore
+    }
+  };
+
+  const saveBusinessAiConfig = async (patch = {}) => {
+    if (!currentUserId) return;
+    const base = businessAiConfig || {};
+    setBusinessAiBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/business`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          businessId: activeBusinessId || base.businessId || undefined,
+          enabled: base.enabled,
+          policyText: base.policyText || '',
+          deliveryPolicy: base.deliveryPolicy || '',
+          refundPolicy: base.refundPolicy || '',
+          faq: base.faq || [],
+          ...patch,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save Business AI.', 'error');
+        return;
+      }
+      setBusinessAiConfig(payload.config || null);
+      showToast('Business AI saved. Auto-send stays off.', 'success', 2800);
+    } catch {
+      showToast('Could not save Business AI.', 'error');
+    } finally {
+      setBusinessAiBusy(false);
+    }
+  };
+
+  const addBusinessAiFaq = async () => {
+    const question = businessAiFaqDraft.question.trim();
+    const answer = businessAiFaqDraft.answer.trim();
+    if (question.length < 2 || answer.length < 2) {
+      showToast('Add a FAQ question and answer.', 'error');
+      return;
+    }
+    const faq = [...(businessAiConfig?.faq || []), { question, answer }];
+    setBusinessAiFaqDraft({ question: '', answer: '' });
+    await saveBusinessAiConfig({ faq });
+  };
+
+  const removeBusinessAiFaq = async (index) => {
+    const faq = (businessAiConfig?.faq || []).filter((_, i) => i !== index);
+    await saveBusinessAiConfig({ faq });
+  };
+
+  const askBusinessAi = async () => {
+    const question = businessAiAskDraft.trim();
+    if (!question || !currentUserId || businessAiBusy) {
+      if (!question) showToast('Type a test question.', 'info');
+      return;
+    }
+    setBusinessAiBusy(true);
+    setBusinessAiAskResult(null);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/business/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          sellerUserId: currentUserId,
+          question,
+          businessId: activeBusinessId || undefined,
+          chatId: selectedChatId || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not get an answer.', 'error');
+        return;
+      }
+      setBusinessAiAskResult(payload);
+      if (payload.notice) showToast(payload.notice, 'info', 3200);
+    } catch {
+      showToast('Could not get an answer.', 'error');
+    } finally {
+      setBusinessAiBusy(false);
+    }
+  };
+
   const importContactAsCustomer = async (contact) => {
     if (!currentUserId || !contact) return;
     try {
@@ -5317,63 +6070,245 @@ function AppContent() {
     }
   };
 
+  const upsertCommerceDocument = (document) => {
+    if (!document?.id) return;
+    setCommerceDocuments((current) => [document, ...current.filter((entry) => entry.id !== document.id)]);
+    setSelectedDocument((current) => (current?.id === document.id ? document : current));
+  };
+
+  const loadCommerceDocuments = async (userId = currentUserId, kind = '') => {
+    if (!userId) return;
+    try {
+      const query = new URLSearchParams({ userId });
+      if (kind === 'quotation' || kind === 'invoice') query.set('kind', kind);
+      const response = await fetch(`${API_BASE_URL}/api/documents?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load documents.', 'error');
+        return;
+      }
+      setCommerceDocuments(payload.documents || []);
+    } catch {
+      showToast('Could not load documents.', 'error');
+    }
+  };
+
+  const openCommerceDocument = async (documentId, options = {}) => {
+    if (!documentId || !currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.document) {
+        showToast(payload.error || 'Could not open document.', 'error');
+        return;
+      }
+      upsertCommerceDocument(payload.document);
+      setSelectedDocument(payload.document);
+      if (options.openPanel !== false) {
+        setBusinessPanel('documents');
+        setActiveView('Business');
+      }
+    } catch {
+      showToast('Could not open document.', 'error');
+    }
+  };
+
+  const resetDocumentForm = () => {
+    setDocumentForm({
+      kind: 'quotation',
+      customerName: '',
+      customerPhone: '',
+      lineTitle: '',
+      lineQty: '1',
+      linePrice: '',
+      discountAmount: '',
+      taxAmount: '',
+      notes: '',
+      expiresAt: '',
+      dueAt: '',
+    });
+  };
+
+  const createCommerceDocument = async ({ sendNow = false } = {}) => {
+    if (!currentUserId) return;
+    const customerName = documentForm.customerName.trim();
+    const lineTitle = documentForm.lineTitle.trim();
+    const quantity = Number.parseFloat(documentForm.lineQty) || 0;
+    const unitPrice = Number.parseFloat(documentForm.linePrice);
+    if (!customerName || !lineTitle || !(quantity > 0) || !Number.isFinite(unitPrice)) {
+      showToast('Add customer name and at least one line (title, qty, price).', 'error', 3600);
+      return;
+    }
+    showToast(sendNow ? 'Creating and sending...' : 'Saving draft...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/documents`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          kind: documentForm.kind === 'invoice' ? 'invoice' : 'quotation',
+          customerName,
+          customerPhone: documentForm.customerPhone.trim() || undefined,
+          currency: accountCurrency,
+          lines: [{ title: lineTitle, quantity, unitPrice }],
+          discountAmount: documentForm.discountAmount.trim() === ''
+            ? undefined
+            : Number.parseFloat(documentForm.discountAmount) || 0,
+          taxAmount: documentForm.taxAmount.trim() === ''
+            ? undefined
+            : Number.parseFloat(documentForm.taxAmount) || 0,
+          notes: documentForm.notes.trim() || undefined,
+          expiresAt: documentForm.kind === 'quotation' && documentForm.expiresAt.trim()
+            ? documentForm.expiresAt.trim()
+            : undefined,
+          dueAt: documentForm.kind === 'invoice' && documentForm.dueAt.trim()
+            ? documentForm.dueAt.trim()
+            : undefined,
+          chatId: selectedChatId || undefined,
+          sendNow: Boolean(sendNow),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.document) {
+        showToast(getBackendErrorMessage(payload, 'Could not create document.'), 'error', 3600);
+        return;
+      }
+      upsertCommerceDocument(payload.document);
+      setSelectedDocument(payload.document);
+      resetDocumentForm();
+      showToast(
+        sendNow
+          ? `${payload.document.kind === 'invoice' ? 'Invoice' : 'Quote'} sent.`
+          : `${payload.document.kind === 'invoice' ? 'Invoice' : 'Quote'} draft saved.`,
+        'success',
+      );
+    } catch {
+      showToast('Could not create document.', 'error');
+    }
+  };
+
+  const runDocumentAction = async (documentId, action, bodyExtra = {}) => {
+    if (!currentUserId || !documentId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}/${action}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, ...bodyExtra }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, `Could not ${action} document.`), 'error', 3600);
+        return;
+      }
+      if (payload.document) upsertCommerceDocument(payload.document);
+      if (payload.quotation) upsertCommerceDocument(payload.quotation);
+      if (payload.invoice) {
+        upsertCommerceDocument(payload.invoice);
+        setSelectedDocument(payload.invoice);
+      }
+      showToast(
+        action === 'send'
+          ? 'Document sent.'
+          : action === 'accept'
+            ? 'Document accepted.'
+            : action === 'reject'
+              ? 'Document rejected.'
+              : action === 'convert'
+                ? 'Converted to invoice.'
+                : action === 'mark-paid'
+                  ? 'Marked paid.'
+                  : 'Updated.',
+        'success',
+      );
+      void loadCommerceDocuments(currentUserId);
+    } catch {
+      showToast(`Could not ${action} document.`, 'error');
+    }
+  };
+
+  const loadBroadcastCampaigns = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/broadcasts?userId=${encodeURIComponent(userId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load broadcasts.', 'error');
+        return;
+      }
+      setBroadcastCampaigns(payload.campaigns || []);
+      setBroadcastAudiencePreview({
+        opted_in: payload.audiencePreview?.opted_in ?? 0,
+        repeat_buyers: payload.audiencePreview?.repeat_buyers ?? 0,
+        all_customers: payload.audiencePreview?.all_customers ?? 0,
+      });
+    } catch {
+      showToast('Could not load broadcasts.', 'error');
+    }
+  };
+
   const sendBroadcast = async () => {
     const text = broadcastDraft.trim();
     if (!text) {
       showToast('Write a broadcast message first.', 'error');
       return;
     }
-
-    const optedInRecipients = businessCustomers
-      .filter((customer) => customer.marketingConsent === 'opted_in' && customer.customerUserId)
-      .map((customer) => customer.customerUserId);
-    const recipients = [...new Set(optedInRecipients.filter(Boolean))];
-
-    if (!recipients.length) {
-      showToast('No opted-in customers yet. Only customers who opted in receive broadcasts.', 'error', 4200);
-      return;
+    if (!currentUserId) return;
+    const segment = ['opted_in', 'repeat_buyers', 'all_customers'].includes(broadcastSegment)
+      ? broadcastSegment
+      : 'opted_in';
+    showToast('Sending broadcast...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/broadcasts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          text,
+          segment,
+          sendNow: true,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.campaign) {
+        showToast(getBackendErrorMessage(payload, 'Broadcast could not be sent.'), 'error', 4200);
+        return;
+      }
+      setBroadcastCampaigns((current) => [payload.campaign, ...current.filter((entry) => entry.id !== payload.campaign.id)]);
+      setBroadcastDraft('');
+      showToast(
+        `Broadcast ${payload.campaign.status === 'sent' ? 'sent' : 'queued'} to ${payload.campaign.audienceCount || 0} opted-in customers.`,
+        'success',
+        4200,
+      );
+      void loadBroadcastCampaigns(currentUserId);
+    } catch {
+      showToast('Broadcast could not be sent.', 'error');
     }
+  };
 
-    showToast(`Broadcasting to ${recipients.length} customers...`, 'info', 0);
-    let sent = 0;
-    await Promise.all(
-      recipients.map(async (peerUserId) => {
-        try {
-          const chatResponse = await fetch(`${API_BASE_URL}/api/chats`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: currentUserId, peerUserId }),
-          });
-          if (!chatResponse.ok) {
-            return;
-          }
-          const chatPayload = await chatResponse.json();
-          const chatId = chatPayload.chat?.id;
-          if (!chatId) {
-            return;
-          }
-          await fetch(`${API_BASE_URL}/api/messages`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chatId,
-              senderId: currentUserId,
-              clientRef: `broadcast-${Date.now()}-${peerUserId}`,
-              kind: 'text',
-              text,
-              mediaUrls: [],
-            }),
-          });
-          sent += 1;
-        } catch {
-          // Keep broadcasting to remaining recipients.
-        }
-      }),
-    );
-
-    setBroadcastDraft('');
-    setBusinessPanel('');
-    showToast(sent ? `Broadcast sent to ${sent} customer${sent === 1 ? '' : 's'}.` : 'Broadcast could not be delivered.', sent ? 'success' : 'error', 4200);
+  const cancelBroadcastCampaign = async (campaignId) => {
+    if (!currentUserId || !campaignId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/broadcasts/${encodeURIComponent(campaignId)}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.campaign) {
+        showToast(getBackendErrorMessage(payload, 'Could not cancel campaign.'), 'error', 3600);
+        return;
+      }
+      setBroadcastCampaigns((current) => [payload.campaign, ...current.filter((entry) => entry.id !== payload.campaign.id)]);
+      showToast('Campaign cancelled.', 'success');
+    } catch {
+      showToast('Could not cancel campaign.', 'error');
+    }
   };
 
   const addAttachmentMessage = (kind, name, source, uri = null) => {
@@ -7014,6 +7949,7 @@ function AppContent() {
           message.mine ? styles.messageMine : styles.messageTheirs,
           emojiOnly ? styles.emojiBubble : null,
           message.deletedForEveryone ? styles.messageDeletedBubble : null,
+          message.automated ? styles.messageAutomatedBubble : null,
         ]}
         onLongPress={() => {
           if (!message.deletedForEveryone) {
@@ -7115,24 +8051,46 @@ function AppContent() {
           const remainingLabel = active && durationMs
             ? formatPlaybackClock(Math.max(0, durationMs - positionMs))
             : (message.durationLabel || '0:00');
+          const transcriptReady = message.transcriptStatus === 'ready' && Boolean(message.transcript);
+          const transcriptPending = message.transcriptStatus === 'pending' || transcribeBusyId === message.id;
+          const showTranscribe = !transcriptReady
+            && (message.transcriptStatus === 'unavailable'
+              || message.transcriptStatus === 'failed'
+              || !message.transcriptStatus);
           return (
-            <View style={styles.voiceNote}>
-              <Pressable style={styles.voicePlayButton} onPress={() => void playVoiceMessage(message)}>
-                <Text style={styles.voiceIcon}>{active && voicePlayback.playing ? '❚❚' : '▶'}</Text>
-              </Pressable>
-              <Pressable
-                style={styles.voiceBarTrack}
-                onLayout={(event) => {
-                  voiceBarWidthRef.current = event.nativeEvent.layout.width || voiceBarWidthRef.current;
-                }}
-                onPress={(event) => {
-                  const width = voiceBarWidthRef.current || 1;
-                  void seekVoiceMessage(message, event.nativeEvent.locationX / width);
-                }}
-              >
-                <View style={[styles.voiceBarFill, { width: `${Math.round(progress * 100)}%` }]} />
-              </Pressable>
-              <Text style={styles.voiceDuration}>{remainingLabel}</Text>
+            <View style={styles.voiceNoteBlock}>
+              <View style={styles.voiceNote}>
+                <Pressable style={styles.voicePlayButton} onPress={() => void playVoiceMessage(message)}>
+                  <Text style={styles.voiceIcon}>{active && voicePlayback.playing ? '❚❚' : '▶'}</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.voiceBarTrack}
+                  onLayout={(event) => {
+                    voiceBarWidthRef.current = event.nativeEvent.layout.width || voiceBarWidthRef.current;
+                  }}
+                  onPress={(event) => {
+                    const width = voiceBarWidthRef.current || 1;
+                    void seekVoiceMessage(message, event.nativeEvent.locationX / width);
+                  }}
+                >
+                  <View style={[styles.voiceBarFill, { width: `${Math.round(progress * 100)}%` }]} />
+                </Pressable>
+                <Text style={styles.voiceDuration}>{remainingLabel}</Text>
+              </View>
+              {transcriptReady ? (
+                <Text style={styles.voiceTranscriptText}>{message.transcript}</Text>
+              ) : null}
+              {transcriptPending ? (
+                <Text style={styles.voiceTranscriptMeta}>Transcribing…</Text>
+              ) : null}
+              {showTranscribe && !transcriptPending ? (
+                <Pressable
+                  style={styles.voiceTranscribeChip}
+                  onPress={() => void requestVoiceTranscript(message)}
+                >
+                  <Text style={styles.voiceTranscribeChipText}>Transcribe</Text>
+                </Pressable>
+              ) : null}
             </View>
           );
         })() : null}
@@ -7172,7 +8130,67 @@ function AppContent() {
           </View>
         ) : null}
 
+        {message.automated ? <Text style={styles.automatedBadge}>Automated reply</Text> : null}
         {message.kind === 'text' ? renderLinkedText(message.text, styles.messageText) : null}
+        {message.kind === 'text' && message.text && !message.deletedForEveryone ? (() => {
+          const translation = messageTranslations[message.id];
+          const busy = translateBusyId === message.id;
+          const picking = translatePickerId === message.id;
+          return (
+            <View style={styles.messageTranslationBlock}>
+              {translation ? (
+                <>
+                  <Text style={styles.messageTranslationText}>{translation.translatedText}</Text>
+                  <Text style={styles.messageTranslationBadge}>
+                    {translation.partial || translation.needsProvider
+                      ? (translation.notice || 'Partial · review before relying on it')
+                      : (
+                        TRANSLATE_TARGET_OPTIONS.find((item) => item.code === translation.targetLanguage)?.label
+                        || translation.targetLanguage
+                        || 'en'
+                      )}
+                  </Text>
+                </>
+              ) : null}
+              {picking ? (
+                <View style={styles.translateLangRow}>
+                  {TRANSLATE_TARGET_OPTIONS.map((option) => (
+                    <Pressable
+                      key={option.code}
+                      style={[
+                        styles.translateChip,
+                        option.code === 'en' ? styles.translateChipDefault : null,
+                      ]}
+                      disabled={busy}
+                      onPress={() => {
+                        setTranslatePickerId('');
+                        void requestMessageTranslation(message, option.code);
+                      }}
+                    >
+                      <Text style={styles.translateChipText}>
+                        {option.code === 'en' ? `${option.label} · default` : option.label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                  <Pressable
+                    style={styles.translateChip}
+                    onPress={() => setTranslatePickerId('')}
+                  >
+                    <Text style={styles.translateChipText}>Cancel</Text>
+                  </Pressable>
+                </View>
+              ) : (
+                <Pressable
+                  style={styles.translateChip}
+                  onPress={() => pickTranslateLanguage(message)}
+                  disabled={busy}
+                >
+                  <Text style={styles.translateChipText}>{busy ? 'Translating…' : 'Translate'}</Text>
+                </Pressable>
+              )}
+            </View>
+          );
+        })() : null}
         {message.catalogItemId ? (
           <View style={styles.catalogActionRow}>
             <Pressable
@@ -7209,6 +8227,20 @@ function AppContent() {
               <Text style={styles.draftActionText}>Share</Text>
             </Pressable>
           </View>
+        ) : null}
+
+        {message.documentId ? (
+          <Pressable
+            style={styles.documentChip}
+            onPress={() => void openCommerceDocument(message.documentId)}
+          >
+            <Text style={styles.documentChipLabel}>
+              {(message.documentKind === 'invoice' ? 'Invoice' : 'Quote')}
+            </Text>
+            <Text style={styles.documentChipMeta} numberOfLines={1}>
+              {message.text || 'Open document'}
+            </Text>
+          </Pressable>
         ) : null}
 
         {message.attachment && message.kind !== 'image' ? (
@@ -7519,6 +8551,28 @@ function AppContent() {
         </View>
       ) : null}
 
+      {scamWarningBanner?.chatId === activeChat.id && scamWarningBanner?.warning?.risky ? (
+        <View style={styles.scamWarningBanner}>
+          <View style={styles.replyComposerCopy}>
+            <Text style={styles.scamWarningTitle}>
+              {(scamWarningBanner.warning.signals || []).some((entry) => entry.code === 'pin_request')
+                ? 'PIN / OTP warning'
+                : 'Scam warning'}
+            </Text>
+            <Text style={styles.scamWarningText}>
+              {scamWarningBanner.warning.advice
+                || 'Be careful. Never share MoMo PINs or OTPs.'}
+              {scamWarningBanner.warning.disclaimer
+                ? ` ${scamWarningBanner.warning.disclaimer}`
+                : ''}
+            </Text>
+          </View>
+          <Pressable onPress={() => setScamWarningBanner(null)}>
+            <Text style={styles.replyComposerClose}>✕</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
       <Pressable style={styles.identityComposer} onPress={() => setIdentitySheetVisible(true)}>
         <Text style={styles.identityComposerText}>
           {(activeChat?.space || 'personal') === (activeBusinessId || 'personal')
@@ -7537,6 +8591,83 @@ function AppContent() {
             {anonymousCompose ? 'Anonymous on · 5 a day in this room' : 'Send as anonymous'}
           </Text>
         </Pressable>
+      ) : null}
+      <View style={styles.aiAssistRow}>
+        <Pressable
+          style={styles.aiAssistButton}
+          onPress={() => openAiHelperSheet('draft')}
+        >
+          <Text style={styles.aiAssistButtonText}>AI helper</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.aiAssistButton, summaryBusy ? styles.aiAssistButtonBusy : null]}
+          disabled={summaryBusy}
+          onPress={() => void requestChatSummary('unread')}
+        >
+          <Text style={styles.aiAssistButtonText}>{summaryBusy ? '…' : 'Summarise'}</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.aiAssistButton, aiAssistBusy ? styles.aiAssistButtonBusy : null]}
+          disabled={aiAssistBusy}
+          onPress={() => void requestSuggestedReplies()}
+        >
+          <Text style={styles.aiAssistButtonText}>{aiAssistBusy ? '…' : 'Suggest reply'}</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.aiAssistButton, aiAssistBusy ? styles.aiAssistButtonBusy : null]}
+          disabled={aiAssistBusy || !messageDraft.trim()}
+          onPress={() => void requestRewriteDraft()}
+        >
+          <Text style={styles.aiAssistButtonText}>Rewrite</Text>
+        </Pressable>
+        <Pressable
+          style={[styles.aiAssistButton, dictateBusy ? styles.aiAssistButtonBusy : null]}
+          disabled={dictateBusy}
+          onPress={openDictateSheet}
+        >
+          <Text style={styles.aiAssistButtonText}>Dictate</Text>
+        </Pressable>
+      </View>
+      <View style={styles.aiToneRow}>
+        {['polite', 'concise', 'professional', 'friendly', 'apologetic'].map((tone) => (
+          <Pressable
+            key={tone}
+            style={[styles.aiToneChip, aiRewriteTone === tone ? styles.aiToneChipActive : null]}
+            onPress={() => setAiRewriteTone(tone)}
+          >
+            <Text style={[styles.aiToneChipText, aiRewriteTone === tone ? styles.aiToneChipTextActive : null]}>
+              {tone}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+      {aiSuggestions.length ? (
+        <View style={styles.aiChipRow}>
+          {aiSuggestions.map((suggestion) => (
+            <Pressable
+              key={suggestion.id || suggestion.text}
+              style={styles.aiSuggestionChip}
+              onPress={() => applyAiSuggestion(suggestion.text)}
+            >
+              <Text numberOfLines={2} style={styles.aiSuggestionChipText}>{suggestion.text}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
+      {aiRewriteVariants.length > 1 ? (
+        <View style={styles.aiChipRow}>
+          {aiRewriteVariants.map((variant) => (
+            <Pressable
+              key={variant.id || variant.text}
+              style={styles.aiSuggestionChip}
+              onPress={() => applyAiSuggestion(variant.text)}
+            >
+              <Text numberOfLines={2} style={styles.aiSuggestionChipText}>
+                {variant.tone ? `${variant.tone}: ` : ''}{variant.text}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
       ) : null}
       <View style={styles.composer}>
         <TextInput
@@ -8513,10 +9644,62 @@ function AppContent() {
                 {saleReceipts.filter((item) => item.sellerUserId === currentUserId && item.state === 'issued').length || 'Auto-generated'}
               </Text>
             </Pressable>
-            <Pressable style={styles.businessGridCard} onPress={() => setBusinessPanel('broadcast')}>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                setSelectedDocument(null);
+                void loadCommerceDocuments();
+                setBusinessPanel('documents');
+              }}
+            >
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◫</Text></View>
+              <Text style={styles.businessGridTitle}>Quotes & invoices</Text>
+              <Text style={styles.businessGridMeta}>
+                {commerceDocuments.length ? `${commerceDocuments.length} docs` : 'Create & send'}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void loadAutoReplyConfig();
+                void loadAutoReplyLogs();
+                setBusinessPanel('autoreplies');
+              }}
+            >
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>↻</Text></View>
+              <Text style={styles.businessGridTitle}>Auto-replies</Text>
+              <Text style={styles.businessGridMeta}>
+                {autoReplyConfig?.enabled ? 'On' : 'Off'} · {(autoReplyConfig?.rules || []).length} rules
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void loadBusinessAiConfig();
+                setBusinessAiAskResult(null);
+                setBusinessPanel('businessai');
+              }}
+            >
+              <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>✦</Text></View>
+              <Text style={styles.businessGridTitle}>Business AI</Text>
+              <Text style={styles.businessGridMeta}>
+                {businessAiConfig?.enabled ? 'On' : 'Paused'} · {(businessAiConfig?.faq || []).length} FAQ
+              </Text>
+            </Pressable>
+            <Pressable
+              style={styles.businessGridCard}
+              onPress={() => {
+                void loadBroadcastCampaigns();
+                setBusinessPanel('broadcast');
+              }}
+            >
               <View style={styles.businessGridIconWrap}><Text style={styles.businessGridIcon}>◍</Text></View>
               <Text style={styles.businessGridTitle}>Broadcast</Text>
-              <Text style={styles.businessGridMeta}>Send to all customers</Text>
+              <Text style={styles.businessGridMeta}>
+                {broadcastAudiencePreview.opted_in
+                  ? `${broadcastAudiencePreview.opted_in} opted in`
+                  : 'Opted-in only'}
+              </Text>
             </Pressable>
             {activeBusiness && (activeBusiness.visibility || 'draft') === 'published' ? (
               <Pressable
@@ -9749,6 +10932,27 @@ function AppContent() {
             >
               <Text style={styles.sheetOptionTitle}>Copy</Text>
             </Pressable>
+            {messageActionTarget?.kind === 'text' && messageActionTarget?.text && !messageActionTarget?.deletedForEveryone ? (
+              <Pressable
+                style={styles.sheetOption}
+                onPress={() => pickTranslateLanguage(messageActionTarget)}
+              >
+                <Text style={styles.sheetOptionTitle}>Translate</Text>
+              </Pressable>
+            ) : null}
+            {(messageActionTarget?.kind === 'voice' || messageActionTarget?.kind === 'audio')
+              && !(messageActionTarget?.transcriptStatus === 'ready' && messageActionTarget?.transcript) ? (
+              <Pressable
+                style={styles.sheetOption}
+                onPress={() => {
+                  const target = messageActionTarget;
+                  setMessageActionTarget(null);
+                  void requestVoiceTranscript(target);
+                }}
+              >
+                <Text style={styles.sheetOptionTitle}>Transcribe</Text>
+              </Pressable>
+            ) : null}
             <Pressable
               style={styles.sheetOption}
               onPress={() => void forwardMessage(messageActionTarget)}
@@ -10430,7 +11634,13 @@ function AppContent() {
                             ? 'Inventory'
                             : businessPanel === 'receipts'
                               ? 'Receipts'
-                              : 'Broadcast'}
+                              : businessPanel === 'documents'
+                                ? 'Quotes & invoices'
+                                : businessPanel === 'autoreplies'
+                                  ? 'Auto-replies'
+                                  : businessPanel === 'businessai'
+                                    ? 'Business AI'
+                                    : 'Broadcast'}
               </Text>
               <Pressable onPress={() => setBusinessPanel('')}>
                 <Text style={styles.storyClose}>Close</Text>
@@ -11140,7 +12350,7 @@ function AppContent() {
                     <Pressable
                       key={order.id}
                       style={styles.sheetOption}
-                      onPress={() => setOrderDetail(order)}
+                      onPress={() => openOrderDetail(order)}
                     >
                       <Text style={styles.sheetOptionTitle}>{item?.title || 'Order'}</Text>
                       <Text style={styles.sheetOptionBody}>
@@ -11190,11 +12400,504 @@ function AppContent() {
               </ScrollView>
             ) : null}
 
-            {businessPanel === 'broadcast' ? (
-              <View>
+            {businessPanel === 'autoreplies' ? (
+              <ScrollView style={styles.businessPanelScroll}>
                 <Text style={styles.cardBody}>
-                  Message every registered customer in one send — like WhatsApp Business broadcast lists.
+                  Rule-based replies only. No invented prices or stock. Customers can type “human” to pause automation for that chat.
                 </Text>
+                <Pressable
+                  style={styles.sendButtonWide}
+                  onPress={() => void saveAutoReplyConfig({ enabled: !autoReplyConfig?.enabled })}
+                >
+                  <Text style={styles.sendButtonText}>
+                    {autoReplyConfig?.enabled ? 'Pause all auto-replies' : 'Turn auto-replies on'}
+                  </Text>
+                </Pressable>
+                <Text style={styles.lightSectionLabel}>GREETING</Text>
+                <Pressable
+                  style={styles.catalogChip}
+                  onPress={() =>
+                    void saveAutoReplyConfig({ greetingEnabled: !autoReplyConfig?.greetingEnabled })
+                  }
+                >
+                  <Text style={styles.catalogChipText}>
+                    First-message greeting: {autoReplyConfig?.greetingEnabled === false ? 'Off' : 'On'}
+                  </Text>
+                </Pressable>
+                <TextInput
+                  value={autoReplyConfig?.greetingText || ''}
+                  onChangeText={(value) => setAutoReplyConfig((current) => ({ ...(current || {}), greetingText: value }))}
+                  onBlur={() => void saveAutoReplyConfig({ greetingText: autoReplyConfig?.greetingText || '' })}
+                  placeholder="Thanks for messaging us..."
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Text style={styles.lightSectionLabel}>AWAY MESSAGE</Text>
+                <Pressable
+                  style={styles.catalogChip}
+                  onPress={() => void saveAutoReplyConfig({ awayEnabled: !autoReplyConfig?.awayEnabled })}
+                >
+                  <Text style={styles.catalogChipText}>
+                    Away fallback: {autoReplyConfig?.awayEnabled === false ? 'Off' : 'On'}
+                  </Text>
+                </Pressable>
+                <TextInput
+                  value={autoReplyConfig?.awayText || ''}
+                  onChangeText={(value) => setAutoReplyConfig((current) => ({ ...(current || {}), awayText: value }))}
+                  onBlur={() => void saveAutoReplyConfig({ awayText: autoReplyConfig?.awayText || '' })}
+                  placeholder="We are away right now..."
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Text style={styles.lightSectionLabel}>OPENING HOURS</Text>
+                <TextInput
+                  value={autoReplyConfig?.hoursText || ''}
+                  onChangeText={(value) => setAutoReplyConfig((current) => ({ ...(current || {}), hoursText: value }))}
+                  onBlur={() => void saveAutoReplyConfig({ hoursText: autoReplyConfig?.hoursText || '' })}
+                  placeholder="Mon–Sat 9am–6pm"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <Text style={styles.lightSectionLabel}>FAQ RULES</Text>
+                {(autoReplyConfig?.rules || []).map((rule) => (
+                  <View key={rule.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{(rule.keywords || []).join(', ')}</Text>
+                    <Text style={styles.sheetOptionBody}>{rule.response}</Text>
+                    <Pressable style={styles.catalogChip} onPress={() => void removeAutoReplyRule(rule.id)}>
+                      <Text style={styles.catalogChipText}>Remove</Text>
+                    </Pressable>
+                  </View>
+                ))}
+                <TextInput
+                  value={autoReplyRuleDraft.keywords}
+                  onChangeText={(value) => setAutoReplyRuleDraft((current) => ({ ...current, keywords: value }))}
+                  placeholder="Keywords (comma separated)"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={autoReplyRuleDraft.response}
+                  onChangeText={(value) => setAutoReplyRuleDraft((current) => ({ ...current, response: value }))}
+                  placeholder="Fixed reply text"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void addAutoReplyRule()}>
+                  <Text style={styles.sendButtonText}>Add rule</Text>
+                </Pressable>
+                <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>RECENT ACTIVITY</Text>
+                {autoReplyLogs.length ? null : (
+                  <Text style={styles.sheetOptionBody}>No automated replies logged yet.</Text>
+                )}
+                {autoReplyLogs.slice(0, 12).map((log) => (
+                  <View key={log.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{log.source}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {new Date(log.createdAt).toLocaleString()} · chat {log.chatId}
+                    </Text>
+                  </View>
+                ))}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'businessai' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.cardBody}>
+                  Policy- and FAQ-backed answers only. Replies are labeled Automated and never auto-send.
+                </Text>
+                <Pressable
+                  style={[styles.sendButtonWide, businessAiBusy ? styles.aiAssistButtonBusy : null]}
+                  disabled={businessAiBusy}
+                  onPress={() => void saveBusinessAiConfig({ enabled: !businessAiConfig?.enabled })}
+                >
+                  <Text style={styles.sendButtonText}>
+                    {businessAiConfig?.enabled ? 'Pause Business AI' : 'Enable Business AI'}
+                  </Text>
+                </Pressable>
+                <Text style={styles.lightSectionLabel}>BUSINESS POLICY</Text>
+                <TextInput
+                  value={businessAiConfig?.policyText || ''}
+                  onChangeText={(value) => setBusinessAiConfig((current) => ({ ...(current || {}), policyText: value }))}
+                  onBlur={() => void saveBusinessAiConfig({ policyText: businessAiConfig?.policyText || '' })}
+                  placeholder="What customers should know about your shop"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Text style={styles.lightSectionLabel}>DELIVERY POLICY</Text>
+                <TextInput
+                  value={businessAiConfig?.deliveryPolicy || ''}
+                  onChangeText={(value) => setBusinessAiConfig((current) => ({ ...(current || {}), deliveryPolicy: value }))}
+                  onBlur={() => void saveBusinessAiConfig({ deliveryPolicy: businessAiConfig?.deliveryPolicy || '' })}
+                  placeholder="Delivery areas, timing, fees"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Text style={styles.lightSectionLabel}>REFUND POLICY</Text>
+                <TextInput
+                  value={businessAiConfig?.refundPolicy || ''}
+                  onChangeText={(value) => setBusinessAiConfig((current) => ({ ...(current || {}), refundPolicy: value }))}
+                  onBlur={() => void saveBusinessAiConfig({ refundPolicy: businessAiConfig?.refundPolicy || '' })}
+                  placeholder="Returns and refunds"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Text style={styles.lightSectionLabel}>FAQ</Text>
+                {(businessAiConfig?.faq || []).map((item, index) => (
+                  <View key={`${item.question}-${index}`} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>{item.question}</Text>
+                    <Text style={styles.sheetOptionBody}>{item.answer}</Text>
+                    <Pressable style={styles.catalogChip} onPress={() => void removeBusinessAiFaq(index)}>
+                      <Text style={styles.catalogChipText}>Remove</Text>
+                    </Pressable>
+                  </View>
+                ))}
+                <TextInput
+                  value={businessAiFaqDraft.question}
+                  onChangeText={(value) => setBusinessAiFaqDraft((current) => ({ ...current, question: value }))}
+                  placeholder="FAQ question"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                />
+                <TextInput
+                  value={businessAiFaqDraft.answer}
+                  onChangeText={(value) => setBusinessAiFaqDraft((current) => ({ ...current, answer: value }))}
+                  placeholder="Approved answer"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Pressable style={styles.sendButtonWide} onPress={() => void addBusinessAiFaq()}>
+                  <Text style={styles.sendButtonText}>Add FAQ</Text>
+                </Pressable>
+                <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>TEST ASK</Text>
+                <TextInput
+                  value={businessAiAskDraft}
+                  onChangeText={setBusinessAiAskDraft}
+                  placeholder="Ask as a customer would…"
+                  placeholderTextColor="#7d8b92"
+                  style={styles.input}
+                  multiline
+                />
+                <Pressable
+                  style={[styles.sendButtonWide, businessAiBusy ? styles.aiAssistButtonBusy : null]}
+                  disabled={businessAiBusy || !businessAiAskDraft.trim()}
+                  onPress={() => void askBusinessAi()}
+                >
+                  <Text style={styles.sendButtonText}>{businessAiBusy ? 'Asking…' : 'Ask Business AI'}</Text>
+                </Pressable>
+                {businessAiAskResult ? (
+                  <View style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle}>Automated</Text>
+                    <Text style={styles.sheetOptionBody}>{businessAiAskResult.answer}</Text>
+                    <Text style={styles.summaryNotice}>
+                      {businessAiAskResult.escalate ? 'Escalate: yes — hand to a human' : 'Escalate: no'}
+                      {businessAiAskResult.confidence != null ? ` · confidence ${businessAiAskResult.confidence}` : ''}
+                      {businessAiAskResult.source ? ` · ${businessAiAskResult.source}` : ''}
+                    </Text>
+                    {businessAiAskResult.disclosure ? (
+                      <Text style={styles.summaryNotice}>{businessAiAskResult.disclosure}</Text>
+                    ) : null}
+                    {(businessAiAskResult.products || []).length ? (
+                      <Text style={styles.summaryNotice}>
+                        Products: {(businessAiAskResult.products || []).map((p) => p.title || p.name || p.id).join(', ')}
+                      </Text>
+                    ) : null}
+                    <Text style={styles.summaryNotice}>autoSend: false — review before sending</Text>
+                  </View>
+                ) : null}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'documents' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                {selectedDocument ? (
+                  <>
+                    <Pressable
+                      style={styles.catalogChip}
+                      onPress={() => setSelectedDocument(null)}
+                    >
+                      <Text style={styles.catalogChipText}>Back to list</Text>
+                    </Pressable>
+                    <Text style={styles.sheetOptionTitle}>
+                      {selectedDocument.number} · {selectedDocument.kind === 'invoice' ? 'Invoice' : 'Quote'}
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {selectedDocument.customerName}
+                      {selectedDocument.customerPhone ? ` · ${selectedDocument.customerPhone}` : ''}
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {selectedDocument.state} · {moneyLabel(selectedDocument.totalAmount, selectedDocument.currency)}
+                    </Text>
+                    {(selectedDocument.lines || []).map((line) => (
+                      <View key={line.id || `${line.title}-${line.quantity}`} style={styles.sheetOption}>
+                        <Text style={styles.sheetOptionTitle}>{line.title}</Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {line.quantity} × {moneyLabel(line.unitPrice, selectedDocument.currency)}
+                          {' = '}
+                          {moneyLabel(line.amount ?? (line.quantity * line.unitPrice), selectedDocument.currency)}
+                        </Text>
+                      </View>
+                    ))}
+                    {selectedDocument.notes ? (
+                      <Text style={styles.sheetOptionBody}>Notes: {selectedDocument.notes}</Text>
+                    ) : null}
+                    {selectedDocument.expiresAt ? (
+                      <Text style={styles.sheetOptionBody}>
+                        Expires {new Date(selectedDocument.expiresAt).toLocaleString()}
+                      </Text>
+                    ) : null}
+                    {selectedDocument.dueAt ? (
+                      <Text style={styles.sheetOptionBody}>
+                        Due {new Date(selectedDocument.dueAt).toLocaleString()}
+                      </Text>
+                    ) : null}
+                    <View style={styles.catalogActionRow}>
+                      {selectedDocument.sellerUserId === currentUserId
+                        && ['draft', 'rejected'].includes(selectedDocument.state) ? (
+                        <Pressable
+                          style={styles.catalogChip}
+                          onPress={() => void runDocumentAction(selectedDocument.id, 'send', {
+                            chatId: selectedDocument.chatId || selectedChatId || undefined,
+                          })}
+                        >
+                          <Text style={styles.catalogChipText}>Send</Text>
+                        </Pressable>
+                      ) : null}
+                      {selectedDocument.state === 'sent'
+                        && (selectedDocument.customerUserId === currentUserId
+                          || selectedDocument.sellerUserId === currentUserId) ? (
+                        <>
+                          <Pressable
+                            style={styles.catalogChip}
+                            onPress={() => void runDocumentAction(selectedDocument.id, 'accept')}
+                          >
+                            <Text style={styles.catalogChipText}>Accept</Text>
+                          </Pressable>
+                          <Pressable
+                            style={styles.catalogChip}
+                            onPress={() => void runDocumentAction(selectedDocument.id, 'reject')}
+                          >
+                            <Text style={styles.catalogChipText}>Reject</Text>
+                          </Pressable>
+                        </>
+                      ) : null}
+                      {selectedDocument.sellerUserId === currentUserId
+                        && selectedDocument.kind === 'quotation'
+                        && ['sent', 'accepted'].includes(selectedDocument.state) ? (
+                        <Pressable
+                          style={styles.catalogChip}
+                          onPress={() => void runDocumentAction(selectedDocument.id, 'convert')}
+                        >
+                          <Text style={styles.catalogChipText}>Convert to invoice</Text>
+                        </Pressable>
+                      ) : null}
+                      {selectedDocument.sellerUserId === currentUserId
+                        && selectedDocument.kind === 'invoice'
+                        && selectedDocument.state !== 'paid'
+                        && selectedDocument.state !== 'voided' ? (
+                        <Pressable
+                          style={styles.catalogChip}
+                          onPress={() => void runDocumentAction(selectedDocument.id, 'mark-paid', {
+                            markCashReceived: true,
+                          })}
+                        >
+                          <Text style={styles.catalogChipText}>Mark paid (cash)</Text>
+                        </Pressable>
+                      ) : null}
+                      <Pressable
+                        style={styles.catalogChip}
+                        onPress={() => void openCommerceDocument(selectedDocument.id, { openPanel: false })}
+                      >
+                        <Text style={styles.catalogChipText}>Refresh</Text>
+                      </Pressable>
+                    </View>
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.cardBody}>
+                      Create a quotation or invoice, send it in chat, and track accept / pay states.
+                    </Text>
+                    <Text style={styles.lightSectionLabel}>NEW DOCUMENT</Text>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                      {[
+                        ['quotation', 'Quote'],
+                        ['invoice', 'Invoice'],
+                      ].map(([id, label]) => (
+                        <Pressable
+                          key={id}
+                          style={[styles.marketFilterChip, documentForm.kind === id ? styles.marketFilterChipOn : null]}
+                          onPress={() => setDocumentForm((current) => ({ ...current, kind: id }))}
+                        >
+                          <Text style={styles.marketFilterText}>{label}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                    <TextInput
+                      value={documentForm.customerName}
+                      onChangeText={(value) => setDocumentForm((current) => ({ ...current, customerName: value }))}
+                      placeholder="Customer name"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <TextInput
+                      value={documentForm.customerPhone}
+                      onChangeText={(value) => setDocumentForm((current) => ({ ...current, customerPhone: value }))}
+                      placeholder="Customer phone (optional)"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                      keyboardType="phone-pad"
+                    />
+                    <TextInput
+                      value={documentForm.lineTitle}
+                      onChangeText={(value) => setDocumentForm((current) => ({ ...current, lineTitle: value }))}
+                      placeholder="Line item title"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <View style={styles.documentFormRow}>
+                      <TextInput
+                        value={documentForm.lineQty}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, lineQty: value }))}
+                        placeholder="Qty"
+                        placeholderTextColor="#7d8b92"
+                        style={[styles.input, styles.documentFormHalf]}
+                        keyboardType="decimal-pad"
+                      />
+                      <TextInput
+                        value={documentForm.linePrice}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, linePrice: value }))}
+                        placeholder={`Unit price (${accountCurrency})`}
+                        placeholderTextColor="#7d8b92"
+                        style={[styles.input, styles.documentFormHalf]}
+                        keyboardType="decimal-pad"
+                      />
+                    </View>
+                    <View style={styles.documentFormRow}>
+                      <TextInput
+                        value={documentForm.discountAmount}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, discountAmount: value }))}
+                        placeholder="Discount (optional)"
+                        placeholderTextColor="#7d8b92"
+                        style={[styles.input, styles.documentFormHalf]}
+                        keyboardType="decimal-pad"
+                      />
+                      <TextInput
+                        value={documentForm.taxAmount}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, taxAmount: value }))}
+                        placeholder="Tax (optional)"
+                        placeholderTextColor="#7d8b92"
+                        style={[styles.input, styles.documentFormHalf]}
+                        keyboardType="decimal-pad"
+                      />
+                    </View>
+                    <TextInput
+                      value={documentForm.notes}
+                      onChangeText={(value) => setDocumentForm((current) => ({ ...current, notes: value }))}
+                      placeholder="Notes (optional)"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                      multiline
+                    />
+                    {documentForm.kind === 'quotation' ? (
+                      <TextInput
+                        value={documentForm.expiresAt}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, expiresAt: value }))}
+                        placeholder="Expiry (ISO date, optional)"
+                        placeholderTextColor="#7d8b92"
+                        style={styles.input}
+                      />
+                    ) : (
+                      <TextInput
+                        value={documentForm.dueAt}
+                        onChangeText={(value) => setDocumentForm((current) => ({ ...current, dueAt: value }))}
+                        placeholder="Due date (ISO date, optional)"
+                        placeholderTextColor="#7d8b92"
+                        style={styles.input}
+                      />
+                    )}
+                    <Pressable style={styles.sendButtonWide} onPress={() => void createCommerceDocument({ sendNow: false })}>
+                      <Text style={styles.sendButtonText}>Save draft</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.sendButtonWide, { marginTop: 10 }]}
+                      onPress={() => void createCommerceDocument({ sendNow: true })}
+                    >
+                      <Text style={styles.sendButtonText}>Save & send</Text>
+                    </Pressable>
+                    <Text style={[styles.lightSectionLabel, { marginTop: 16 }]}>YOUR DOCUMENTS</Text>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                      {[
+                        ['all', 'All'],
+                        ['quotation', 'Quotes'],
+                        ['invoice', 'Invoices'],
+                      ].map(([id, label]) => (
+                        <Pressable
+                          key={id}
+                          style={[styles.marketFilterChip, documentKindFilter === id ? styles.marketFilterChipOn : null]}
+                          onPress={() => {
+                            setDocumentKindFilter(id);
+                            void loadCommerceDocuments(currentUserId, id === 'all' ? '' : id);
+                          }}
+                        >
+                          <Text style={styles.marketFilterText}>{label}</Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                    <Pressable style={styles.catalogChip} onPress={() => void loadCommerceDocuments(currentUserId, documentKindFilter === 'all' ? '' : documentKindFilter)}>
+                      <Text style={styles.catalogChipText}>Refresh</Text>
+                    </Pressable>
+                    {commerceDocuments.length ? null : (
+                      <Text style={styles.sheetOptionBody}>No documents yet.</Text>
+                    )}
+                    {commerceDocuments.map((doc) => (
+                      <Pressable
+                        key={doc.id}
+                        style={styles.sheetOption}
+                        onPress={() => setSelectedDocument(doc)}
+                      >
+                        <Text style={styles.sheetOptionTitle}>
+                          {doc.number} · {doc.kind === 'invoice' ? 'Invoice' : 'Quote'}
+                        </Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {doc.customerName} · {doc.state}
+                        </Text>
+                        <Text style={styles.sheetOptionBody}>
+                          {moneyLabel(doc.totalAmount, doc.currency)}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </>
+                )}
+              </ScrollView>
+            ) : null}
+
+            {businessPanel === 'broadcast' ? (
+              <ScrollView style={styles.businessPanelScroll}>
+                <Text style={styles.cardBody}>
+                  Marketing always requires opt-in — even for “all customers”. Segments only include opted-in people.
+                </Text>
+                <Text style={styles.lightSectionLabel}>AUDIENCE</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketFilterRow}>
+                  {[
+                    ['opted_in', 'Opted in', broadcastAudiencePreview.opted_in],
+                    ['repeat_buyers', 'Repeat buyers', broadcastAudiencePreview.repeat_buyers],
+                    ['all_customers', 'All customers', broadcastAudiencePreview.all_customers],
+                  ].map(([id, label, count]) => (
+                    <Pressable
+                      key={id}
+                      style={[styles.marketFilterChip, broadcastSegment === id ? styles.marketFilterChipOn : null]}
+                      onPress={() => setBroadcastSegment(id)}
+                    >
+                      <Text style={styles.marketFilterText}>{label} · {count}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
                 <TextInput
                   value={broadcastDraft}
                   onChangeText={setBroadcastDraft}
@@ -11206,7 +12909,35 @@ function AppContent() {
                 <Pressable style={styles.sendButtonWide} onPress={() => void sendBroadcast()}>
                   <Text style={styles.sendButtonText}>Send broadcast</Text>
                 </Pressable>
-              </View>
+                <Pressable style={[styles.catalogChip, { marginTop: 12 }]} onPress={() => void loadBroadcastCampaigns()}>
+                  <Text style={styles.catalogChipText}>Refresh campaigns</Text>
+                </Pressable>
+                <Text style={[styles.lightSectionLabel, { marginTop: 16 }]}>CAMPAIGN HISTORY</Text>
+                {broadcastCampaigns.length ? null : (
+                  <Text style={styles.sheetOptionBody}>No campaigns yet.</Text>
+                )}
+                {broadcastCampaigns.map((campaign) => (
+                  <View key={campaign.id} style={styles.sheetOption}>
+                    <Text style={styles.sheetOptionTitle} numberOfLines={2}>{campaign.text}</Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {campaign.status} · {campaign.segment}
+                      {' · '}
+                      {campaign.sentCount || 0}/{campaign.audienceCount || 0} sent
+                    </Text>
+                    <Text style={styles.sheetOptionBody}>
+                      {new Date(campaign.createdAt).toLocaleString()}
+                    </Text>
+                    {['draft', 'sending'].includes(campaign.status) ? (
+                      <Pressable
+                        style={styles.catalogChip}
+                        onPress={() => void cancelBroadcastCampaign(campaign.id)}
+                      >
+                        <Text style={styles.catalogChipText}>Cancel</Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ))}
+              </ScrollView>
             ) : null}
           </View>
         </View>
@@ -11244,7 +12975,7 @@ function AppContent() {
                 {commerceOrders.map((order) => {
                   const item = order.items?.[0];
                   return (
-                    <Pressable key={order.id} style={styles.sheetOption} onPress={() => setOrderDetail(order)}>
+                    <Pressable key={order.id} style={styles.sheetOption} onPress={() => openOrderDetail(order)}>
                       <Text style={styles.sheetOptionTitle}>{item?.title || 'Order'}</Text>
                       <Text style={styles.sheetOptionBody}>
                         {orderStateLabel(order.state)} · {order.currency} {order.totalAmount}
@@ -11339,6 +13070,43 @@ function AppContent() {
                 <Text style={styles.sheetOptionBody}>
                   {orderDetail.sellerUserId === currentUserId ? 'You are the seller' : 'You are the buyer'}
                 </Text>
+                {orderDetail.deliveryReference ? (
+                  <Text style={styles.sheetOptionBody}>
+                    Delivery ref: {orderDetail.deliveryReference}
+                  </Text>
+                ) : null}
+                {orderDetail.fulfilmentNote ? (
+                  <Text style={styles.sheetOptionBody}>
+                    Fulfilment note: {orderDetail.fulfilmentNote}
+                  </Text>
+                ) : null}
+                {orderDetail.sellerUserId === currentUserId
+                  && (orderDetail.state === 'processing' || orderDetail.state === 'dispatched') ? (
+                  <View style={{ marginTop: 12, gap: 8 }}>
+                    <Text style={styles.lightSectionLabel}>DELIVERY TRACKING</Text>
+                    <TextInput
+                      value={orderDeliveryDraft.deliveryReference}
+                      onChangeText={(value) => setOrderDeliveryDraft((current) => ({
+                        ...current,
+                        deliveryReference: value,
+                      }))}
+                      placeholder="Delivery reference / tracking #"
+                      placeholderTextColor="#7d8b92"
+                      style={styles.input}
+                    />
+                    <TextInput
+                      value={orderDeliveryDraft.fulfilmentNote}
+                      onChangeText={(value) => setOrderDeliveryDraft((current) => ({
+                        ...current,
+                        fulfilmentNote: value,
+                      }))}
+                      placeholder="Fulfilment note"
+                      placeholderTextColor="#7d8b92"
+                      multiline
+                      style={[styles.input, styles.textArea]}
+                    />
+                  </View>
+                ) : null}
                 {orderDetail.receiptId ? (
                   <Pressable
                     style={[styles.sendButtonWide, { marginTop: 12 }]}
@@ -11363,7 +13131,7 @@ function AppContent() {
                     <Pressable
                       key={state}
                       style={styles.catalogChip}
-                      onPress={() => void updateCommerceOrderState(orderDetail, state)}
+                      onPress={() => runSellerOrderAction(orderDetail, state)}
                     >
                       <Text style={styles.catalogChipText}>{label}</Text>
                     </Pressable>
@@ -11441,7 +13209,7 @@ function AppContent() {
                       onPress={() => {
                         const order = commerceOrders.find((entry) => entry.id === receiptDetail.orderId);
                         setReceiptDetail(null);
-                        if (order) setOrderDetail(order);
+                        if (order) openOrderDetail(order);
                       }}
                     >
                       <Text style={styles.ghostButtonText}>Open order</Text>
@@ -11755,6 +13523,33 @@ function AppContent() {
         <Pressable style={styles.dialogOverlay} onPress={() => setChatMenuVisible(false)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
             <Text style={styles.dialogTitle}>{activeChat?.name || 'Chat'}</Text>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                setChatMenuVisible(false);
+                openAiHelperSheet('suggest_reply');
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>AI helper</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                setChatMenuVisible(false);
+                void requestChatSummary('unread');
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>Summarise unread</Text>
+            </Pressable>
+            <Pressable
+              style={styles.sheetOption}
+              onPress={() => {
+                setChatMenuVisible(false);
+                void requestChatSummary('recent');
+              }}
+            >
+              <Text style={styles.sheetOptionTitle}>Summarise recent</Text>
+            </Pressable>
             <Pressable style={styles.sheetOption} onPress={() => { setChatMenuVisible(false); toggleLockChat(activeChat.id); if (lockedChatIds.includes(activeChat?.id)) setChatScreen('list'); }}>
               <Text style={styles.sheetOptionTitle}>{lockedChatIds.includes(activeChat?.id) ? 'Unlock chat' : 'Lock chat'}</Text>
             </Pressable>
@@ -11810,6 +13605,295 @@ function AppContent() {
             </Pressable>
           </Pressable>
         </Pressable>
+      </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={summarySheetVisible}
+        onRequestClose={() => setSummarySheetVisible(false)}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, styles.summarySheet, { paddingBottom: modalBottomInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>Summarise</Text>
+              <Pressable onPress={() => setSummarySheetVisible(false)}>
+                <Text style={styles.sheetBackText}>Close</Text>
+              </Pressable>
+            </View>
+            <View style={styles.aiToneRow}>
+              {['unread', 'recent'].map((scope) => (
+                <Pressable
+                  key={scope}
+                  style={[styles.aiToneChip, summaryScope === scope ? styles.aiToneChipActive : null]}
+                  disabled={summaryBusy}
+                  onPress={() => void requestChatSummary(scope)}
+                >
+                  <Text style={[styles.aiToneChipText, summaryScope === scope ? styles.aiToneChipTextActive : null]}>
+                    {scope}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {summaryBusy && !summaryResult ? (
+              <ActivityIndicator color="#8fd6c4" />
+            ) : null}
+            <ScrollView style={styles.summaryScroll} contentContainerStyle={styles.summaryScrollContent}>
+              {summaryResult?.summary?.overview ? (
+                <Text style={styles.summaryOverview}>{summaryResult.summary.overview}</Text>
+              ) : null}
+              {summaryResult?.summary?.notice || summaryResult?.summary ? (
+                <Text style={styles.summaryNotice}>
+                  {summaryResult?.summary?.notice
+                    || 'Action items are suggestions only. Review the chat before acting.'}
+                </Text>
+              ) : null}
+              {[
+                { key: 'questions', title: 'Questions' },
+                { key: 'decisions', title: 'Decisions' },
+                { key: 'actionSuggestions', title: 'Action suggestions' },
+                { key: 'highlights', title: 'Highlights' },
+              ].map((section) => {
+                const items = summaryResult?.summary?.[section.key] || [];
+                if (!items.length) {
+                  return null;
+                }
+                return (
+                  <View key={section.key} style={styles.summarySection}>
+                    <Text style={styles.summarySectionTitle}>{section.title}</Text>
+                    {items.map((item) => (
+                      <Pressable
+                        key={`${section.key}-${item.messageId}-${item.sentAt}`}
+                        style={styles.summaryItem}
+                        onPress={() => {
+                          setSummarySheetVisible(false);
+                          scrollToMessageId(item.messageId);
+                        }}
+                      >
+                        <Text style={styles.summaryItemText}>{item.text}</Text>
+                        <Text style={styles.summaryItemMeta}>
+                          {displayNameFor(item.senderId, 'Member')} · tap to jump
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                );
+              })}
+              {!summaryBusy && summaryResult?.summary && !(
+                (summaryResult.summary.questions || []).length
+                || (summaryResult.summary.decisions || []).length
+                || (summaryResult.summary.actionSuggestions || []).length
+                || (summaryResult.summary.highlights || []).length
+              ) ? (
+                <Text style={styles.summaryNotice}>No extractable items in this scope.</Text>
+              ) : null}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={dictateSheetVisible}
+        onRequestClose={() => setDictateSheetVisible(false)}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, { paddingBottom: modalBottomInset + keyboardInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>Dictate</Text>
+              <Pressable onPress={() => setDictateSheetVisible(false)}>
+                <Text style={styles.sheetBackText}>Close</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.summaryNotice}>
+              Use your keyboard mic (on-device) to speak into the box below, or paste text. Review before send — dictation never sends automatically.
+            </Text>
+            <TextInput
+              value={dictateDraft}
+              onChangeText={setDictateDraft}
+              placeholder="Speak or paste here…"
+              placeholderTextColor="#7d8b92"
+              multiline
+              autoFocus
+              textAlignVertical="top"
+              style={styles.dictateInput}
+            />
+            <View style={styles.aiAssistRow}>
+              <Pressable
+                style={[styles.aiAssistButton, dictateBusy ? styles.aiAssistButtonBusy : null]}
+                disabled={dictateBusy || !dictateDraft.trim()}
+                onPress={() => void normalizeDictateDraft()}
+              >
+                <Text style={styles.aiAssistButtonText}>{dictateBusy ? '…' : 'Normalize'}</Text>
+              </Pressable>
+              <Pressable
+                style={styles.aiAssistButton}
+                disabled={!dictateDraft.trim()}
+                onPress={() => useDictateInComposer(dictateDraft)}
+              >
+                <Text style={styles.aiAssistButtonText}>Use in draft</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.summaryNotice}>Label: review before send</Text>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        transparent
+        animationType="slide"
+        visible={aiHelperSheetVisible}
+        onRequestClose={() => setAiHelperSheetVisible(false)}
+      >
+        <View style={styles.statusComposerOverlay}>
+          <View style={[styles.statusComposerSheet, styles.summarySheet, { paddingBottom: modalBottomInset + keyboardInset }]}>
+            <View style={styles.statusComposerHeader}>
+              <Text style={styles.statusComposerTitle}>AI helper</Text>
+              <Pressable onPress={() => setAiHelperSheetVisible(false)}>
+                <Text style={styles.sheetBackText}>Close</Text>
+              </Pressable>
+            </View>
+            <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.summaryScrollContent}>
+              <Text style={styles.summaryNotice}>
+                Pick a task, review the result, then put it in your draft. Nothing is sent automatically.
+              </Text>
+              <View style={styles.aiToneRow}>
+                {[
+                  ['draft', 'Draft'],
+                  ['rewrite', 'Rewrite'],
+                  ['summarise', 'Summarise'],
+                  ['translate', 'Translate'],
+                  ['suggest_reply', 'Suggest'],
+                  ['explain', 'Explain'],
+                ].map(([id, label]) => (
+                  <Pressable
+                    key={id}
+                    style={[styles.aiToneChip, aiHelperTask === id ? styles.aiToneChipActive : null]}
+                    onPress={() => {
+                      setAiHelperTask(id);
+                      setAiHelperPayload(null);
+                    }}
+                  >
+                    <Text style={[styles.aiToneChipText, aiHelperTask === id ? styles.aiToneChipTextActive : null]}>
+                      {label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              {(aiHelperTask === 'draft' || aiHelperTask === 'rewrite' || aiHelperTask === 'translate' || aiHelperTask === 'explain') ? (
+                <View style={styles.aiToneRow}>
+                  {['polite', 'concise', 'professional', 'friendly', 'apologetic'].map((tone) => (
+                    <Pressable
+                      key={tone}
+                      style={[styles.aiToneChip, aiRewriteTone === tone ? styles.aiToneChipActive : null]}
+                      onPress={() => setAiRewriteTone(tone)}
+                    >
+                      <Text style={[styles.aiToneChipText, aiRewriteTone === tone ? styles.aiToneChipTextActive : null]}>
+                        {tone}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
+              {aiHelperTask === 'translate' ? (
+                <View style={styles.aiToneRow}>
+                  {['en', 'tw', 'ga', 'ee', 'pcm'].map((code) => (
+                    <Pressable
+                      key={code}
+                      style={[styles.aiToneChip, aiHelperTargetLang === code ? styles.aiToneChipActive : null]}
+                      onPress={() => setAiHelperTargetLang(code)}
+                    >
+                      <Text style={[styles.aiToneChipText, aiHelperTargetLang === code ? styles.aiToneChipTextActive : null]}>
+                        {code}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
+              <TextInput
+                value={aiHelperPrompt}
+                onChangeText={setAiHelperPrompt}
+                placeholder={
+                  aiHelperTask === 'draft'
+                    ? 'Describe what to draft…'
+                    : aiHelperTask === 'explain'
+                      ? 'Text to explain…'
+                      : 'Optional prompt or text…'
+                }
+                placeholderTextColor="#7d8b92"
+                multiline
+                textAlignVertical="top"
+                style={styles.dictateInput}
+              />
+              <Pressable
+                style={styles.settingsToggleRow}
+                onPress={() => setAiHelperConsent((current) => !current)}
+              >
+                <View style={styles.settingsToggleCopy}>
+                  <Text style={styles.settingsToggleLabel}>Share chat context</Text>
+                  <Text style={styles.settingsToggleHelper}>
+                    Required for suggest / summarise. Confirms consentToShareContext when chat is used.
+                  </Text>
+                </View>
+                <Switch
+                  value={aiHelperConsent}
+                  onValueChange={setAiHelperConsent}
+                  trackColor={{ false: '#3a4650', true: '#2f8f7b' }}
+                  thumbColor={aiHelperConsent ? '#dff7f1' : '#d0d7dc'}
+                />
+              </Pressable>
+              <View style={styles.aiAssistRow}>
+                <Pressable
+                  style={[styles.aiAssistButton, aiHelperBusy ? styles.aiAssistButtonBusy : null]}
+                  disabled={aiHelperBusy}
+                  onPress={() => void runAiHelper()}
+                >
+                  <Text style={styles.aiAssistButtonText}>{aiHelperBusy ? '…' : 'Run'}</Text>
+                </Pressable>
+                {aiHelperPayload?.result ? (
+                  <Pressable
+                    style={styles.aiAssistButton}
+                    onPress={() => applyAiHelperToDraft(aiHelperPayload.result)}
+                  >
+                    <Text style={styles.aiAssistButtonText}>Use in draft</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+              {aiHelperBusy && !aiHelperPayload ? (
+                <ActivityIndicator color="#8fd6c4" />
+              ) : null}
+              {aiHelperPayload?.result ? (
+                <Text style={styles.summaryOverview}>{aiHelperPayload.result}</Text>
+              ) : null}
+              {aiHelperPayload?.summary?.overview ? (
+                <>
+                  <Text style={styles.summaryOverview}>{aiHelperPayload.summary.overview}</Text>
+                  <Pressable
+                    style={styles.aiAssistButton}
+                    onPress={() => applyAiHelperToDraft(aiHelperPayload.summary.overview)}
+                  >
+                    <Text style={styles.aiAssistButtonText}>Use summary in draft</Text>
+                  </Pressable>
+                </>
+              ) : null}
+              {(aiHelperPayload?.suggestions || []).length ? (
+                <View style={styles.aiChipRow}>
+                  {aiHelperPayload.suggestions.map((suggestion) => (
+                    <Pressable
+                      key={suggestion.id || suggestion.text}
+                      style={styles.aiSuggestionChip}
+                      onPress={() => applyAiHelperToDraft(suggestion.text)}
+                    >
+                      <Text numberOfLines={3} style={styles.aiSuggestionChipText}>{suggestion.text}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
+              {aiHelperPayload?.notice ? (
+                <Text style={styles.summaryNotice}>{aiHelperPayload.notice}</Text>
+              ) : null}
+              <Text style={styles.summaryNotice}>autoSend: false</Text>
+            </ScrollView>
+          </View>
+        </View>
       </Modal>
       <Modal
         transparent
@@ -13677,6 +15761,33 @@ const styles = StyleSheet.create({
   businessPanelScroll: {
     maxHeight: 520,
   },
+  documentFormRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  documentFormHalf: {
+    flex: 1,
+  },
+  documentChip: {
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: '#12324a',
+    gap: 2,
+  },
+  documentChipLabel: {
+    color: '#9fd5c8',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  documentChipMeta: {
+    color: '#f4f8fb',
+    fontWeight: '700',
+    fontSize: 14,
+  },
   catalogManageRow: {
     flexDirection: 'row',
     gap: 12,
@@ -13977,11 +16088,72 @@ const styles = StyleSheet.create({
     marginTop: 10,
     fontSize: 15,
   },
+  voiceNoteBlock: {
+    gap: 8,
+    minWidth: 190,
+  },
   voiceNote: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     minWidth: 190,
+  },
+  voiceTranscriptText: {
+    color: '#e3ecef',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  voiceTranscriptMeta: {
+    color: '#9ab0b8',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  voiceTranscribeChip: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  voiceTranscribeChipText: {
+    color: '#f6f7f8',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  messageTranslationBlock: {
+    marginTop: 8,
+    gap: 6,
+  },
+  messageTranslationText: {
+    color: '#d5e2e8',
+    fontSize: 14,
+    lineHeight: 20,
+    fontStyle: 'italic',
+  },
+  messageTranslationBadge: {
+    color: '#9ab0b8',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  translateLangRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  translateChip: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+  },
+  translateChipDefault: {
+    backgroundColor: 'rgba(124,255,178,0.18)',
+  },
+  translateChipText: {
+    color: '#f6f7f8',
+    fontWeight: '700',
+    fontSize: 12,
   },
   voiceIcon: {
     color: '#f6f7f8',
@@ -14105,6 +16277,162 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+  },
+  aiAssistRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingBottom: 6,
+  },
+  aiAssistButton: {
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#172228',
+    borderWidth: 1,
+    borderColor: '#2a3b42',
+  },
+  aiAssistButtonBusy: {
+    opacity: 0.55,
+  },
+  aiAssistButtonText: {
+    color: '#d5e2e8',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  aiToneRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingBottom: 6,
+  },
+  aiToneChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: '#1b262d',
+  },
+  aiToneChipActive: {
+    backgroundColor: '#12324a',
+  },
+  aiToneChipText: {
+    color: '#9ab0b8',
+    fontSize: 11,
+    fontWeight: '700',
+    textTransform: 'capitalize',
+  },
+  aiToneChipTextActive: {
+    color: '#f4f8fb',
+  },
+  aiChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingBottom: 8,
+  },
+  aiSuggestionChip: {
+    maxWidth: '100%',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 14,
+    backgroundColor: '#12324a',
+  },
+  aiSuggestionChipText: {
+    color: '#f4f8fb',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  summarySheet: {
+    maxHeight: '78%',
+  },
+  summaryScroll: {
+    maxHeight: 420,
+  },
+  summaryScrollContent: {
+    gap: 12,
+    paddingBottom: 8,
+  },
+  summaryOverview: {
+    color: '#f4f8fb',
+    fontSize: 15,
+    fontWeight: '700',
+    lineHeight: 22,
+  },
+  summaryNotice: {
+    color: '#9ab0b8',
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  summarySection: {
+    gap: 8,
+  },
+  summarySectionTitle: {
+    color: '#8fd6c4',
+    fontSize: 12,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  summaryItem: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 14,
+    backgroundColor: '#172228',
+    borderWidth: 1,
+    borderColor: '#2a3b42',
+    gap: 4,
+  },
+  summaryItemText: {
+    color: '#e8f1f5',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
+  },
+  summaryItemMeta: {
+    color: '#7d8b92',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  dictateInput: {
+    minHeight: 120,
+    maxHeight: 180,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: '#172228',
+    borderWidth: 1,
+    borderColor: '#2a3b42',
+    color: '#f4f8fb',
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  scamWarningBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginHorizontal: 12,
+    marginBottom: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#3a1a1a',
+    borderWidth: 1,
+    borderColor: '#7a3030',
+  },
+  scamWarningTitle: {
+    color: '#ff8f8f',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  scamWarningText: {
+    color: '#f0cfcf',
+    fontSize: 13,
+    lineHeight: 18,
   },
   roundButton: {
     width: 42,
@@ -16168,6 +18496,16 @@ const styles = StyleSheet.create({
   },
   messageDeletedBubble: {
     opacity: 0.72,
+  },
+  messageAutomatedBubble: {
+    borderWidth: 1,
+    borderColor: '#9bb8b3',
+  },
+  automatedBadge: {
+    fontSize: 11,
+    color: '#5f7a75',
+    marginBottom: 4,
+    fontWeight: '600',
   },
   chatCameraScreen: {
     flex: 1,
