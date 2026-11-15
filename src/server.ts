@@ -955,9 +955,35 @@ const updateProfileSchema = z.object({
   pin: z.string().regex(/^\d{4,6}$/).optional(),
 });
 
-const blockUserSchema = z.object({
+const blockUserSchema = z
+  .object({
+    userId: z.string().min(1),
+    targetUserId: z.string().min(1).optional(),
+    targetPhone: z.string().min(6).max(30).optional(),
+  })
+  .refine((data) => Boolean(data.targetUserId || data.targetPhone), {
+    message: 'Choose who to block.',
+  });
+
+const USER_REPORT_REASONS = [
+  'spam',
+  'harassment',
+  'scam',
+  'inappropriate',
+  'impersonation',
+  'other',
+] as const;
+
+const userReportSchema = z.object({
   userId: z.string().min(1),
-  targetUserId: z.string().min(1),
+  targetUserId: z.string().min(1).optional(),
+  targetPhone: z.string().min(6).max(30).optional(),
+  messageId: z.string().min(1).optional(),
+  chatId: z.string().min(1).optional(),
+  reason: z.enum(USER_REPORT_REASONS),
+  details: z.string().max(500).optional(),
+}).refine((data) => Boolean(data.targetUserId || data.targetPhone || data.messageId), {
+  message: 'Choose who or what to report.',
 });
 
 const chatDisappearSchema = z.object({
@@ -11316,29 +11342,166 @@ app.patch('/api/messages/:messageId/receipt', async (req, res) => {
   return res.json({ message });
 });
 
+const resolveBlockTargetUserId = async (input: {
+  targetUserId?: string;
+  targetPhone?: string;
+}): Promise<{ userId: string | null; error?: string }> => {
+  if (input.targetUserId) {
+    return { userId: input.targetUserId };
+  }
+  if (input.targetPhone) {
+    const match = await findUserByPhoneLoose(input.targetPhone);
+    if (!match) {
+      return { userId: null, error: 'No ZynkUp account found for that number.' };
+    }
+    return { userId: match.id };
+  }
+  return { userId: null, error: 'Choose who to block.' };
+};
+
 app.post('/api/users/block', async (req, res) => {
   const parseResult = blockUserSchema.safeParse(req.body);
   if (!parseResult.success) {
-    return res.status(400).json({ error: 'Choose who to block.' });
+    return res.status(400).json({ error: 'Choose who to block (user id or phone).' });
   }
-  if (parseResult.data.userId === parseResult.data.targetUserId) {
+  const resolved = await resolveBlockTargetUserId(parseResult.data);
+  if (!resolved.userId) {
+    return res.status(404).json({ error: resolved.error || 'User not found.' });
+  }
+  if (parseResult.data.userId === resolved.userId) {
     return res.status(400).json({ error: 'You cannot block yourself.' });
   }
   const profile = await readProfile(parseResult.data.userId);
-  const blockedUserIds = [...new Set([...(profile?.blockedUserIds ?? []), parseResult.data.targetUserId])];
+  const blockedUserIds = [...new Set([...(profile?.blockedUserIds ?? []), resolved.userId])];
   const next = await updateProfile(parseResult.data.userId, { blockedUserIds });
-  return res.json({ profile: next, blockedUserIds });
+  return res.json({ profile: next, blockedUserIds, targetUserId: resolved.userId });
 });
 
 app.post('/api/users/unblock', async (req, res) => {
   const parseResult = blockUserSchema.safeParse(req.body);
   if (!parseResult.success) {
-    return res.status(400).json({ error: 'Choose who to unblock.' });
+    return res.status(400).json({ error: 'Choose who to unblock (user id or phone).' });
+  }
+  const resolved = await resolveBlockTargetUserId(parseResult.data);
+  if (!resolved.userId) {
+    return res.status(404).json({ error: resolved.error || 'User not found.' });
   }
   const profile = await readProfile(parseResult.data.userId);
-  const blockedUserIds = (profile?.blockedUserIds ?? []).filter((id) => id !== parseResult.data.targetUserId);
+  const blockedUserIds = (profile?.blockedUserIds ?? []).filter((id) => id !== resolved.userId);
   const next = await updateProfile(parseResult.data.userId, { blockedUserIds });
-  return res.json({ profile: next, blockedUserIds });
+  return res.json({ profile: next, blockedUserIds, targetUserId: resolved.userId });
+});
+
+app.get('/api/users/blocked', async (req, res) => {
+  const userId = String(req.query.userId || '').trim();
+  if (!userId) {
+    return res.status(400).json({ error: 'Sign in to see blocked contacts.' });
+  }
+  const profile = await readProfile(userId);
+  const blockedUserIds = profile?.blockedUserIds ?? [];
+  const users = await readUsers();
+  const profiles = await readProfiles();
+  const blocked = blockedUserIds.map((id) => {
+    const user = users.find((item) => item.id === id);
+    const peerProfile = profiles.find((item) => item.id === id);
+    return {
+      id,
+      name: peerProfile?.name || user?.name || 'Blocked user',
+      phone: peerProfile?.phone || user?.phone || '',
+      username: peerProfile?.username || '',
+      photoUri: peerProfile?.photoUri || user?.avatar || '',
+    };
+  });
+  return res.json({ blockedUserIds, blocked });
+});
+
+app.post('/api/users/report', async (req, res) => {
+  const parseResult = userReportSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Pick a reason and who or what you are reporting.',
+      reasons: USER_REPORT_REASONS,
+    });
+  }
+  const data = parseResult.data;
+  let targetUserId = data.targetUserId && data.targetUserId !== 'anonymous'
+    ? data.targetUserId
+    : null;
+  if (!targetUserId && data.targetPhone) {
+    const match = await findUserByPhoneLoose(data.targetPhone);
+    targetUserId = match?.id || null;
+  }
+  if ((!targetUserId || targetUserId === 'anonymous') && data.messageId) {
+    const messages = await readMessages();
+    const message = messages.find((item) => item.id === data.messageId);
+    if (message?.senderId && message.senderId !== 'anonymous') {
+      targetUserId = message.senderId;
+    }
+  }
+  if (!targetUserId || targetUserId === 'anonymous') {
+    return res.status(404).json({ error: 'Could not find the account to report.' });
+  }
+  if (targetUserId === data.userId) {
+    return res.status(400).json({ error: 'You cannot report yourself.' });
+  }
+
+  const [users, profiles] = await Promise.all([readUsers(), readProfiles()]);
+  const reporter = users.find((item) => item.id === data.userId);
+  const target = users.find((item) => item.id === targetUserId);
+  const targetProfile = profiles.find((item) => item.id === targetUserId);
+  const report = {
+    id: `ur${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: data.messageId ? 'message' : 'user',
+    reporterUserId: data.userId,
+    reporterName: reporter?.name || '',
+    reporterPhone: reporter?.phone || '',
+    targetUserId,
+    targetName: targetProfile?.name || target?.name || '',
+    targetPhone: targetProfile?.phone || target?.phone || data.targetPhone || '',
+    messageId: data.messageId || null,
+    chatId: data.chatId || null,
+    reason: data.reason,
+    details: (data.details || '').trim(),
+    state: 'open' as const,
+    createdAt: new Date().toISOString(),
+    reviewedAt: null as string | null,
+    reviewNote: '',
+  };
+
+  const db = await getDb();
+  if (db) {
+    await db.collection('userReports').insertOne({ ...report });
+  }
+  void recordAdminEvent(getDb, {
+    level: 'warn',
+    area: 'safety',
+    message: data.messageId ? 'Message reported' : 'User reported',
+    detail: `${targetUserId} · ${data.reason}${data.messageId ? ` · msg ${data.messageId}` : ''}`,
+  });
+  return res.status(201).json({
+    report,
+    message: 'Thanks — our team can review this report.',
+  });
+});
+
+app.get('/api/users/report-reasons', (_req, res) => {
+  return res.json({
+    reasons: USER_REPORT_REASONS.map((id) => ({
+      id,
+      label:
+        id === 'spam'
+          ? 'Spam'
+          : id === 'harassment'
+            ? 'Harassment or bullying'
+            : id === 'scam'
+              ? 'Scam or fraud'
+              : id === 'inappropriate'
+                ? 'Inappropriate content'
+                : id === 'impersonation'
+                  ? 'Impersonation'
+                  : 'Something else',
+    })),
+  });
 });
 
 app.patch('/api/chats/:chatId/disappear', async (req, res) => {

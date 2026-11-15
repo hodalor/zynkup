@@ -444,6 +444,54 @@ export const mountAdmin = (app: Express, deps: AdminDeps) => {
     });
   });
 
+  app.get('/api/admin/reports', requireAdmin, async (req, res) => {
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const state = String(req.query.state || '').trim();
+    const filter = state ? { state } : {};
+    const reports = await db
+      .collection('userReports')
+      .find(filter, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .toArray();
+    return res.json({
+      reports,
+      open: reports.filter((item) => item.state === 'open').length,
+      reviewed: reports.filter((item) => item.state === 'reviewed' || item.state === 'actioned').length,
+      dismissed: reports.filter((item) => item.state === 'dismissed').length,
+    });
+  });
+
+  app.patch('/api/admin/reports/:reportId', requireAdmin, async (req, res) => {
+    const state = String(req.body?.state || '');
+    const reviewNote = String(req.body?.reviewNote || '').slice(0, 400);
+    if (!['reviewed', 'dismissed', 'actioned', 'open'].includes(state)) {
+      return res.status(400).json({ error: 'Choose reviewed, dismissed, actioned, or open.' });
+    }
+    const db = await deps.getDb();
+    if (!db) return res.status(503).json({ error: 'Database is not connected.' });
+    const now = new Date().toISOString();
+    const result = await db.collection('userReports').updateOne(
+      { id: param(req.params.reportId) },
+      {
+        $set: {
+          state,
+          reviewNote,
+          reviewedAt: state === 'open' ? null : now,
+        },
+      },
+    );
+    if (!result.matchedCount) return res.status(404).json({ error: 'Report not found' });
+    await recordAdminEvent(deps.getDb, {
+      level: 'info',
+      area: 'safety',
+      message: `User report ${state}`,
+      detail: param(req.params.reportId),
+    });
+    return res.json({ ok: true, state });
+  });
+
   app.post('/api/admin/businesses/:businessId/verify', requireAdmin, async (req, res) => {
     const decision = String(req.body?.decision || '');
     const note = String(req.body?.note || '').slice(0, 280);
