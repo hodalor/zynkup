@@ -100,6 +100,7 @@ type Message = {
   replyPreview?: string;
   catalogItemId?: string;
   receiptId?: string;
+  paymentRequestId?: string;
   deletedForEveryone?: boolean;
   deletedFor?: string[];
   anonymous?: boolean;
@@ -508,7 +509,7 @@ type CommerceOrder = {
   updatedAt: string;
 };
 
-type SaleReceiptState = 'issued' | 'voided' | 'refunded';
+type SaleReceiptState = 'issued' | 'voided' | 'refunded' | 'disputed';
 
 type SaleReceipt = {
   id: string;
@@ -531,7 +532,43 @@ type SaleReceipt = {
   paymentReference: string;
   state: SaleReceiptState;
   linkedReceiptId?: string | null;
+  disputeNote?: string | null;
+  disputeByUserId?: string | null;
+  disputedAt?: string | null;
   issuedAt: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type PaymentShareStatus = 'pending' | 'initialized' | 'paid' | 'failed' | 'cancelled';
+
+type PaymentShare = {
+  userId: string;
+  phone?: string;
+  name?: string;
+  amount: number;
+  status: PaymentShareStatus;
+  paymentId?: string | null;
+  authorizationUrl?: string | null;
+  paidAt?: string | null;
+};
+
+type PaymentRequestKind = 'request' | 'split';
+type PaymentRequestStatus = 'open' | 'partial' | 'paid' | 'cancelled' | 'expired';
+
+type PaymentRequestRecord = {
+  id: string;
+  kind: PaymentRequestKind;
+  creatorUserId: string;
+  /** Who should receive the money (usually the creator). */
+  recipientUserId: string;
+  amount: number;
+  currency: string;
+  note?: string;
+  chatId?: string | null;
+  shares: PaymentShare[];
+  status: PaymentRequestStatus;
+  dueAt?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -738,6 +775,8 @@ const seedStatuses: StatusPost[] = [];
 const seedCatalogItems: CatalogItem[] = [];
 const seedOrders: CommerceOrder[] = [];
 const seedReceipts: SaleReceipt[] = [];
+const seedPaymentRequests: PaymentRequestRecord[] = [];
+const seedPayments: Array<Record<string, unknown>> = [];
 const receiptCounters: Record<string, number> = {};
 const seedInventoryMovements: InventoryMovement[] = [];
 const seedInventoryAlerts: InventoryAlert[] = [];
@@ -1339,9 +1378,45 @@ const paymentIntentSchema = z.object({
   note: z.string().max(160).optional(),
   userId: z.string().min(1).optional(),
   orderId: z.string().min(1).max(80).optional(),
+  chatId: z.string().min(1).max(80).optional(),
+  targetUserId: z.string().min(1).max(80).optional(),
+  paymentRequestId: z.string().min(1).max(80).optional(),
   // Paystack is the default card/MoMo aggregator (not Flutterwave). MTN MoMo direct remains optional.
   provider: z.enum(['paystack', 'mtn_momo', 'vodafone_cash', 'airteltigo']).default('paystack'),
   callbackUrl: z.string().url().optional(),
+});
+
+const paymentSplitSchema = z.object({
+  userId: z.string().min(1),
+  amount: z.number().positive(),
+  currency: z.string().min(3).max(5).default('GHS'),
+  note: z.string().max(160).optional(),
+  chatId: z.string().min(1).max(80).optional(),
+  /** Equal split among these user ids (creator may be included). */
+  participantUserIds: z.array(z.string().min(1)).min(1).max(24).optional(),
+  /** Optional custom shares; amounts must sum to total when provided. */
+  shares: z.array(z.object({
+    userId: z.string().min(1),
+    amount: z.number().positive(),
+    phone: z.string().min(6).max(30).optional(),
+  })).min(1).max(24).optional(),
+  dueAt: z.string().datetime().optional(),
+});
+
+const paymentRequestPaySchema = z.object({
+  userId: z.string().min(1),
+  email: z.string().email().optional(),
+  callbackUrl: z.string().url().optional(),
+});
+
+const paymentVerifySchema = z.object({
+  reference: z.string().min(3).max(120),
+  userId: z.string().min(1).optional(),
+});
+
+const receiptDisputeSchema = z.object({
+  userId: z.string().min(1),
+  note: z.string().trim().min(4).max(400),
 });
 
 const createOrderSchema = z.object({
@@ -3732,6 +3807,271 @@ const saveSaleReceipt = async (receipt: SaleReceipt) => {
   await seedDatabaseIfNeeded();
   await db.collection<SaleReceipt>('saleReceipts').updateOne({ id: receipt.id }, { $set: receipt }, { upsert: true });
   return receipt;
+};
+
+const readPaymentRequests = async (): Promise<PaymentRequestRecord[]> => {
+  const db = await getDb();
+  if (!db) return [...seedPaymentRequests];
+  await seedDatabaseIfNeeded();
+  return db.collection<PaymentRequestRecord>('paymentRequests')
+    .find({}, { projection: { _id: 0 }, sort: { createdAt: -1 } })
+    .toArray();
+};
+
+const savePaymentRequest = async (request: PaymentRequestRecord) => {
+  const db = await getDb();
+  if (!db) {
+    const index = seedPaymentRequests.findIndex((item) => item.id === request.id);
+    if (index >= 0) seedPaymentRequests[index] = request;
+    else seedPaymentRequests.unshift(request);
+    return request;
+  }
+  await seedDatabaseIfNeeded();
+  await db.collection<PaymentRequestRecord>('paymentRequests').updateOne(
+    { id: request.id },
+    { $set: request },
+    { upsert: true },
+  );
+  return request;
+};
+
+const findPaymentById = async (paymentId: string) => {
+  const db = await getDb();
+  if (!db) {
+    return seedPayments.find((item) => item.id === paymentId) || null;
+  }
+  await seedDatabaseIfNeeded();
+  return db.collection('payments').findOne({ id: paymentId }, { projection: { _id: 0 } });
+};
+
+const savePaymentRecord = async (payment: Record<string, unknown>) => {
+  const id = String(payment.id || '');
+  const db = await getDb();
+  if (!db) {
+    const index = seedPayments.findIndex((item) => item.id === id);
+    if (index >= 0) seedPayments[index] = payment;
+    else seedPayments.unshift(payment);
+    return payment;
+  }
+  await seedDatabaseIfNeeded();
+  await db.collection('payments').updateOne({ id }, { $set: payment }, { upsert: true });
+  return payment;
+};
+
+const findUserByPhoneLoose = async (phone: string) => {
+  const cleaned = sanitizePhone(phone);
+  if (cleaned.replace(/\D/g, '').length < 8) return null;
+  const users = await readUsers();
+  return users.find((user) => phonesMatch(user.phone, cleaned)) || null;
+};
+
+const moneyRound2 = (value: number) => Math.round(value * 100) / 100;
+
+const buildEqualShares = (
+  total: number,
+  participants: Array<{ userId: string; phone?: string; name?: string }>,
+): PaymentShare[] => {
+  const count = participants.length;
+  if (count === 0) return [];
+  const base = moneyRound2(Math.floor((total * 100) / count) / 100);
+  let allocated = 0;
+  return participants.map((participant, index) => {
+    const amount = index === count - 1
+      ? moneyRound2(total - allocated)
+      : base;
+    allocated = moneyRound2(allocated + amount);
+    return {
+      userId: participant.userId,
+      phone: participant.phone,
+      name: participant.name,
+      amount,
+      status: 'pending' as const,
+      paymentId: null,
+      authorizationUrl: null,
+      paidAt: null,
+    };
+  });
+};
+
+const refreshPaymentRequestStatus = (request: PaymentRequestRecord): PaymentRequestRecord => {
+  const paidCount = request.shares.filter((share) => share.status === 'paid').length;
+  let status: PaymentRequestStatus = 'open';
+  if (paidCount === request.shares.length && request.shares.length > 0) status = 'paid';
+  else if (paidCount > 0) status = 'partial';
+  return { ...request, status, updatedAt: new Date().toISOString() };
+};
+
+const initializePaystackCheckout = async (params: {
+  amount: number;
+  currency: string;
+  email?: string;
+  userId?: string;
+  reference: string;
+  callbackUrl?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<{
+  status: 'awaiting_provider_keys' | 'initialized';
+  authorizationUrl: string | null;
+  accessCode: string | null;
+  providerReference: string | null;
+  providerPayload: Record<string, unknown> | null;
+  error?: string;
+}> => {
+  const paystackSecret = (process.env.PAYSTACK_SECRET_KEY || '').trim();
+  if (!paystackSecret) {
+    return {
+      status: 'awaiting_provider_keys',
+      authorizationUrl: null,
+      accessCode: null,
+      providerReference: null,
+      providerPayload: null,
+    };
+  }
+  try {
+    const amountKobo = Math.round(params.amount * 100);
+    const email = params.email
+      || (params.userId ? `${params.userId.replace(/[^a-zA-Z0-9]/g, '')}@zynkup.payments` : 'payments@zynkup.app');
+    const response = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${paystackSecret}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email,
+        amount: amountKobo,
+        currency: params.currency.toUpperCase(),
+        reference: params.reference,
+        callback_url: params.callbackUrl,
+        metadata: params.metadata || {},
+      }),
+    });
+    const payload = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      data?: { authorization_url?: string; access_code?: string; reference?: string };
+    };
+    if (!response.ok || !payload.status) {
+      return {
+        status: 'awaiting_provider_keys',
+        authorizationUrl: null,
+        accessCode: null,
+        providerReference: null,
+        providerPayload: null,
+        error: payload.message || `Paystack initialize failed (${response.status})`,
+      };
+    }
+    return {
+      status: 'initialized',
+      authorizationUrl: payload.data?.authorization_url || null,
+      accessCode: payload.data?.access_code || null,
+      providerReference: payload.data?.reference || params.reference,
+      providerPayload: { paystack: payload.data },
+    };
+  } catch (error) {
+    return {
+      status: 'awaiting_provider_keys',
+      authorizationUrl: null,
+      accessCode: null,
+      providerReference: null,
+      providerPayload: null,
+      error: error instanceof Error ? error.message : 'Paystack request failed',
+    };
+  }
+};
+
+const notifyPaymentRequest = async (request: PaymentRequestRecord, chatId?: string | null) => {
+  const now = new Date().toISOString();
+  const users = await readUsers();
+  const creator = users.find((user) => user.id === request.creatorUserId);
+  const preview = request.kind === 'split'
+    ? `Split request ${request.currency} ${request.amount}${request.note ? ` · ${request.note}` : ''}`
+    : `Payment request ${request.currency} ${request.amount}${request.note ? ` · ${request.note}` : ''}`;
+
+  const targetUserIds = [...new Set([
+    ...request.shares.map((share) => share.userId),
+  ])].filter((id) => id && id !== request.creatorUserId);
+
+  let groupChat: Chat | null = null;
+  if (chatId) {
+    groupChat = (await readChats()).find((entry) => entry.id === chatId) || null;
+  }
+
+  if (groupChat && groupChat.kind === 'group') {
+    const text = `${creator?.name || 'Someone'} started a ${request.kind === 'split' ? 'split' : 'payment'} request for ${request.currency} ${request.amount}${request.note ? ` · ${request.note}` : ''}`;
+    const message: Message = {
+      id: `m${Date.now()}`,
+      chatId: groupChat.id,
+      senderId: request.creatorUserId,
+      kind: 'text',
+      text,
+      mediaUrls: [],
+      sentAt: now,
+      state: 'sent',
+      paymentRequestId: request.id,
+      actorName: creator?.name,
+    };
+    await persistMessage(message);
+    const updatedChat = {
+      ...groupChat,
+      lastMessagePreview: preview,
+      updatedAt: now,
+    };
+    const db = await getDb();
+    if (!db) {
+      const index = seedChats.findIndex((entry) => entry.id === groupChat!.id);
+      if (index >= 0) seedChats[index] = updatedChat;
+    } else {
+      await collectionsFor(db).chats.updateOne({ id: groupChat.id }, { $set: updatedChat });
+    }
+    groupChat.participants.forEach((participantId) => {
+      io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+      io.to(`user:${participantId}`).emit('chat:updated', updatedChat);
+    });
+  } else {
+    for (const targetUserId of targetUserIds) {
+      const share = request.shares.find((item) => item.userId === targetUserId);
+      const shareText = share
+        ? `Your share: ${request.currency} ${share.amount}`
+        : `Amount: ${request.currency} ${request.amount}`;
+      const text = `${creator?.name || 'Someone'} sent a ${request.kind === 'split' ? 'split' : 'payment'} request. ${shareText}${request.note ? ` · ${request.note}` : ''}`;
+      const thread = await createOrFindDirectChat(request.creatorUserId, targetUserId);
+      if (!thread) continue;
+      const message: Message = {
+        id: `m${Date.now()}-${targetUserId.slice(-4)}`,
+        chatId: thread.id,
+        senderId: request.creatorUserId,
+        kind: 'text',
+        text,
+        mediaUrls: [],
+        sentAt: now,
+        state: 'sent',
+        paymentRequestId: request.id,
+        actorName: creator?.name,
+      };
+      await persistMessage(message);
+      const updatedChat = {
+        ...thread,
+        lastMessagePreview: preview,
+        updatedAt: now,
+      };
+      const db = await getDb();
+      if (!db) {
+        const index = seedChats.findIndex((entry) => entry.id === thread.id);
+        if (index >= 0) seedChats[index] = updatedChat;
+      } else {
+        await collectionsFor(db).chats.updateOne({ id: thread.id }, { $set: updatedChat });
+      }
+      thread.participants.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit('message:new', presentMessage(message, participantId));
+        io.to(`user:${participantId}`).emit('chat:updated', updatedChat);
+      });
+    }
+  }
+
+  [...new Set([request.creatorUserId, ...request.shares.map((share) => share.userId)])].forEach((userId) => {
+    io.to(`user:${userId}`).emit('payment:request', { request });
+  });
 };
 
 const nextReceiptNumber = async (businessKey: string) => {
@@ -6345,6 +6685,47 @@ app.get('/api/receipts/:receiptId', async (req, res) => {
   return res.json({ receipt });
 });
 
+app.post('/api/receipts/:receiptId/dispute', async (req, res) => {
+  const parseResult = receiptDisputeSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Enter a short reason (at least 4 characters).',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+  const { userId, note } = parseResult.data;
+  const receipt = (await readSaleReceipts()).find((item) => item.id === req.params.receiptId);
+  if (!receipt) return res.status(404).json({ error: 'Receipt not found' });
+  if (receipt.buyerUserId !== userId && receipt.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'Only the buyer or seller can report a problem.' });
+  }
+  if (receipt.state === 'voided' || receipt.state === 'refunded') {
+    return res.status(400).json({ error: 'This receipt cannot be disputed.' });
+  }
+  const now = new Date().toISOString();
+  const updated: SaleReceipt = {
+    ...receipt,
+    state: 'disputed',
+    disputeNote: note,
+    disputeByUserId: userId,
+    disputedAt: now,
+    updatedAt: now,
+  };
+  await saveSaleReceipt(updated);
+  io.to(`user:${updated.sellerUserId}`).emit('receipt:updated', { receipt: updated });
+  io.to(`user:${updated.buyerUserId}`).emit('receipt:updated', { receipt: updated });
+  void recordAdminEvent(getDb, {
+    level: 'warn',
+    area: 'receipts',
+    message: 'Receipt disputed',
+    detail: `${updated.receiptNumber} ${updated.id} · ${note.slice(0, 80)}`,
+  });
+  return res.json({
+    receipt: updated,
+    message: 'Problem reported. The other party can see this dispute on the receipt.',
+  });
+});
+
 app.get('/api/orders/:orderId/receipt', async (req, res) => {
   const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
   const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
@@ -8837,65 +9218,127 @@ app.post('/api/payments/intent', async (req, res) => {
   const data = parseResult.data;
   const createdAt = new Date().toISOString();
   const intentId = `pay-${Date.now()}`;
-  const paystackSecret = (process.env.PAYSTACK_SECRET_KEY || '').trim();
   const mtnKey = (process.env.MTN_MOMO_API_KEY || process.env.PAYMENT_PROVIDER_API_KEY || '').trim();
+
+  // F3: action=request creates a payment request for the peer (they pay later via Paystack).
+  if (data.action === 'request' && !data.paymentRequestId) {
+    if (!data.userId) {
+      return res.status(400).json({ error: 'userId is required to create a payment request.' });
+    }
+    const target = data.targetUserId
+      ? (await readUsers()).find((user) => user.id === data.targetUserId) || null
+      : data.phone
+        ? await findUserByPhoneLoose(data.phone)
+        : null;
+    if (!target) {
+      return res.status(404).json({
+        error: 'Could not find that person on ZynkUp. Ask them to join, or use a registered phone.',
+      });
+    }
+    if (target.id === data.userId) {
+      return res.status(400).json({ error: 'You cannot request money from yourself.' });
+    }
+    const request: PaymentRequestRecord = {
+      id: `preq-${Date.now()}`,
+      kind: 'request',
+      creatorUserId: data.userId,
+      recipientUserId: data.userId,
+      amount: moneyRound2(data.amount),
+      currency: data.currency.toUpperCase(),
+      note: data.note,
+      chatId: data.chatId || null,
+      shares: [{
+        userId: target.id,
+        phone: target.phone,
+        name: target.name,
+        amount: moneyRound2(data.amount),
+        status: 'pending',
+        paymentId: null,
+        authorizationUrl: null,
+        paidAt: null,
+      }],
+      status: 'open',
+      dueAt: null,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    await savePaymentRequest(request);
+    await notifyPaymentRequest(request, data.chatId || null);
+
+    const intent = {
+      id: intentId,
+      ...data,
+      paymentRequestId: request.id,
+      status: 'request_sent',
+      authorizationUrl: null,
+      accessCode: null,
+      providerReference: null,
+      providerPayload: null,
+      createdAt,
+    };
+    await savePaymentRecord(intent);
+    return res.status(201).json({
+      intent,
+      paymentRequest: request,
+      message: 'Payment request sent. They can pay their share from Pay History or the chat notice.',
+    });
+  }
 
   let providerPayload: Record<string, unknown> | null = null;
   let status: 'awaiting_provider_keys' | 'queued' | 'initialized' = 'awaiting_provider_keys';
   let authorizationUrl: string | null = null;
   let accessCode: string | null = null;
   let providerReference: string | null = null;
+  let linkedRequest: PaymentRequestRecord | null = null;
+
+  if (data.paymentRequestId && data.userId) {
+    linkedRequest = (await readPaymentRequests()).find((item) => item.id === data.paymentRequestId) || null;
+    if (!linkedRequest) {
+      return res.status(404).json({ error: 'Payment request not found.' });
+    }
+    if (linkedRequest.status === 'cancelled' || linkedRequest.status === 'expired') {
+      return res.status(400).json({ error: 'This payment request is closed.' });
+    }
+    const share = linkedRequest.shares.find((item) => item.userId === data.userId);
+    if (!share) {
+      return res.status(403).json({ error: 'You are not on this payment request.' });
+    }
+    if (share.status === 'paid') {
+      return res.status(400).json({ error: 'Your share is already paid.' });
+    }
+    data.amount = share.amount;
+    data.currency = linkedRequest.currency;
+    data.note = data.note || linkedRequest.note;
+  }
 
   if (data.provider === 'paystack') {
-    if (!paystackSecret) {
-      status = 'awaiting_provider_keys';
-    } else {
-      try {
-        const amountKobo = Math.round(data.amount * 100);
-        const email = data.email
-          || (data.userId ? `${data.userId.replace(/[^a-zA-Z0-9]/g, '')}@zynkup.payments` : 'payments@zynkup.app');
-        const response = await fetch('https://api.paystack.co/transaction/initialize', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${paystackSecret}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            email,
-            amount: amountKobo,
-            currency: data.currency.toUpperCase(),
-            reference: intentId,
-            callback_url: data.callbackUrl,
-            metadata: {
-              orderId: data.orderId || null,
-              userId: data.userId || null,
-              note: data.note || null,
-              phone: data.phone || null,
-              action: data.action,
-            },
-          }),
-        });
-        const payload = (await response.json().catch(() => ({}))) as {
-          status?: boolean;
-          message?: string;
-          data?: { authorization_url?: string; access_code?: string; reference?: string };
-        };
-        if (!response.ok || !payload.status) {
-          return res.status(502).json({
-            error: payload.message || `Paystack initialize failed (${response.status})`,
-          });
-        }
-        status = 'initialized';
-        authorizationUrl = payload.data?.authorization_url || null;
-        accessCode = payload.data?.access_code || null;
-        providerReference = payload.data?.reference || intentId;
-        providerPayload = { paystack: payload.data };
-      } catch (error) {
-        return res.status(502).json({
-          error: error instanceof Error ? error.message : 'Paystack request failed',
-        });
-      }
+    const paystack = await initializePaystackCheckout({
+      amount: data.amount,
+      currency: data.currency,
+      email: data.email,
+      userId: data.userId,
+      reference: intentId,
+      callbackUrl: data.callbackUrl,
+      metadata: {
+        orderId: data.orderId || null,
+        userId: data.userId || null,
+        note: data.note || null,
+        phone: data.phone || null,
+        action: data.action,
+        paymentRequestId: data.paymentRequestId || linkedRequest?.id || null,
+      },
+    });
+    if (paystack.error && paystack.status !== 'awaiting_provider_keys') {
+      return res.status(502).json({ error: paystack.error });
     }
+    if (paystack.error && !paystack.authorizationUrl && process.env.PAYSTACK_SECRET_KEY?.trim()) {
+      return res.status(502).json({ error: paystack.error });
+    }
+    status = paystack.status;
+    authorizationUrl = paystack.authorizationUrl;
+    accessCode = paystack.accessCode;
+    providerReference = paystack.providerReference;
+    providerPayload = paystack.providerPayload;
   } else if (mtnKey) {
     status = 'queued';
   }
@@ -8911,10 +9354,29 @@ app.post('/api/payments/intent', async (req, res) => {
     createdAt,
   };
 
-  const db = await getDb();
-  if (db) {
-    await db.collection('payments').insertOne({ ...intent });
+  await savePaymentRecord(intent);
+
+  if (linkedRequest && data.userId) {
+    const nextShares = linkedRequest.shares.map((share) => (
+      share.userId === data.userId
+        ? {
+          ...share,
+          status: status === 'initialized' ? 'initialized' as const : share.status,
+          paymentId: intent.id,
+          authorizationUrl,
+        }
+        : share
+    ));
+    linkedRequest = await savePaymentRequest(refreshPaymentRequestStatus({
+      ...linkedRequest,
+      shares: nextShares,
+      updatedAt: createdAt,
+    }));
+    [...new Set([linkedRequest.creatorUserId, ...linkedRequest.shares.map((s) => s.userId)])].forEach((uid) => {
+      io.to(`user:${uid}`).emit('payment:request', { request: linkedRequest });
+    });
   }
+
   if (data.orderId) {
     const order = (await readOrders()).find((entry) => entry.id === data.orderId);
     if (order) {
@@ -8934,7 +9396,377 @@ app.post('/api/payments/intent', async (req, res) => {
         ? 'Add PAYSTACK_SECRET_KEY (and optional PAYSTACK_PUBLIC_KEY) to enable live checkout.'
         : 'Add MTN_MOMO_API_KEY for direct MoMo, or use provider=paystack.';
 
-  return res.status(201).json({ intent, message });
+  return res.status(201).json({ intent, paymentRequest: linkedRequest, message });
+});
+
+app.post('/api/payments/split', async (req, res) => {
+  const parseResult = paymentSplitSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid split payload',
+      details: z.flattenError(parseResult.error),
+    });
+  }
+  const data = parseResult.data;
+  const users = await readUsers();
+  const creator = users.find((user) => user.id === data.userId);
+  if (!creator) {
+    return res.status(404).json({ error: 'Account not found' });
+  }
+
+  let shareInputs: Array<{ userId: string; amount?: number; phone?: string; name?: string }> = [];
+  if (data.shares?.length) {
+    shareInputs = data.shares;
+  } else if (data.participantUserIds?.length) {
+    shareInputs = data.participantUserIds.map((userId) => ({ userId }));
+  } else if (data.chatId) {
+    const chat = (await readChats()).find((entry) => entry.id === data.chatId);
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    if (!chat.participants.includes(data.userId)) {
+      return res.status(403).json({ error: 'You are not in that chat.' });
+    }
+    shareInputs = chat.participants.map((userId) => ({ userId }));
+  } else {
+    return res.status(400).json({ error: 'Provide participantUserIds, shares, or chatId.' });
+  }
+
+  const uniqueIds = [...new Set(shareInputs.map((item) => item.userId))];
+  if (uniqueIds.length < 1) {
+    return res.status(400).json({ error: 'Add at least one participant.' });
+  }
+
+  const resolved = uniqueIds.map((userId) => {
+    const user = users.find((entry) => entry.id === userId);
+    const input = shareInputs.find((item) => item.userId === userId);
+    return {
+      userId,
+      phone: input?.phone || user?.phone,
+      name: user?.name || 'Member',
+      amount: input?.amount,
+    };
+  });
+  if (resolved.some((item) => !users.some((user) => user.id === item.userId))) {
+    return res.status(404).json({ error: 'One or more participants were not found.' });
+  }
+
+  const total = moneyRound2(data.amount);
+  let shares: PaymentShare[];
+  if (resolved.every((item) => typeof item.amount === 'number')) {
+    const customTotal = moneyRound2(resolved.reduce((sum, item) => sum + Number(item.amount || 0), 0));
+    if (Math.abs(customTotal - total) > 0.01) {
+      return res.status(400).json({ error: `Share amounts (${customTotal}) must equal total (${total}).` });
+    }
+    shares = resolved.map((item) => ({
+      userId: item.userId,
+      phone: item.phone,
+      name: item.name,
+      amount: moneyRound2(Number(item.amount)),
+      status: 'pending' as const,
+      paymentId: null,
+      authorizationUrl: null,
+      paidAt: null,
+    }));
+  } else {
+    shares = buildEqualShares(total, resolved);
+  }
+
+  const now = new Date().toISOString();
+  const request: PaymentRequestRecord = {
+    id: `psplit-${Date.now()}`,
+    kind: 'split',
+    creatorUserId: data.userId,
+    recipientUserId: data.userId,
+    amount: total,
+    currency: data.currency.toUpperCase(),
+    note: data.note,
+    chatId: data.chatId || null,
+    shares,
+    status: 'open',
+    dueAt: data.dueAt || null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await savePaymentRequest(request);
+  await notifyPaymentRequest(request, data.chatId || null);
+  return res.status(201).json({
+    request,
+    message: 'Split request created. Each participant can open Paystack for their share.',
+  });
+});
+
+app.get('/api/payments/requests', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const requests = (await readPaymentRequests()).filter((request) => (
+    request.creatorUserId === userId
+    || request.recipientUserId === userId
+    || request.shares.some((share) => share.userId === userId)
+  ));
+  return res.json({ requests });
+});
+
+app.get('/api/payments/requests/:requestId', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  const request = (await readPaymentRequests()).find((item) => item.id === req.params.requestId);
+  if (!request) return res.status(404).json({ error: 'Payment request not found' });
+  if (
+    userId
+    && request.creatorUserId !== userId
+    && request.recipientUserId !== userId
+    && !request.shares.some((share) => share.userId === userId)
+  ) {
+    return res.status(403).json({ error: 'You cannot view this payment request.' });
+  }
+  return res.json({ request });
+});
+
+app.post('/api/payments/requests/:requestId/pay', async (req, res) => {
+  const parseResult = paymentRequestPaySchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+  const { userId, email, callbackUrl } = parseResult.data;
+  const request = (await readPaymentRequests()).find((item) => item.id === req.params.requestId);
+  if (!request) return res.status(404).json({ error: 'Payment request not found' });
+  if (request.status === 'cancelled' || request.status === 'expired') {
+    return res.status(400).json({ error: 'This payment request is closed.' });
+  }
+  const share = request.shares.find((item) => item.userId === userId);
+  if (!share) return res.status(403).json({ error: 'You are not on this payment request.' });
+  if (share.status === 'paid') return res.status(400).json({ error: 'Your share is already paid.' });
+
+  const intentId = `pay-${Date.now()}`;
+  const createdAt = new Date().toISOString();
+  const paystack = await initializePaystackCheckout({
+    amount: share.amount,
+    currency: request.currency,
+    email,
+    userId,
+    reference: intentId,
+    callbackUrl,
+    metadata: {
+      action: 'request',
+      paymentRequestId: request.id,
+      userId,
+      note: request.note || null,
+    },
+  });
+  if (paystack.error && process.env.PAYSTACK_SECRET_KEY?.trim()) {
+    return res.status(502).json({ error: paystack.error });
+  }
+
+  const intent = {
+    id: intentId,
+    action: 'request' as const,
+    amount: share.amount,
+    currency: request.currency,
+    userId,
+    note: request.note,
+    paymentRequestId: request.id,
+    provider: 'paystack' as const,
+    status: paystack.status,
+    authorizationUrl: paystack.authorizationUrl,
+    accessCode: paystack.accessCode,
+    providerReference: paystack.providerReference,
+    providerPayload: paystack.providerPayload,
+    createdAt,
+  };
+  await savePaymentRecord(intent);
+
+  const nextShares = request.shares.map((item) => (
+    item.userId === userId
+      ? {
+        ...item,
+        status: paystack.status === 'initialized' ? 'initialized' as const : item.status,
+        paymentId: intent.id,
+        authorizationUrl: paystack.authorizationUrl,
+      }
+      : item
+  ));
+  const updated = await savePaymentRequest(refreshPaymentRequestStatus({
+    ...request,
+    shares: nextShares,
+    updatedAt: createdAt,
+  }));
+  [...new Set([updated.creatorUserId, ...updated.shares.map((s) => s.userId)])].forEach((uid) => {
+    io.to(`user:${uid}`).emit('payment:request', { request: updated });
+  });
+
+  const message = paystack.status === 'initialized'
+    ? 'Paystack checkout ready — open authorizationUrl to complete your share.'
+    : 'Add PAYSTACK_SECRET_KEY to enable live checkout.';
+  return res.status(201).json({ intent, paymentRequest: updated, message });
+});
+
+app.post('/api/payments/verify', async (req, res) => {
+  const parseResult = paymentVerifySchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'reference is required' });
+  }
+  const { reference, userId } = parseResult.data;
+  const paystackSecret = (process.env.PAYSTACK_SECRET_KEY || '').trim();
+  if (!paystackSecret) {
+    return res.status(503).json({ error: 'Paystack is not configured.' });
+  }
+
+  let payment = await findPaymentById(reference);
+  if (!payment) {
+    const db = await getDb();
+    if (db) {
+      payment = await db.collection('payments').findOne(
+        { $or: [{ id: reference }, { providerReference: reference }] },
+        { projection: { _id: 0 } },
+      );
+    } else {
+      payment = seedPayments.find((item) => item.id === reference || item.providerReference === reference) || null;
+    }
+  }
+  if (!payment) {
+    return res.status(404).json({ error: 'Payment not found' });
+  }
+  if (userId && payment.userId && payment.userId !== userId) {
+    return res.status(403).json({ error: 'You cannot verify this payment.' });
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(String(payment.providerReference || payment.id))}`,
+      { headers: { Authorization: `Bearer ${paystackSecret}` } },
+    );
+    const payload = (await response.json().catch(() => ({}))) as {
+      status?: boolean;
+      message?: string;
+      data?: { status?: string; amount?: number; currency?: string; reference?: string };
+    };
+    if (!response.ok || !payload.status) {
+      return res.status(502).json({ error: payload.message || 'Paystack verify failed' });
+    }
+    const paid = String(payload.data?.status || '').toLowerCase() === 'success';
+    if (!paid) {
+      await savePaymentRecord({ ...payment, status: 'failed', verifyPayload: payload.data });
+      return res.json({ payment: { ...payment, status: 'failed' }, paid: false, message: 'Payment not successful yet.' });
+    }
+
+    const now = new Date().toISOString();
+    const confirmed = {
+      ...payment,
+      status: 'paid',
+      paidAt: now,
+      verifyPayload: payload.data,
+      updatedAt: now,
+    };
+    await savePaymentRecord(confirmed);
+
+    let paymentRequest: PaymentRequestRecord | null = null;
+    const requestId = typeof payment.paymentRequestId === 'string' ? payment.paymentRequestId : '';
+    if (requestId) {
+      const existing = (await readPaymentRequests()).find((item) => item.id === requestId) || null;
+      if (existing) {
+        const payerId = String(payment.userId || userId || '');
+        const nextShares = existing.shares.map((share) => (
+          share.userId === payerId
+            ? { ...share, status: 'paid' as const, paymentId: String(payment.id), paidAt: now }
+            : share
+        ));
+        paymentRequest = await savePaymentRequest(refreshPaymentRequestStatus({
+          ...existing,
+          shares: nextShares,
+          updatedAt: now,
+        }));
+        [...new Set([paymentRequest.creatorUserId, ...paymentRequest.shares.map((s) => s.userId)])].forEach((uid) => {
+          io.to(`user:${uid}`).emit('payment:request', { request: paymentRequest });
+        });
+      }
+    }
+
+    let receipt: SaleReceipt | null = null;
+    const orderId = typeof payment.orderId === 'string' ? payment.orderId : '';
+    if (orderId) {
+      const order = (await readOrders()).find((entry) => entry.id === orderId);
+      if (order && order.state === 'pending_payment') {
+        const withPayment = { ...order, paymentId: String(payment.id) };
+        const receiptResult = await issueSaleReceiptForOrder(withPayment, 'paystack');
+        const paidOrder = {
+          ...receiptResult.order,
+          state: 'paid' as const,
+          history: [
+            ...receiptResult.order.history,
+            { state: 'paid' as const, at: now, byUserId: String(payment.userId || 'paystack'), note: 'Paystack verified' },
+          ],
+          updatedAt: now,
+        };
+        await saveOrder(paidOrder);
+        receipt = receiptResult.receipt;
+        io.to(`user:${paidOrder.sellerUserId}`).emit('order:updated', { order: paidOrder });
+        io.to(`user:${paidOrder.buyerUserId}`).emit('order:updated', { order: paidOrder });
+      } else if (order?.receiptId) {
+        receipt = (await readSaleReceipts()).find((item) => item.id === order.receiptId) || null;
+      }
+    } else if (paymentRequest && String(payment.userId || '')) {
+      const payerId = String(payment.userId);
+      const recipientId = paymentRequest.recipientUserId;
+      const [payer, recipient, payerProfile, recipientProfile] = await Promise.all([
+        readUsers().then((list) => list.find((user) => user.id === payerId)),
+        readUsers().then((list) => list.find((user) => user.id === recipientId)),
+        readProfile(payerId),
+        readProfile(recipientId),
+      ]);
+      const existingPeer = (await readSaleReceipts()).find(
+        (item) => item.paymentId === payment.id && item.state === 'issued',
+      );
+      if (!existingPeer) {
+        const receiptNumber = await nextReceiptNumber(recipientId);
+        receipt = {
+          id: `rcpt${Date.now()}`,
+          receiptNumber,
+          orderId: `peer:${payment.id}`,
+          paymentId: String(payment.id),
+          buyerUserId: payerId,
+          sellerUserId: recipientId,
+          businessId: null,
+          businessName: recipientProfile?.businessName || recipient?.name || 'Recipient',
+          sellerName: recipient?.name || recipientProfile?.name || 'Recipient',
+          buyerName: payer?.name || payerProfile?.name || 'Payer',
+          items: [{
+            catalogItemId: paymentRequest.id,
+            title: paymentRequest.note || (paymentRequest.kind === 'split' ? 'Split payment' : 'Payment request'),
+            quantity: 1,
+            price: Number(payment.amount) || 0,
+            currency: String(payment.currency || paymentRequest.currency),
+          }],
+          subtotal: Number(payment.amount) || 0,
+          discount: 0,
+          tax: 0,
+          totalAmount: Number(payment.amount) || 0,
+          currency: String(payment.currency || paymentRequest.currency),
+          paymentMethod: 'paystack',
+          paymentReference: String(payment.providerReference || payment.id),
+          state: 'issued',
+          linkedReceiptId: null,
+          issuedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        };
+        await saveSaleReceipt(receipt);
+        io.to(`user:${payerId}`).emit('receipt:created', { receipt });
+        io.to(`user:${recipientId}`).emit('receipt:created', { receipt });
+      } else {
+        receipt = existingPeer;
+      }
+    }
+
+    return res.json({
+      payment: confirmed,
+      paymentRequest,
+      receipt,
+      paid: true,
+      message: 'Payment confirmed.',
+    });
+  } catch (error) {
+    return res.status(502).json({
+      error: error instanceof Error ? error.message : 'Paystack verify failed',
+    });
+  }
 });
 
 app.get('/api/profile', async (req, res) => {
