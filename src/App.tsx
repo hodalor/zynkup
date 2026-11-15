@@ -1058,6 +1058,7 @@ type BusinessHubTab =
   | 'customers'
   | 'autoreplies'
   | 'automations'
+  | 'loyalty'
   | 'documents'
   | 'broadcasts'
   | 'ai'
@@ -1095,6 +1096,52 @@ type AutomationRun = {
   draftText?: string;
   chatId?: string | null;
   autoSend: false;
+  createdAt: string;
+};
+
+type LoyaltyEarnMode = 'per_currency' | 'flat_per_order';
+
+type LoyaltyProgram = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  enabled: boolean;
+  earnMode: LoyaltyEarnMode;
+  pointsPerCurrency: number;
+  flatPointsPerOrder: number;
+  termsNote: string;
+  updatedAt?: string;
+};
+
+type LoyaltyBalance = {
+  id?: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  customerUserId: string;
+  pointsBalance: number;
+  lifetimeEarned: number;
+  lifetimeRedeemed: number;
+  displayName?: string;
+};
+
+type LoyaltyReward = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  name: string;
+  pointsCost: number;
+  active: boolean;
+};
+
+type LoyaltyRedemption = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  customerUserId: string;
+  rewardId: string;
+  rewardName: string;
+  pointsCost: number;
+  status: 'pending' | 'fulfilled' | 'cancelled';
   createdAt: string;
 };
 
@@ -2096,6 +2143,21 @@ function App() {
     templateText: '',
     label: '',
   });
+  const [loyaltyProgram, setLoyaltyProgram] = useState<LoyaltyProgram | null>(null);
+  const [loyaltyBalances, setLoyaltyBalances] = useState<LoyaltyBalance[]>([]);
+  const [loyaltyRewards, setLoyaltyRewards] = useState<LoyaltyReward[]>([]);
+  const [loyaltyRedemptions, setLoyaltyRedemptions] = useState<LoyaltyRedemption[]>([]);
+  const [loyaltyBusy, setLoyaltyBusy] = useState(false);
+  const [loyaltyPointsNote, setLoyaltyPointsNote] = useState(
+    'Loyalty points only — not cash, and not redeemable for MoMo.',
+  );
+  const [loyaltyAdjustDraft, setLoyaltyAdjustDraft] = useState({
+    customerUserId: '',
+    delta: '',
+    reason: '',
+  });
+  const [loyaltyRewardDraft, setLoyaltyRewardDraft] = useState({ name: '', pointsCost: '' });
+  const [myLoyaltyBalances, setMyLoyaltyBalances] = useState<LoyaltyBalance[]>([]);
   const [commerceDocuments, setCommerceDocuments] = useState<CommerceDocument[]>([]);
   const [documentKindFilter, setDocumentKindFilter] = useState<'' | CommerceDocKind>('');
   const [documentForm, setDocumentForm] = useState({
@@ -4381,6 +4443,39 @@ function App() {
       } else if (run.summary) {
         showToast(run.summary, 3200);
       }
+    });
+    socket.on('loyalty:program', ({ program, pointsNote }: { program?: LoyaltyProgram; pointsNote?: string }) => {
+      if (program) setLoyaltyProgram(program);
+      if (pointsNote) setLoyaltyPointsNote(pointsNote);
+    });
+    socket.on('loyalty:updated', ({ balance, pointsNote }: { balance?: LoyaltyBalance; pointsNote?: string }) => {
+      if (pointsNote) setLoyaltyPointsNote(pointsNote);
+      if (!balance?.customerUserId) return;
+      if (balance.ownerUserId === currentUserId) {
+        setLoyaltyBalances((current) => {
+          const next = current.filter((entry) => entry.customerUserId !== balance.customerUserId);
+          return [balance, ...next].sort((a, b) => b.pointsBalance - a.pointsBalance);
+        });
+      }
+      if (balance.customerUserId === currentUserId) {
+        setMyLoyaltyBalances((current) => {
+          const next = current.filter(
+            (entry) =>
+              !(
+                entry.ownerUserId === balance.ownerUserId
+                && (entry.businessId || null) === (balance.businessId || null)
+              ),
+          );
+          return [balance, ...next];
+        });
+      }
+    });
+    socket.on('loyalty:redemption', ({ redemption }: { redemption?: LoyaltyRedemption }) => {
+      if (!redemption?.id) return;
+      setLoyaltyRedemptions((current) => [
+        redemption,
+        ...current.filter((entry) => entry.id !== redemption.id),
+      ]);
     });
     socket.on('autoReply:sent', ({ log, message: autoMessage }: { log?: AutoReplyLog; message?: any }) => {
       if (log?.id) {
@@ -6795,6 +6890,264 @@ function App() {
       return;
     }
     fillComposerFromTwinDraft(run.draftText, 'Filled automation draft — never auto-sent. Review before sending.');
+  };
+
+  const loadLoyaltyProgram = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/loyalty/program?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setLoyaltyProgram(null);
+        return;
+      }
+      setLoyaltyProgram(payload.program || null);
+      if (payload.pointsNote) setLoyaltyPointsNote(payload.pointsNote);
+    } catch {
+      setLoyaltyProgram(null);
+    }
+  };
+
+  const loadLoyaltyBalances = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/loyalty/balances?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setLoyaltyBalances([]);
+        return;
+      }
+      setLoyaltyBalances(Array.isArray(payload.balances) ? payload.balances : []);
+      if (payload.pointsNote) setLoyaltyPointsNote(payload.pointsNote);
+    } catch {
+      setLoyaltyBalances([]);
+    }
+  };
+
+  const loadLoyaltyRewards = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/loyalty/rewards?userId=${encodeURIComponent(userId)}&ownerUserId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      setLoyaltyRewards(Array.isArray(payload.rewards) ? payload.rewards : []);
+    } catch {
+      setLoyaltyRewards([]);
+    }
+  };
+
+  const loadLoyaltyRedemptions = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/loyalty/redemptions?userId=${encodeURIComponent(userId)}&role=seller&status=pending`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      setLoyaltyRedemptions(Array.isArray(payload.redemptions) ? payload.redemptions : []);
+    } catch {
+      setLoyaltyRedemptions([]);
+    }
+  };
+
+  const loadMyLoyaltyBalances = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const ordersResponse = await fetch(
+        `${API_BASE_URL}/api/orders?userId=${encodeURIComponent(userId)}&role=buyer`,
+      );
+      const ordersPayload = await ordersResponse.json().catch(() => ({}));
+      const buyerOrdersList = Array.isArray(ordersPayload.orders) ? ordersPayload.orders : [];
+      const sellers = Array.from(
+        new Set(
+          buyerOrdersList
+            .filter((order: { sellerUserId?: string }) => order.sellerUserId && order.sellerUserId !== userId)
+            .map((order: { sellerUserId: string }) => order.sellerUserId),
+        ),
+      ).slice(0, 12) as string[];
+      if (!sellers.length) {
+        setMyLoyaltyBalances([]);
+        return;
+      }
+      const rows: LoyaltyBalance[] = [];
+      await Promise.all(
+        sellers.map(async (sellerId) => {
+          try {
+            const response = await fetch(
+              `${API_BASE_URL}/api/loyalty/balance?userId=${encodeURIComponent(userId)}&ownerUserId=${encodeURIComponent(sellerId)}&customerUserId=${encodeURIComponent(userId)}`,
+            );
+            const payload = await response.json().catch(() => ({}));
+            if (response.ok && payload.balance && Number(payload.balance.pointsBalance) >= 0 && payload.program?.enabled !== false) {
+              if (Number(payload.balance.pointsBalance) > 0 || Number(payload.balance.lifetimeEarned) > 0) {
+                rows.push(payload.balance);
+              }
+            }
+            if (payload.pointsNote) setLoyaltyPointsNote(payload.pointsNote);
+          } catch {
+            // ignore per-seller failures
+          }
+        }),
+      );
+      setMyLoyaltyBalances(rows);
+    } catch {
+      setMyLoyaltyBalances([]);
+    }
+  };
+
+  const saveLoyaltyProgram = async (patch: Partial<LoyaltyProgram> = {}) => {
+    if (!currentUserId || loyaltyBusy) return;
+    setLoyaltyBusy(true);
+    try {
+      const base = loyaltyProgram;
+      const response = await fetch(`${API_BASE_URL}/api/loyalty/program`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          enabled: patch.enabled ?? base?.enabled ?? false,
+          earnMode: patch.earnMode ?? base?.earnMode ?? 'per_currency',
+          pointsPerCurrency: patch.pointsPerCurrency ?? base?.pointsPerCurrency ?? 1,
+          flatPointsPerOrder: patch.flatPointsPerOrder ?? base?.flatPointsPerOrder ?? 10,
+          termsNote: patch.termsNote ?? base?.termsNote,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not save loyalty settings');
+        return;
+      }
+      setLoyaltyProgram(payload.program || null);
+      if (payload.pointsNote) setLoyaltyPointsNote(payload.pointsNote);
+      showToast(payload.program?.enabled ? 'Loyalty program on' : 'Loyalty program saved');
+    } catch {
+      showToast('Could not save loyalty settings');
+    } finally {
+      setLoyaltyBusy(false);
+    }
+  };
+
+  const adjustLoyaltyPoints = async () => {
+    if (!currentUserId || loyaltyBusy) return;
+    const delta = Number(loyaltyAdjustDraft.delta);
+    if (!loyaltyAdjustDraft.customerUserId.trim() || !Number.isFinite(delta) || !delta) {
+      showToast('Enter a customer user id and a non-zero points delta');
+      return;
+    }
+    if (!loyaltyAdjustDraft.reason.trim()) {
+      showToast('Add a short reason for the adjustment');
+      return;
+    }
+    setLoyaltyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/loyalty/adjust`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          customerUserId: loyaltyAdjustDraft.customerUserId.trim(),
+          delta: Math.trunc(delta),
+          reason: loyaltyAdjustDraft.reason.trim(),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not adjust points');
+        return;
+      }
+      if (payload.balance) {
+        setLoyaltyBalances((current) => {
+          const next = current.filter(
+            (entry) => entry.customerUserId !== payload.balance.customerUserId,
+          );
+          return [payload.balance, ...next].sort((a, b) => b.pointsBalance - a.pointsBalance);
+        });
+      }
+      setLoyaltyAdjustDraft({ customerUserId: '', delta: '', reason: '' });
+      showToast('Points adjusted (ledger only — not cash)');
+    } catch {
+      showToast('Could not adjust points');
+    } finally {
+      setLoyaltyBusy(false);
+    }
+  };
+
+  const createLoyaltyReward = async () => {
+    if (!currentUserId || loyaltyBusy) return;
+    const name = loyaltyRewardDraft.name.trim();
+    const pointsCost = Math.trunc(Number(loyaltyRewardDraft.pointsCost));
+    if (!name || !Number.isFinite(pointsCost) || pointsCost < 1) {
+      showToast('Enter a reward name and points cost');
+      return;
+    }
+    setLoyaltyBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/loyalty/rewards`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, name, pointsCost }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not add reward');
+        return;
+      }
+      if (payload.reward?.id) {
+        setLoyaltyRewards((current) => [payload.reward, ...current]);
+      }
+      setLoyaltyRewardDraft({ name: '', pointsCost: '' });
+      showToast('Reward added — offline fulfilment only');
+    } catch {
+      showToast('Could not add reward');
+    } finally {
+      setLoyaltyBusy(false);
+    }
+  };
+
+  const updateLoyaltyRedemption = async (
+    redemptionId: string,
+    status: 'fulfilled' | 'cancelled',
+  ) => {
+    if (!currentUserId || loyaltyBusy) return;
+    setLoyaltyBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/loyalty/redemptions/${encodeURIComponent(redemptionId)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, status }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update redemption');
+        return;
+      }
+      if (payload.redemption?.id) {
+        setLoyaltyRedemptions((current) =>
+          current
+            .map((entry) => (entry.id === payload.redemption.id ? payload.redemption : entry))
+            .filter((entry) => entry.status === 'pending'),
+        );
+      }
+      if (payload.balance) {
+        setLoyaltyBalances((current) => {
+          const next = current.filter(
+            (entry) => entry.customerUserId !== payload.balance.customerUserId,
+          );
+          return [payload.balance, ...next].sort((a, b) => b.pointsBalance - a.pointsBalance);
+        });
+      }
+      showToast(status === 'fulfilled' ? 'Marked fulfilled offline' : 'Redemption cancelled — points restored');
+    } catch {
+      showToast('Could not update redemption');
+    } finally {
+      setLoyaltyBusy(false);
+    }
   };
 
   const saveAutoReplyConfig = async (
@@ -13431,6 +13784,7 @@ function App() {
         { id: 'broadcasts', label: 'Broadcasts' },
         { id: 'autoreplies', label: 'Auto-replies' },
         { id: 'automations', label: 'Automations' },
+        { id: 'loyalty', label: 'Loyalty' },
         { id: 'ai', label: 'AI assistant' },
         { id: 'twin', label: 'AI Twin' },
       ];
@@ -13488,6 +13842,13 @@ function App() {
                   if (tab.id === 'automations') {
                     void loadAutomationRules();
                     void loadAutomationLogs();
+                  }
+                  if (tab.id === 'loyalty') {
+                    void loadLoyaltyProgram();
+                    void loadLoyaltyBalances();
+                    void loadLoyaltyRewards();
+                    void loadLoyaltyRedemptions();
+                    void loadMyLoyaltyBalances();
                   }
                   if (tab.id === 'ai') {
                     void loadBusinessAiConfig();
@@ -14915,6 +15276,225 @@ function App() {
                       </button>
                     </div>
                   ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'loyalty' ? (
+            <div className="business-panel">
+              <h3>Loyalty points</h3>
+              <p>{loyaltyPointsNote}</p>
+              <p>
+                {loyaltyProgram?.enabled
+                  ? loyaltyProgram.earnMode === 'flat_per_order'
+                    ? `Earning ${loyaltyProgram.flatPointsPerOrder} pts per completed order`
+                    : `Earning ${loyaltyProgram.pointsPerCurrency} pts per currency unit on completed orders`
+                  : 'Program is off — enable below to award points on completed orders.'}
+              </p>
+
+              <h3>Earn settings</h3>
+              <label>
+                <input
+                  checked={Boolean(loyaltyProgram?.enabled)}
+                  disabled={loyaltyBusy}
+                  onChange={(event) => void saveLoyaltyProgram({ enabled: event.target.checked })}
+                  type="checkbox"
+                />{' '}
+                Enable loyalty program
+              </label>
+              <label>
+                Earn mode
+                <select
+                  disabled={loyaltyBusy}
+                  onChange={(event) =>
+                    void saveLoyaltyProgram({
+                      earnMode: event.target.value as LoyaltyEarnMode,
+                    })
+                  }
+                  value={loyaltyProgram?.earnMode || 'per_currency'}
+                >
+                  <option value="per_currency">Per currency unit</option>
+                  <option value="flat_per_order">Flat per order</option>
+                </select>
+              </label>
+              {(loyaltyProgram?.earnMode || 'per_currency') === 'per_currency' ? (
+                <input
+                  disabled={loyaltyBusy}
+                  onBlur={(event) => {
+                    const value = Number(event.target.value);
+                    if (Number.isFinite(value) && value >= 0) {
+                      void saveLoyaltyProgram({ pointsPerCurrency: value });
+                    }
+                  }}
+                  onChange={(event) =>
+                    setLoyaltyProgram((current) =>
+                      current
+                        ? { ...current, pointsPerCurrency: Number(event.target.value) || 0 }
+                        : current,
+                    )
+                  }
+                  placeholder="Points per currency unit"
+                  type="number"
+                  value={loyaltyProgram?.pointsPerCurrency ?? 1}
+                />
+              ) : (
+                <input
+                  disabled={loyaltyBusy}
+                  onBlur={(event) => {
+                    const value = Math.trunc(Number(event.target.value));
+                    if (Number.isFinite(value) && value >= 0) {
+                      void saveLoyaltyProgram({ flatPointsPerOrder: value });
+                    }
+                  }}
+                  onChange={(event) =>
+                    setLoyaltyProgram((current) =>
+                      current
+                        ? { ...current, flatPointsPerOrder: Math.trunc(Number(event.target.value)) || 0 }
+                        : current,
+                    )
+                  }
+                  placeholder="Flat points per order"
+                  type="number"
+                  value={loyaltyProgram?.flatPointsPerOrder ?? 10}
+                />
+              )}
+
+              <h3>Top customers</h3>
+              {loyaltyBalances.length ? null : <p>No customer points yet.</p>}
+              {loyaltyBalances.slice(0, 20).map((row) => (
+                <div className="business-product-row" key={`${row.ownerUserId}-${row.customerUserId}`}>
+                  <div>
+                    <strong>{row.displayName || row.customerUserId}</strong>
+                    <small>
+                      {row.pointsBalance} pts · earned {row.lifetimeEarned} · redeemed{' '}
+                      {row.lifetimeRedeemed}
+                    </small>
+                  </div>
+                  <div className="business-product-actions">
+                    <button
+                      onClick={() =>
+                        setLoyaltyAdjustDraft((current) => ({
+                          ...current,
+                          customerUserId: row.customerUserId,
+                        }))
+                      }
+                      type="button"
+                    >
+                      Adjust
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              <h3>Adjust points</h3>
+              <input
+                onChange={(event) =>
+                  setLoyaltyAdjustDraft((current) => ({
+                    ...current,
+                    customerUserId: event.target.value,
+                  }))
+                }
+                placeholder="Customer user id"
+                value={loyaltyAdjustDraft.customerUserId}
+              />
+              <input
+                onChange={(event) =>
+                  setLoyaltyAdjustDraft((current) => ({ ...current, delta: event.target.value }))
+                }
+                placeholder="Delta (+ credit / − debit)"
+                type="number"
+                value={loyaltyAdjustDraft.delta}
+              />
+              <input
+                onChange={(event) =>
+                  setLoyaltyAdjustDraft((current) => ({ ...current, reason: event.target.value }))
+                }
+                placeholder="Reason"
+                value={loyaltyAdjustDraft.reason}
+              />
+              <button disabled={loyaltyBusy} onClick={() => void adjustLoyaltyPoints()} type="button">
+                {loyaltyBusy ? 'Saving…' : 'Apply adjustment'}
+              </button>
+
+              <h3>Reward catalog</h3>
+              <p>Offline fulfilment only — no MoMo or cash payout.</p>
+              {loyaltyRewards.map((reward) => (
+                <div className="business-product-row" key={reward.id}>
+                  <div>
+                    <strong>{reward.name}</strong>
+                    <small>
+                      {reward.pointsCost} pts
+                      {reward.active === false ? ' · inactive' : ''}
+                    </small>
+                  </div>
+                </div>
+              ))}
+              <input
+                onChange={(event) =>
+                  setLoyaltyRewardDraft((current) => ({ ...current, name: event.target.value }))
+                }
+                placeholder="Reward name"
+                value={loyaltyRewardDraft.name}
+              />
+              <input
+                onChange={(event) =>
+                  setLoyaltyRewardDraft((current) => ({
+                    ...current,
+                    pointsCost: event.target.value,
+                  }))
+                }
+                placeholder="Points cost"
+                type="number"
+                value={loyaltyRewardDraft.pointsCost}
+              />
+              <button disabled={loyaltyBusy} onClick={() => void createLoyaltyReward()} type="button">
+                Add reward
+              </button>
+
+              <h3>Pending redemptions</h3>
+              {loyaltyRedemptions.length ? null : <p>No pending redemptions.</p>}
+              {loyaltyRedemptions.map((item) => (
+                <div className="business-product-row" key={item.id}>
+                  <div>
+                    <strong>{item.rewardName}</strong>
+                    <small>
+                      {item.pointsCost} pts · {item.customerUserId} ·{' '}
+                      {new Date(item.createdAt).toLocaleString()}
+                    </small>
+                  </div>
+                  <div className="business-product-actions">
+                    <button
+                      disabled={loyaltyBusy}
+                      onClick={() => void updateLoyaltyRedemption(item.id, 'fulfilled')}
+                      type="button"
+                    >
+                      Fulfilled
+                    </button>
+                    <button
+                      disabled={loyaltyBusy}
+                      onClick={() => void updateLoyaltyRedemption(item.id, 'cancelled')}
+                      type="button"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              <h3>Your points as a customer</h3>
+              <p>Balances with businesses you have bought from.</p>
+              {myLoyaltyBalances.length ? null : (
+                <p>No loyalty balances yet — complete an order with a program that is on.</p>
+              )}
+              {myLoyaltyBalances.map((row) => (
+                <div className="business-product-row" key={`mine-${row.ownerUserId}-${row.businessId || 'x'}`}>
+                  <div>
+                    <strong>{row.displayName || row.ownerUserId}</strong>
+                    <small>
+                      {row.pointsBalance} pts · {loyaltyPointsNote}
+                    </small>
+                  </div>
                 </div>
               ))}
             </div>
