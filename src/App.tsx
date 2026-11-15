@@ -672,6 +672,7 @@ type OrderTrackingView = {
 type AiTone = 'polite' | 'concise' | 'professional' | 'friendly' | 'apologetic';
 
 type AiAssistantTask = 'draft' | 'rewrite' | 'summarise' | 'translate' | 'suggest_reply' | 'explain';
+type MeetingAssistMode = 'prep' | 'followup' | 'agenda' | 'notes';
 
 type AiSuggestionChip = {
   id: string;
@@ -1153,6 +1154,12 @@ const AI_ASSISTANT_TASKS: Array<{ id: AiAssistantTask; label: string }> = [
   { id: 'summarise', label: 'Summarise' },
   { id: 'translate', label: 'Translate' },
   { id: 'explain', label: 'Explain' },
+];
+const MEETING_ASSIST_MODES: Array<{ id: MeetingAssistMode; label: string }> = [
+  { id: 'prep', label: 'Prep' },
+  { id: 'followup', label: 'Follow-up' },
+  { id: 'agenda', label: 'Agenda' },
+  { id: 'notes', label: 'Notes' },
 ];
 const TWIN_ALLOWED_TASKS: Array<{ id: TwinAllowedTask; label: string }> = [
   { id: 'draft_reply', label: 'Draft replies' },
@@ -2096,6 +2103,13 @@ function App() {
   const [aiConsentToShareContext, setAiConsentToShareContext] = useState(false);
   const [aiHelperNotice, setAiHelperNotice] = useState('');
   const [aiHelperResult, setAiHelperResult] = useState('');
+  const [meetingAssistVisible, setMeetingAssistVisible] = useState(false);
+  const [meetingAssistMode, setMeetingAssistMode] = useState<MeetingAssistMode>('prep');
+  const [meetingAssistContext, setMeetingAssistContext] = useState('');
+  const [meetingAssistConsent, setMeetingAssistConsent] = useState(false);
+  const [meetingAssistBusy, setMeetingAssistBusy] = useState(false);
+  const [meetingAssistResult, setMeetingAssistResult] = useState('');
+  const [meetingAssistNotice, setMeetingAssistNotice] = useState('');
   const [businessAiConfig, setBusinessAiConfig] = useState<BusinessAiConfig | null>(null);
   const [businessAiFaqDraft, setBusinessAiFaqDraft] = useState({ question: '', answer: '' });
   const [businessAiTestQuestion, setBusinessAiTestQuestion] = useState('');
@@ -5827,6 +5841,71 @@ function App() {
 
   const requestRewrite = async () => {
     await runAssistantTask('rewrite', { text: messageDraft });
+  };
+
+  const openMeetingAssist = () => {
+    setMeetingAssistVisible(true);
+    setAiHelperVisible(false);
+    setMeetingAssistContext(messageDraft.trim());
+    setMeetingAssistConsent(false);
+    setMeetingAssistResult('');
+    setMeetingAssistNotice('');
+  };
+
+  const runMeetingAssist = async () => {
+    if (!currentUserId || meetingAssistBusy) return;
+    const useChat = Boolean(activeChat?.id) && meetingAssistConsent;
+    if (activeChat?.id && !meetingAssistConsent && !meetingAssistContext.trim()) {
+      showToast('Confirm consent to share chat context, or paste notes');
+      return;
+    }
+    if (!useChat && !meetingAssistContext.trim()) {
+      showToast('Add context notes, or open a chat and consent to share it');
+      return;
+    }
+
+    setMeetingAssistBusy(true);
+    setMeetingAssistResult('');
+    setMeetingAssistNotice('');
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/ai/meeting-assist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          mode: meetingAssistMode,
+          contextText: meetingAssistContext.trim() || undefined,
+          chatId: useChat ? activeChat?.id : undefined,
+          consentToShareContext: useChat,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        if (payload.requiresConsent) {
+          setMeetingAssistVisible(true);
+        }
+        showToast(payload.error || 'Meeting assist failed');
+        return;
+      }
+      const resultText = typeof payload.result === 'string' ? payload.result.trim() : '';
+      const notice =
+        typeof payload.notice === 'string'
+          ? payload.notice
+          : 'Meeting assist draft only — review before sending.';
+      setMeetingAssistNotice(notice);
+      setMeetingAssistResult(resultText);
+      if (resultText) {
+        setMessageDraft(resultText);
+        setAiSuggestionChips([]);
+        showToast(notice, 3500);
+      } else {
+        showToast('No meeting draft returned');
+      }
+    } catch {
+      showToast('Meeting assist failed');
+    } finally {
+      setMeetingAssistBusy(false);
+    }
   };
 
   const loadBusinessAiConfig = async (userId = currentUserId) => {
@@ -11951,6 +12030,75 @@ function App() {
           </aside>
         ) : null}
 
+        {meetingAssistVisible ? (
+          <aside className="ai-helper-panel" aria-label="Meeting assist">
+            <div className="ai-helper-toolbar">
+              <strong>Meeting assist</strong>
+              <button onClick={() => setMeetingAssistVisible(false)} type="button">
+                Close
+              </button>
+            </div>
+            <p className="ai-helper-disclaimer" role="note">
+              Prep, agenda, notes, or follow-up drafts. Never auto-sent.
+            </p>
+            <div className="ai-helper-tasks">
+              {MEETING_ASSIST_MODES.map((entry) => (
+                <button
+                  className={meetingAssistMode === entry.id ? 'active' : ''}
+                  key={entry.id}
+                  onClick={() => {
+                    setMeetingAssistMode(entry.id);
+                    setMeetingAssistResult('');
+                  }}
+                  type="button"
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+            <textarea
+              onChange={(event) => setMeetingAssistContext(event.target.value)}
+              placeholder="Optional notes / context (or use chat with consent)…"
+              rows={3}
+              value={meetingAssistContext}
+            />
+            <label className="ai-consent-row">
+              <input
+                checked={meetingAssistConsent}
+                onChange={(event) => setMeetingAssistConsent(event.target.checked)}
+                type="checkbox"
+              />
+              <span>I consent to share this chat context with meeting assist</span>
+            </label>
+            <div className="ai-helper-actions">
+              <button
+                disabled={meetingAssistBusy || !currentUserId}
+                onClick={() => void runMeetingAssist()}
+                type="button"
+              >
+                {meetingAssistBusy ? 'Working…' : 'Run'}
+              </button>
+              {meetingAssistResult ? (
+                <button
+                  onClick={() => {
+                    setMessageDraft(meetingAssistResult);
+                    showToast('Filled draft — review before sending', 3000);
+                  }}
+                  type="button"
+                >
+                  Use as draft
+                </button>
+              ) : null}
+            </div>
+            {meetingAssistNotice ? (
+              <p className="ai-helper-notice" role="status">
+                {meetingAssistNotice}
+              </p>
+            ) : null}
+            {meetingAssistResult ? <p className="ai-helper-result">{meetingAssistResult}</p> : null}
+          </aside>
+        ) : null}
+
         {aiHelperVisible ? (
           <aside className="ai-helper-panel" aria-label="AI helper">
             <div className="ai-helper-toolbar">
@@ -12436,6 +12584,20 @@ function App() {
             type="button"
           >
             AI helper
+          </button>
+          <button
+            className={meetingAssistVisible ? 'active' : ''}
+            disabled={!currentUserId}
+            onClick={() => {
+              if (meetingAssistVisible) {
+                setMeetingAssistVisible(false);
+              } else {
+                openMeetingAssist();
+              }
+            }}
+            type="button"
+          >
+            Meeting assist
           </button>
           <button
             disabled={aiTwinBusy || !currentUserId}
