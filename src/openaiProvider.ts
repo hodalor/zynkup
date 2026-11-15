@@ -261,3 +261,53 @@ export async function openaiTwinDraft(
     { temperature: 0.4, maxTokens: 400 },
   );
 }
+
+export type MeetingAssistMode = 'prep' | 'followup' | 'agenda' | 'notes';
+
+const MEETING_MODE_PROMPTS: Record<MeetingAssistMode, string> = {
+  prep:
+    'Help the user prepare for an upcoming meeting or call. '
+    + 'Return short talking points and questions to ask. '
+    + 'Use markdown bullets. Do not invent commitments, prices, or facts not in the context.',
+  followup:
+    'Draft a polite follow-up message after a meeting or call. '
+    + 'Include a short thank-you, key next steps if clear from context, and open questions. '
+    + 'Output send-ready draft text the user can edit. Never invent agreements.',
+  agenda:
+    'Propose a concise meeting agenda as numbered or bulleted items. '
+    + 'Base it only on the provided chat/context. Mark unknowns clearly.',
+  notes:
+    'Turn the provided chat/context into concise meeting notes: decisions, open questions, and action items. '
+    + 'Use short bullets. Flag money/PIN/OTP requests if present. Do not invent decisions.',
+};
+
+const extractBullets = (text: string): string[] =>
+  text
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())
+    .filter((line) => line.length > 0 && line.length < 280)
+    .slice(0, 16);
+
+export async function openaiMeetingAssist(
+  mode: MeetingAssistMode,
+  contextText: string,
+): Promise<{ result: string; bullets: string[] }> {
+  const result = await openaiChat(
+    [
+      {
+        role: 'system',
+        content:
+          'You are ZynkUp meeting assist. Drafts only — never send messages. '
+          + MEETING_MODE_PROMPTS[mode]
+          + ' Keep it concise and practical for Ghana / West Africa business chat. '
+          + 'No legal or financial advice. Never share or request PINs/OTPs.',
+      },
+      {
+        role: 'user',
+        content: `Mode: ${mode}\n\nContext:\n${contextText.slice(0, 12000)}`,
+      },
+    ],
+    { temperature: 0.4, maxTokens: 700 },
+  );
+  return { result, bullets: extractBullets(result) };
+}

@@ -54,12 +54,14 @@ import {
 import {
   hasOpenAi,
   openaiChat,
+  openaiMeetingAssist,
   openaiRewrite,
   openaiSuggestReplies,
   openaiSummarize,
   openaiTranscribeAudioUrl,
   openaiTranslate,
   openaiTwinDraft,
+  type MeetingAssistMode,
 } from './openaiProvider.js';
 
 type Presence = 'online' | 'offline' | 'typing';
@@ -1311,6 +1313,14 @@ const assistantTaskSchema = z.object({
   messageId: z.string().min(1).max(80).optional(),
   tone: aiToneSchema.optional(),
   targetLanguage: z.enum(['en', 'tw', 'ga', 'ee', 'pcm']).optional(),
+  consentToShareContext: z.boolean().default(false),
+});
+
+const meetingAssistSchema = z.object({
+  userId: z.string().min(1),
+  chatId: z.string().min(1).max(80).optional(),
+  mode: z.enum(['prep', 'followup', 'agenda', 'notes']),
+  contextText: z.string().trim().max(12000).optional(),
   consentToShareContext: z.boolean().default(false),
 });
 
@@ -8753,6 +8763,143 @@ app.post('/api/ai/assistant', async (req, res) => {
     autoSend: false,
     contextUsed: contextMeta,
     notice: 'Draft only. Edit before sending. Never treat AI wording as a final commitment.',
+  });
+});
+
+const templateMeetingAssist = (mode: MeetingAssistMode, contextText: string) => {
+  const snippet = contextText.trim().slice(0, 220) || 'the recent chat';
+  const templates: Record<MeetingAssistMode, { result: string; bullets: string[] }> = {
+    prep: {
+      result:
+        `Prep for the call\n`
+        + `- Confirm the goal based on: ${snippet}\n`
+        + '- List open questions before you dial\n'
+        + '- Note any amounts, dates, or promises to verify\n'
+        + '- Decide what you will not commit to without checking',
+      bullets: [
+        `Confirm the goal based on: ${snippet}`,
+        'List open questions before you dial',
+        'Note any amounts, dates, or promises to verify',
+        'Decide what you will not commit to without checking',
+      ],
+    },
+    followup: {
+      result:
+        `Thanks for the call earlier — following up on ${snippet}.\n\n`
+        + 'Could you confirm the next step and timing when you can? Happy to adjust if anything changed.',
+      bullets: [
+        'Thank them for the call',
+        'Restate the topic briefly',
+        'Ask them to confirm next steps / timing',
+      ],
+    },
+    agenda: {
+      result:
+        `Proposed agenda\n`
+        + '1. Quick check-in\n'
+        + `2. Review: ${snippet}\n`
+        + '3. Decisions / blockers\n'
+        + '4. Next steps and owners',
+      bullets: [
+        'Quick check-in',
+        `Review: ${snippet}`,
+        'Decisions / blockers',
+        'Next steps and owners',
+      ],
+    },
+    notes: {
+      result:
+        `Meeting notes (draft)\n`
+        + `- Context: ${snippet}\n`
+        + '- Decisions: (review chat — none invented)\n'
+        + '- Open questions: (list what still needs a yes/no)\n'
+        + '- Action items: (assign owners after you confirm)',
+      bullets: [
+        `Context: ${snippet}`,
+        'Decisions: (review chat — none invented)',
+        'Open questions: (list what still needs a yes/no)',
+        'Action items: (assign owners after you confirm)',
+      ],
+    },
+  };
+  return templates[mode];
+};
+
+app.post('/api/ai/meeting-assist', async (req, res) => {
+  const parseResult = meetingAssistSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Provide userId and a mode (prep, followup, agenda, or notes).' });
+  }
+  const { userId, chatId, mode, consentToShareContext } = parseResult.data;
+  let contextText = (parseResult.data.contextText || '').trim();
+  const contextUsed: Record<string, string> = {};
+
+  if (chatId) {
+    if (!consentToShareContext) {
+      return res.status(400).json({
+        error: 'Confirm consentToShareContext before sharing chat content with meeting assist.',
+        requiresConsent: true,
+      });
+    }
+    const chat = (await readChats()).find((entry) => entry.id === chatId);
+    if (!chat || !chat.participants.includes(userId)) {
+      return res.status(403).json({ error: 'You cannot use this chat with meeting assist.' });
+    }
+    contextUsed.chatId = chat.id;
+    if (!contextText) {
+      const now = Date.now();
+      const messages = (await readMessages())
+        .filter((entry) => entry.chatId === chatId)
+        .filter((entry) => !entry.expiresAt || new Date(entry.expiresAt).getTime() > now)
+        .filter((entry) => !entry.deletedForEveryone && (entry.text || '').trim())
+        .sort((a, b) => a.sentAt.localeCompare(b.sentAt))
+        .slice(-60);
+      contextText = messages
+        .map((entry) => `${entry.senderId === userId ? 'Me' : 'Them'}: ${entry.text}`)
+        .join('\n')
+        .slice(0, 12000);
+    }
+  }
+
+  if (!contextText) {
+    return res.status(400).json({
+      error: chatId
+        ? 'No usable chat text found. Add contextText or wait for messages.'
+        : 'Provide contextText, or a chatId with consentToShareContext.',
+    });
+  }
+
+  let result = '';
+  let bullets: string[] = [];
+  let source: 'openai' | 'template' = 'template';
+
+  if (hasOpenAi()) {
+    try {
+      const ai = await openaiMeetingAssist(mode, contextText);
+      result = ai.result;
+      bullets = ai.bullets;
+      source = 'openai';
+    } catch {
+      // template fallback below
+    }
+  }
+
+  if (!result) {
+    const fallback = templateMeetingAssist(mode, contextText);
+    result = fallback.result;
+    bullets = fallback.bullets;
+    source = 'template';
+  }
+
+  return res.json({
+    mode,
+    result,
+    bullets,
+    autoSend: false,
+    source,
+    contextUsed,
+    notice:
+      'Meeting assist draft only — review and edit before sending. Nothing is sent automatically.',
   });
 });
 
