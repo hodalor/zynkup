@@ -1057,10 +1057,46 @@ type BusinessHubTab =
   | 'inventory'
   | 'customers'
   | 'autoreplies'
+  | 'automations'
   | 'documents'
   | 'broadcasts'
   | 'ai'
   | 'twin';
+
+type AutomationTrigger = 'new_message' | 'new_order' | 'low_stock' | 'payment_request_paid';
+type AutomationAction =
+  | 'draft_reply_template'
+  | 'notify_owner'
+  | 'create_reminder'
+  | 'label_chat';
+
+type AutomationRule = {
+  id: string;
+  ownerUserId: string;
+  businessId?: string | null;
+  name: string;
+  trigger: AutomationTrigger;
+  action: AutomationAction;
+  templateText: string;
+  label: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AutomationRun = {
+  id: string;
+  ruleId: string;
+  ownerUserId: string;
+  trigger: AutomationTrigger;
+  action: AutomationAction;
+  status: string;
+  summary: string;
+  draftText?: string;
+  chatId?: string | null;
+  autoSend: false;
+  createdAt: string;
+};
 
 type StatusItem = {
   id: string;
@@ -2050,6 +2086,16 @@ function App() {
   const [autoReplyConfig, setAutoReplyConfig] = useState<AutoReplyConfig | null>(null);
   const [autoReplyLogs, setAutoReplyLogs] = useState<AutoReplyLog[]>([]);
   const [autoReplyRuleDraft, setAutoReplyRuleDraft] = useState({ keywords: '', response: '' });
+  const [automationRules, setAutomationRules] = useState<AutomationRule[]>([]);
+  const [automationLogs, setAutomationLogs] = useState<AutomationRun[]>([]);
+  const [automationBusy, setAutomationBusy] = useState(false);
+  const [automationDraft, setAutomationDraft] = useState({
+    name: '',
+    trigger: 'new_message' as AutomationTrigger,
+    action: 'draft_reply_template' as AutomationAction,
+    templateText: '',
+    label: '',
+  });
   const [commerceDocuments, setCommerceDocuments] = useState<CommerceDocument[]>([]);
   const [documentKindFilter, setDocumentKindFilter] = useState<'' | CommerceDocKind>('');
   const [documentForm, setDocumentForm] = useState({
@@ -4318,6 +4364,23 @@ function App() {
     });
     socket.on('autoReply:updated', ({ config }: { config: AutoReplyConfig }) => {
       if (config) setAutoReplyConfig(config);
+    });
+    socket.on('automation:updated', ({ rule, change }: { rule?: AutomationRule; change?: string }) => {
+      if (!rule?.id) return;
+      if (change === 'deleted') {
+        setAutomationRules((current) => current.filter((entry) => entry.id !== rule.id));
+        return;
+      }
+      setAutomationRules((current) => [rule, ...current.filter((entry) => entry.id !== rule.id)]);
+    });
+    socket.on('automation:fired', ({ run }: { run?: AutomationRun }) => {
+      if (!run?.id) return;
+      setAutomationLogs((current) => [run, ...current.filter((entry) => entry.id !== run.id)].slice(0, 100));
+      if (run.draftText) {
+        showToast(`Automation draft ready — never auto-sent. Review before sending.`, 4000);
+      } else if (run.summary) {
+        showToast(run.summary, 3200);
+      }
     });
     socket.on('autoReply:sent', ({ log, message: autoMessage }: { log?: AutoReplyLog; message?: any }) => {
       if (log?.id) {
@@ -6608,6 +6671,130 @@ function App() {
     } catch {
       // ignore
     }
+  };
+
+  const loadAutomationRules = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/automations?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutomationRules(Array.isArray(payload.rules) ? payload.rules : []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadAutomationLogs = async (userId = currentUserId) => {
+    if (!userId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/automations/logs?userId=${encodeURIComponent(userId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setAutomationLogs(Array.isArray(payload.logs) ? payload.logs : []);
+    } catch {
+      // ignore
+    }
+  };
+
+  const createAutomationRule = async () => {
+    if (!currentUserId || automationBusy) return;
+    setAutomationBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/automations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          name: automationDraft.name.trim() || undefined,
+          trigger: automationDraft.trigger,
+          action: automationDraft.action,
+          templateText: automationDraft.templateText.trim(),
+          label: automationDraft.label.trim() || undefined,
+          enabled: true,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create automation');
+        return;
+      }
+      if (payload.rule?.id) {
+        setAutomationRules((current) => [payload.rule, ...current.filter((entry) => entry.id !== payload.rule.id)]);
+      }
+      setAutomationDraft({
+        name: '',
+        trigger: 'new_message',
+        action: 'draft_reply_template',
+        templateText: '',
+        label: '',
+      });
+      showToast('Automation created — drafts never auto-send');
+    } catch {
+      showToast('Could not create automation');
+    } finally {
+      setAutomationBusy(false);
+    }
+  };
+
+  const toggleAutomationRule = async (rule: AutomationRule) => {
+    if (!currentUserId || automationBusy) return;
+    setAutomationBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/automations/${encodeURIComponent(rule.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUserId, enabled: !rule.enabled }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not update automation');
+        return;
+      }
+      if (payload.rule?.id) {
+        setAutomationRules((current) =>
+          current.map((entry) => (entry.id === payload.rule.id ? payload.rule : entry)),
+        );
+      }
+    } catch {
+      showToast('Could not update automation');
+    } finally {
+      setAutomationBusy(false);
+    }
+  };
+
+  const deleteAutomationRule = async (ruleId: string) => {
+    if (!currentUserId || automationBusy) return;
+    setAutomationBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/automations/${encodeURIComponent(ruleId)}?userId=${encodeURIComponent(currentUserId)}`,
+        { method: 'DELETE' },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not delete automation');
+        return;
+      }
+      setAutomationRules((current) => current.filter((entry) => entry.id !== ruleId));
+      showToast('Automation removed');
+    } catch {
+      showToast('Could not delete automation');
+    } finally {
+      setAutomationBusy(false);
+    }
+  };
+
+  const useAutomationDraft = (run: AutomationRun) => {
+    if (!run.draftText) {
+      showToast('No draft on this run');
+      return;
+    }
+    fillComposerFromTwinDraft(run.draftText, 'Filled automation draft — never auto-sent. Review before sending.');
   };
 
   const saveAutoReplyConfig = async (
@@ -13243,6 +13430,7 @@ function App() {
         { id: 'documents', label: 'Documents' },
         { id: 'broadcasts', label: 'Broadcasts' },
         { id: 'autoreplies', label: 'Auto-replies' },
+        { id: 'automations', label: 'Automations' },
         { id: 'ai', label: 'AI assistant' },
         { id: 'twin', label: 'AI Twin' },
       ];
@@ -13296,6 +13484,10 @@ function App() {
                   if (tab.id === 'autoreplies') {
                     void loadAutoReplyConfig();
                     void loadAutoReplyLogs();
+                  }
+                  if (tab.id === 'automations') {
+                    void loadAutomationRules();
+                    void loadAutomationLogs();
                   }
                   if (tab.id === 'ai') {
                     void loadBusinessAiConfig();
@@ -14581,6 +14773,148 @@ function App() {
                       {new Date(log.createdAt).toLocaleString()} · chat {log.chatId}
                     </small>
                   </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {businessHubTab === 'automations' ? (
+            <div className="business-panel">
+              <h3>Workflow automations</h3>
+              <p>
+                Simple if-this-then-that rules for your business. Reply actions create owner drafts
+                only — never auto-send.
+              </p>
+
+              <h3>Your rules</h3>
+              {automationRules.length ? null : <p>No automations yet. Create one below.</p>}
+              {automationRules.map((rule) => (
+                <div className="business-product-row" key={rule.id}>
+                  <div>
+                    <strong>{rule.name}</strong>
+                    <small>
+                      {rule.trigger.replace(/_/g, ' ')} → {rule.action.replace(/_/g, ' ')}
+                      {rule.templateText ? ` · ${rule.templateText.slice(0, 80)}` : ''}
+                      {rule.label ? ` · label “${rule.label}”` : ''}
+                    </small>
+                    {rule.enabled === false ? (
+                      <span className="consent-badge consent-opted_out">Off</span>
+                    ) : (
+                      <span className="consent-badge consent-opted_in">On</span>
+                    )}
+                  </div>
+                  <div className="business-product-actions">
+                    <button
+                      disabled={automationBusy}
+                      onClick={() => void toggleAutomationRule(rule)}
+                      type="button"
+                    >
+                      {rule.enabled ? 'Pause' : 'Enable'}
+                    </button>
+                    <button
+                      disabled={automationBusy}
+                      onClick={() => void deleteAutomationRule(rule.id)}
+                      type="button"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              <h3>Create rule</h3>
+              <input
+                onChange={(event) =>
+                  setAutomationDraft((current) => ({ ...current, name: event.target.value }))
+                }
+                placeholder="Name (optional)"
+                value={automationDraft.name}
+              />
+              <label>
+                Trigger
+                <select
+                  onChange={(event) =>
+                    setAutomationDraft((current) => ({
+                      ...current,
+                      trigger: event.target.value as AutomationTrigger,
+                    }))
+                  }
+                  value={automationDraft.trigger}
+                >
+                  <option value="new_message">New message</option>
+                  <option value="new_order">New order</option>
+                  <option value="low_stock">Low stock</option>
+                  <option value="payment_request_paid">Payment request paid</option>
+                </select>
+              </label>
+              <label>
+                Action
+                <select
+                  onChange={(event) =>
+                    setAutomationDraft((current) => ({
+                      ...current,
+                      action: event.target.value as AutomationAction,
+                    }))
+                  }
+                  value={automationDraft.action}
+                >
+                  <option value="draft_reply_template">Draft reply (owner only)</option>
+                  <option value="notify_owner">Notify owner</option>
+                  <option value="create_reminder">Create reminder</option>
+                  <option value="label_chat">Label chat / customer</option>
+                </select>
+              </label>
+              <textarea
+                onChange={(event) =>
+                  setAutomationDraft((current) => ({
+                    ...current,
+                    templateText: event.target.value,
+                  }))
+                }
+                placeholder="Template text (use {{name}}, {{text}}, {{title}}…)"
+                value={automationDraft.templateText}
+              />
+              {automationDraft.action === 'label_chat' ? (
+                <input
+                  onChange={(event) =>
+                    setAutomationDraft((current) => ({ ...current, label: event.target.value }))
+                  }
+                  placeholder="Label / tag"
+                  value={automationDraft.label}
+                />
+              ) : null}
+              <button disabled={automationBusy} onClick={() => void createAutomationRule()} type="button">
+                {automationBusy ? 'Saving…' : 'Add automation'}
+              </button>
+
+              <h3>Recent runs</h3>
+              <button
+                onClick={() => {
+                  void loadAutomationRules();
+                  void loadAutomationLogs();
+                }}
+                type="button"
+              >
+                Refresh
+              </button>
+              {automationLogs.length ? null : <p>No automation runs yet.</p>}
+              {automationLogs.slice(0, 12).map((run) => (
+                <div className="business-product-row" key={run.id}>
+                  <div>
+                    <strong>{run.status}</strong>
+                    <small>
+                      {new Date(run.createdAt).toLocaleString()} · {run.trigger} → {run.action}
+                      {run.summary ? ` · ${run.summary}` : ''}
+                    </small>
+                    {run.draftText ? <small>{run.draftText.slice(0, 120)}</small> : null}
+                  </div>
+                  {run.draftText ? (
+                    <div className="business-product-actions">
+                      <button onClick={() => useAutomationDraft(run)} type="button">
+                        Use draft
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>
