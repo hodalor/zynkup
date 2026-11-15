@@ -3643,3 +3643,65 @@
   font-size: 0.75rem;
   font-weight: 700;
 }
+
+.pay-shell {
+  overflow: auto;
+  padding-bottom: 32px;
+}
+
+.pay-hero {
+  margin: 20px;
+  padding: 22px;
+  border-radius: 22px;
+  background: linear-gradient(145deg, #0ea5e9 0%, #0369a1 100%);
+  color: #f8fafc;
+}
+
+.pay-hero-label {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 700;
+  opacity: 0.88;
+}
+
+.pay-hero h3 {
+  margin: 8px 0 6px;
+  font-size: 2rem;
+  letter-spacing: -0.03em;
+}
+
+.pay-hero .muted {
+  color: rgba(248, 250, 252, 0.86);
+}
+
+.pay-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.pay-hero-actions button {
+  border: 0;
+  border-radius: 12px;
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.pay-hero-actions button.active,
+.pay-hero-actions button:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.pay-form-panel input {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 12px;
+  border: 1px solid #243044;
+  background: #0b1018;
+  color: #f2f4f5;
+  padding: 12px;
+}

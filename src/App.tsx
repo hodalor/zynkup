@@ -3,7 +3,18 @@ import QRCode from 'qrcode';
 import { io, Socket } from 'socket.io-client';
 import './App.css';
 
-type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games' | 'events';
+type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games' | 'events' | 'pay';
+type PayPanel = 'home' | 'send' | 'request' | 'topup' | 'orders' | 'history';
+type PayHistoryItem = {
+  id: string;
+  title: string;
+  time: string;
+  amount: string;
+  positive: boolean;
+  status?: string;
+  authorizationUrl?: string | null;
+  orderId?: string | null;
+};
 type ReceiptState = 'pending' | 'sent' | 'delivered' | 'read';
 
 type OutboxMessageBody = {
@@ -1853,6 +1864,11 @@ function App() {
   const [salesDashboard, setSalesDashboard] = useState<SalesDashboard | null>(null);
   const [salesDashboardPeriod, setSalesDashboardPeriod] = useState<'today' | '7d' | '30d'>('7d');
   const [commerceOrders, setCommerceOrders] = useState<CommerceOrder[]>([]);
+  const [buyerOrders, setBuyerOrders] = useState<CommerceOrder[]>([]);
+  const [payPanel, setPayPanel] = useState<PayPanel>('home');
+  const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '' });
+  const [payHistoryItems, setPayHistoryItems] = useState<PayHistoryItem[]>([]);
+  const [payBusy, setPayBusy] = useState(false);
   const [saleReceipts, setSaleReceipts] = useState<SaleReceipt[]>([]);
   const [receiptDetail, setReceiptDetail] = useState<SaleReceipt | null>(null);
   const [inventoryAlerts, setInventoryAlerts] = useState<InventoryAlert[]>([]);
@@ -4810,20 +4826,179 @@ function App() {
     }
   };
 
-  const loadCommerceOrders = async () => {
+  const loadCommerceOrders = async (role: 'seller' | 'buyer' | 'all' = 'seller') => {
     if (!currentUserId) return;
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/orders?userId=${encodeURIComponent(currentUserId)}&role=seller`,
+        `${API_BASE_URL}/api/orders?userId=${encodeURIComponent(currentUserId)}&role=${encodeURIComponent(role)}`,
       );
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         showToast(payload.error || 'Could not load orders');
         return;
       }
-      setCommerceOrders(payload.orders ?? []);
+      const orders = (payload.orders ?? []) as CommerceOrder[];
+      if (role === 'buyer') {
+        setBuyerOrders(orders);
+      } else {
+        setCommerceOrders(orders);
+      }
     } catch {
       showToast('Could not load orders');
+    }
+  };
+
+  const appendPayHistoryEntry = (
+    intent: {
+      id?: string;
+      status?: string;
+      authorizationUrl?: string | null;
+      provider?: string;
+      orderId?: string | null;
+    } | null | undefined,
+    options: { title: string; amount: number; currency?: string; positive?: boolean },
+  ) => {
+    const currency = options.currency || profile.currency || 'GHS';
+    const entry: PayHistoryItem = {
+      id: intent?.id || `local-${Date.now()}`,
+      title: options.title,
+      time: 'Just now',
+      amount: `${options.positive ? '+' : '-'}${currency} ${options.amount.toFixed(2)}`,
+      positive: Boolean(options.positive),
+      status: intent?.status,
+      authorizationUrl: intent?.authorizationUrl || null,
+      orderId: intent?.orderId || null,
+    };
+    setPayHistoryItems((current) => [entry, ...current.filter((item) => item.id !== entry.id)]);
+    return entry;
+  };
+
+  const openPaystackCheckout = (intent: {
+    status?: string;
+    authorizationUrl?: string | null;
+  } | null | undefined, message?: string) => {
+    const status = intent?.status;
+    const url = typeof intent?.authorizationUrl === 'string' ? intent.authorizationUrl.trim() : '';
+
+    if (status === 'awaiting_provider_keys') {
+      showToast(
+        message
+          || 'Paystack keys are not configured yet. Add PAYSTACK_SECRET_KEY on the server to enable checkout.',
+        5600,
+      );
+      return false;
+    }
+
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      showToast(message || 'Opening Paystack checkout…', 3600);
+      return true;
+    }
+
+    if (status === 'initialized') {
+      showToast(message || 'Checkout initialized, but Paystack did not return a link.', 4800);
+      return false;
+    }
+
+    showToast(message || `Payment status: ${status || 'unknown'}.`, 4200);
+    return false;
+  };
+
+  const createPaystackIntent = async (body: Record<string, unknown>) => {
+    const response = await fetch(`${API_BASE_URL}/api/payments/intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'paystack',
+        userId: currentUserId || undefined,
+        ...body,
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return { response, payload };
+  };
+
+  const submitPayAction = async (action: 'send' | 'request' | 'topup') => {
+    if (!currentUserId || payBusy) return;
+    const amount = Number.parseFloat(payForm.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast('Enter a valid amount first.');
+      return;
+    }
+    if ((action === 'send' || action === 'request') && !payForm.phone.trim()) {
+      showToast('Enter the recipient phone number.');
+      return;
+    }
+    setPayBusy(true);
+    try {
+      const { response, payload } = await createPaystackIntent({
+        action,
+        amount,
+        currency: profile.currency || 'GHS',
+        phone: payForm.phone.trim() || profile.phone || undefined,
+        note: payForm.note.trim() || undefined,
+      });
+      if (!response.ok) {
+        showToast(payload.error || 'Payment could not start.', 3600);
+        return;
+      }
+      appendPayHistoryEntry(payload.intent, {
+        title:
+          action === 'send'
+            ? `Sent to ${payForm.phone.trim()}`
+            : action === 'request'
+              ? `Requested from ${payForm.phone.trim()}`
+              : 'Paystack top up',
+        amount,
+        currency: profile.currency || 'GHS',
+        positive: action === 'request' || action === 'topup',
+      });
+      openPaystackCheckout(payload.intent, payload.message);
+      setPayForm({ amount: '', phone: '', note: '' });
+      setPayPanel('home');
+    } catch {
+      showToast('Network error while starting payment.');
+    } finally {
+      setPayBusy(false);
+    }
+  };
+
+  const payForCommerceOrder = async (order: CommerceOrder) => {
+    if (!currentUserId || payBusy) return;
+    if (order.state !== 'pending_payment') {
+      showToast(`This order is already ${order.state.replace(/_/g, ' ')}.`);
+      return;
+    }
+    const amount = Number(order.totalAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast('This order has no amount to charge.');
+      return;
+    }
+    setPayBusy(true);
+    try {
+      const { response, payload } = await createPaystackIntent({
+        action: 'checkout',
+        amount,
+        currency: order.currency || profile.currency || 'GHS',
+        note: order.items?.[0]?.title || `Order ${order.id}`,
+        phone: profile.phone || undefined,
+        orderId: order.id,
+      });
+      if (!response.ok) {
+        showToast(payload.error || 'Payment could not start.', 3600);
+        return;
+      }
+      appendPayHistoryEntry(payload.intent, {
+        title: `Order ${order.id}`,
+        amount,
+        currency: order.currency || profile.currency || 'GHS',
+        positive: false,
+      });
+      openPaystackCheckout(payload.intent, payload.message);
+    } catch {
+      showToast('Network error while starting payment.');
+    } finally {
+      setPayBusy(false);
     }
   };
 
@@ -11448,6 +11623,212 @@ function App() {
     </>
   );
 
+  const renderPayView = () => {
+    const currency = profile.currency || 'GHS';
+    return (
+      <main className="panel-shell pay-shell">
+        <header className="panel-header">
+          <div>
+            <h2>ZynkUp Pay</h2>
+            <p>F1 Pay / MoMo checkout via Paystack — no stored wallet balance.</p>
+          </div>
+        </header>
+
+        <section className="pay-hero">
+          <p className="pay-hero-label">Card &amp; MoMo</p>
+          <h3>Paystack</h3>
+          <p className="muted">Checkout opens in a new tab. Keys live on the server only.</p>
+          <div className="pay-hero-actions">
+            {([
+              ['send', 'Send'],
+              ['request', 'Request'],
+              ['topup', 'Pay in'],
+              ['orders', 'Orders'],
+              ['history', 'History'],
+            ] as Array<[PayPanel, string]>).map(([id, label]) => (
+              <button
+                key={id}
+                className={payPanel === id ? 'active' : ''}
+                onClick={() => {
+                  setPayForm({ amount: '', phone: '', note: '' });
+                  setPayPanel(id);
+                  if (id === 'orders' || id === 'history') {
+                    void loadCommerceOrders('buyer');
+                    void loadSaleReceipts();
+                  }
+                }}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        {payPanel === 'send' || payPanel === 'request' || payPanel === 'topup' ? (
+          <section className="business-panel pay-form-panel">
+            <h3>
+              {payPanel === 'send' ? 'Send money' : payPanel === 'request' ? 'Request money' : 'Pay in via Paystack'}
+            </h3>
+            {(payPanel === 'send' || payPanel === 'request') ? (
+              <input
+                onChange={(event) => setPayForm((current) => ({ ...current, phone: event.target.value }))}
+                placeholder="Phone number"
+                value={payForm.phone}
+              />
+            ) : null}
+            <input
+              onChange={(event) => setPayForm((current) => ({ ...current, amount: event.target.value }))}
+              placeholder={`Amount (${currency})`}
+              type="number"
+              value={payForm.amount}
+            />
+            <input
+              onChange={(event) => setPayForm((current) => ({ ...current, note: event.target.value }))}
+              placeholder="Note (optional)"
+              value={payForm.note}
+            />
+            <p className="muted">
+              Opens Paystack checkout (card / MoMo). If keys are missing, you will see awaiting provider keys.
+            </p>
+            <button disabled={payBusy} onClick={() => void submitPayAction(payPanel)} type="button">
+              {payBusy
+                ? 'Starting…'
+                : payPanel === 'send'
+                  ? 'Send with Paystack'
+                  : payPanel === 'request'
+                    ? 'Request'
+                    : 'Pay with Paystack'}
+            </button>
+            <button onClick={() => setPayPanel('home')} type="button">Back</button>
+          </section>
+        ) : null}
+
+        {payPanel === 'orders' ? (
+          <section className="business-panel">
+            <h3>My orders</h3>
+            <button onClick={() => void loadCommerceOrders('buyer')} type="button">Refresh</button>
+            {buyerOrders.length ? null : <p>No purchases yet.</p>}
+            {buyerOrders.map((order) => (
+              <div className="business-product-row" key={order.id}>
+                <div>
+                  <strong>{order.items?.[0]?.title || order.id}</strong>
+                  <small>
+                    {order.state.replace(/_/g, ' ')} · {moneyLabel(order.totalAmount, order.currency)}
+                  </small>
+                </div>
+                <div className="business-product-actions">
+                  {order.state === 'pending_payment' ? (
+                    <button disabled={payBusy} onClick={() => void payForCommerceOrder(order)} type="button">
+                      Pay with Paystack
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </section>
+        ) : null}
+
+        {payPanel === 'history' ? (
+          <section className="business-panel">
+            <h3>Payment history</h3>
+            {payHistoryItems.length || buyerOrders.length || saleReceipts.length ? null : (
+              <p>No payments yet.</p>
+            )}
+            {payHistoryItems.map((item) => (
+              <button
+                className="settings-list-row"
+                key={item.id}
+                onClick={() => {
+                  if (item.authorizationUrl) {
+                    window.open(item.authorizationUrl, '_blank', 'noopener,noreferrer');
+                  }
+                }}
+                type="button"
+              >
+                <span>
+                  {item.title}
+                  <small>
+                    {' '}
+                    · {item.time} · {item.amount}
+                    {item.status ? ` · ${item.status.replace(/_/g, ' ')}` : ''}
+                  </small>
+                </span>
+                <strong>{item.authorizationUrl ? 'Open' : '·'}</strong>
+              </button>
+            ))}
+            {buyerOrders.map((order) => (
+              <div className="settings-list-row" key={`order-${order.id}`}>
+                <span>
+                  {order.items?.[0]?.title || `Order ${order.id}`}
+                  <small>
+                    {' '}
+                    · Order · {order.state.replace(/_/g, ' ')} · {moneyLabel(order.totalAmount, order.currency)}
+                  </small>
+                </span>
+                {order.state === 'pending_payment' ? (
+                  <button disabled={payBusy} onClick={() => void payForCommerceOrder(order)} type="button">
+                    Pay
+                  </button>
+                ) : (
+                  <strong>·</strong>
+                )}
+              </div>
+            ))}
+            {saleReceipts.slice(0, 12).map((receipt) => (
+              <button
+                className="settings-list-row"
+                key={`receipt-${receipt.id}`}
+                onClick={() => void openReceiptDetail(receipt.id)}
+                type="button"
+              >
+                <span>
+                  {receipt.receiptNumber}
+                  <small>
+                    {' '}
+                    · Receipt · {receipt.state} · {moneyLabel(receipt.totalAmount, receipt.currency)}
+                  </small>
+                </span>
+                <strong>View</strong>
+              </button>
+            ))}
+          </section>
+        ) : null}
+
+        {payPanel === 'home' ? (
+          <section className="business-panel">
+            <h3>Recent transactions</h3>
+            {payHistoryItems.length ? null : (
+              <p>No payments yet. Send money or pay an order to see them here.</p>
+            )}
+            {payHistoryItems.map((item) => (
+              <button
+                className="settings-list-row"
+                key={item.id}
+                onClick={() => {
+                  if (item.authorizationUrl) {
+                    window.open(item.authorizationUrl, '_blank', 'noopener,noreferrer');
+                  }
+                }}
+                type="button"
+              >
+                <span>
+                  {item.title}
+                  <small>
+                    {' '}
+                    · {item.time}
+                    {item.status ? ` · ${item.status.replace(/_/g, ' ')}` : ''}
+                  </small>
+                </span>
+                <strong>{item.amount}</strong>
+              </button>
+            ))}
+          </section>
+        ) : null}
+      </main>
+    );
+  };
+
   const renderCallsView = () => (
     <main className="panel-shell">
       <header className="panel-header">
@@ -14327,6 +14708,17 @@ function App() {
           <button className={`rail-button ${activeView === 'events' ? 'active' : ''}`} onClick={() => setActiveView('events')} type="button" title="Events">📅</button>
           <button className={`rail-button ${activeView === 'voiceRooms' ? 'active' : ''}`} onClick={() => setActiveView('voiceRooms')} type="button" title="Voice rooms">🎙</button>
           <button className={`rail-button ${activeView === 'games' ? 'active' : ''}`} onClick={() => setActiveView('games')} type="button" title="Games">🎮</button>
+          <button
+            className={`rail-button ${activeView === 'pay' ? 'active' : ''}`}
+            onClick={() => {
+              setActiveView('pay');
+              setPayPanel('home');
+            }}
+            title="Pay"
+            type="button"
+          >
+            💸
+          </button>
           <button className={`rail-button ${activeView === 'catalog' ? 'active' : ''}`} onClick={() => setActiveView('catalog')} type="button">🏬</button>
           <button className={`rail-button ${activeView === 'settings' ? 'active' : ''}`} onClick={() => setActiveView('settings')} type="button">⚙</button>
         </div>
@@ -14340,6 +14732,7 @@ function App() {
       {activeView === 'events' ? renderEventsView() : null}
       {activeView === 'voiceRooms' ? renderVoiceRoomsView() : null}
       {activeView === 'games' ? renderGamesView() : null}
+      {activeView === 'pay' ? renderPayView() : null}
       {activeView === 'catalog' ? renderCatalogView() : null}
       {activeView === 'settings' ? renderSettingsView() : null}
 
