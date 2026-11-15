@@ -1,0 +1,129 @@
+.public-card {
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse at top left, rgba(34, 211, 238, 0.12), transparent 45%),
+    radial-gradient(ellipse at bottom right, rgba(124, 58, 237, 0.16), transparent 40%),
+    #090b10;
+  color: #f2f4f5;
+  padding: 28px 20px 64px;
+}
+
+.public-card-top {
+  max-width: 520px;
+  margin: 0 auto 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.public-card-brand {
+  color: #f2f4f5;
+  font-weight: 800;
+  font-size: 22px;
+  text-decoration: none;
+  letter-spacing: -0.02em;
+}
+
+.public-card-home {
+  color: #22d3ee;
+  text-decoration: none;
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.public-card-status {
+  max-width: 520px;
+  margin: 40px auto;
+  text-align: center;
+  color: #acb3b9;
+}
+
+.public-card-error {
+  color: #fb7185;
+}
+
+.public-card-sheet {
+  max-width: 520px;
+  margin: 0 auto;
+  border: 1.5px solid #22d3ee;
+  border-radius: 22px;
+  padding: 28px 24px 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+}
+
+.public-card-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 36px;
+  object-fit: cover;
+  margin-bottom: 14px;
+}
+
+.public-card-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.12);
+  font-weight: 800;
+  font-size: 22px;
+}
+
+.public-card-sheet h1 {
+  margin: 0 0 4px;
+  font-size: 28px;
+  letter-spacing: -0.02em;
+}
+
+.public-card-title {
+  margin: 0;
+  color: rgba(248, 250, 252, 0.85);
+  font-weight: 600;
+}
+
+.public-card-business {
+  margin: 4px 0 0;
+  font-weight: 700;
+}
+
+.public-card-meta {
+  margin: 12px 0 0;
+  color: rgba(248, 250, 252, 0.7);
+  font-size: 14px;
+}
+
+.public-card-bio {
+  margin: 14px 0 0;
+  color: rgba(248, 250, 252, 0.78);
+  line-height: 1.45;
+}
+
+.public-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.public-card-primary {
+  border: none;
+  border-radius: 12px;
+  padding: 12px 18px;
+  font-weight: 800;
+  color: #0a0b30;
+  cursor: pointer;
+}
+
+.public-card-secondary {
+  border-radius: 12px;
+  padding: 12px 16px;
+  font-weight: 700;
+  color: #f8fafc;
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.public-card-code {
+  margin: 18px 0 0;
+  font-size: 12px;
+  font-weight: 700;
+}

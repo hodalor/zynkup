@@ -2596,6 +2596,60 @@
   color: #4b5563;
 }
 
+.digital-card-preview {
+  display: grid;
+  gap: 6px;
+  padding: 20px;
+  border-radius: 18px;
+  border: 1.5px solid #22d3ee;
+  color: #f8fafc;
+  margin-bottom: 14px;
+}
+
+.digital-card-preview strong {
+  font-size: 22px;
+  letter-spacing: -0.02em;
+}
+
+.digital-card-preview span,
+.digital-card-preview small,
+.digital-card-preview p {
+  color: rgba(248, 250, 252, 0.82);
+}
+
+.digital-card-avatar {
+  width: 64px;
+  height: 64px;
+  border-radius: 32px;
+  object-fit: cover;
+}
+
+.digital-card-qr {
+  margin-bottom: 16px;
+  justify-items: start;
+}
+
+.digital-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.digital-card-actions .ghost-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid #1d2634;
+  background: #10141c;
+  color: #f2f4f5;
+  text-decoration: none;
+  font-weight: 700;
+  cursor: pointer;
+}
+
 .desktop-link-qr-panel {
   display: grid;
   align-content: center;

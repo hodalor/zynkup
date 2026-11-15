@@ -62,6 +62,7 @@ type OutboxEntry = {
 };
 type SettingsPanelId =
   | 'favorites'
+  | 'myCard'
   | 'business'
   | 'history'
   | 'account'
@@ -72,6 +73,29 @@ type SettingsPanelId =
   | 'storage'
   | 'help'
   | '';
+
+type DigitalCardState = {
+  id?: string;
+  code: string;
+  displayName: string;
+  title: string;
+  businessName: string;
+  phone: string;
+  handle: string;
+  email: string;
+  bio: string;
+  avatarUrl: string;
+  theme: 'navy' | 'cyan' | 'magenta' | 'lime' | 'sunset';
+};
+
+const WEB_BASE_URL = process.env.REACT_APP_WEB_BASE_URL || 'https://zynkup.app';
+const CARD_THEME_OPTIONS: Array<{ id: DigitalCardState['theme']; label: string }> = [
+  { id: 'navy', label: 'Navy' },
+  { id: 'cyan', label: 'Cyan' },
+  { id: 'magenta', label: 'Magenta' },
+  { id: 'lime', label: 'Lime' },
+  { id: 'sunset', label: 'Sunset' },
+];
 
 type ReportReasonId = 'spam' | 'harassment' | 'scam' | 'inappropriate' | 'impersonation' | 'other';
 
@@ -1265,6 +1289,7 @@ const DEFAULT_APP_SETTINGS = {
 
 const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top' },
+  { id: 'myCard', title: 'My card', subtitle: 'Digital card and QR for networking' },
   { id: 'business', title: 'Business tools', subtitle: 'Catalog, customers, invoices, quotations, broadcasts, and sales' },
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations' },
   { id: 'account', title: 'Account', subtitle: 'Profile and security' },
@@ -1947,6 +1972,10 @@ function App() {
   );
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
   const [settingsPanel, setSettingsPanel] = useState<SettingsPanelId>('account');
+  const [digitalCard, setDigitalCard] = useState<DigitalCardState | null>(null);
+  const [digitalCardQrDataUrl, setDigitalCardQrDataUrl] = useState('');
+  const [digitalCardLinks, setDigitalCardLinks] = useState({ deepLink: '', webUrl: '', qrPayload: '' });
+  const [cardBusy, setCardBusy] = useState(false);
   const [businessHubTab, setBusinessHubTab] = useState<BusinessHubTab>('catalog');
   const [salesDashboard, setSalesDashboard] = useState<SalesDashboard | null>(null);
   const [salesDashboardPeriod, setSalesDashboardPeriod] = useState<'today' | '7d' | '30d'>('7d');
@@ -3618,6 +3647,109 @@ function App() {
     });
     setLinkQrDataUrl(qrDataUrl);
   }, [authRequired, currentDeviceId]);
+
+  const refreshDigitalCardQr = async (qrPayload: string) => {
+    if (!qrPayload) {
+      setDigitalCardQrDataUrl('');
+      return;
+    }
+    const qrDataUrl = await QRCode.toDataURL(qrPayload, {
+      width: 220,
+      margin: 1,
+      color: {
+        dark: '#0A0B30',
+        light: '#F8FAFC',
+      },
+    });
+    setDigitalCardQrDataUrl(qrDataUrl);
+  };
+
+  const loadMyDigitalCard = async () => {
+    if (!currentUserId) {
+      showToast('Link your phone first to manage your card.');
+      return;
+    }
+    setCardBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/cards/me?userId=${encodeURIComponent(currentUserId)}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.card) {
+        showToast(payload.error || 'Unable to load your card.');
+        return;
+      }
+      const nextCard: DigitalCardState = {
+        id: payload.card.id,
+        code: payload.card.code || '',
+        displayName: payload.card.displayName || profile.name || '',
+        title: payload.card.title || '',
+        businessName: payload.card.businessName || '',
+        phone: payload.card.phone || profile.phone || '',
+        handle: payload.card.handle || '',
+        email: payload.card.email || '',
+        bio: payload.card.bio || profile.about || '',
+        avatarUrl: payload.card.avatarUrl || profile.photoUrl || '',
+        theme: payload.card.theme || 'navy',
+      };
+      const links = {
+        deepLink: payload.deepLink || `zynkup://card/${nextCard.code}`,
+        webUrl: payload.webUrl || `${WEB_BASE_URL}/?card=${encodeURIComponent(nextCard.code)}`,
+        qrPayload: payload.qrPayload || payload.deepLink || `zynkup://card/${nextCard.code}`,
+      };
+      setDigitalCard(nextCard);
+      setDigitalCardLinks(links);
+      await refreshDigitalCardQr(links.qrPayload);
+    } catch {
+      showToast('Unable to load your card.');
+    } finally {
+      setCardBusy(false);
+    }
+  };
+
+  const saveMyDigitalCard = async () => {
+    if (!currentUserId || !digitalCard) return;
+    setCardBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/cards/me`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          ...digitalCard,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.card) {
+        showToast(payload.error || 'Could not save your card.');
+        return;
+      }
+      const nextCard: DigitalCardState = {
+        id: payload.card.id,
+        code: payload.card.code || '',
+        displayName: payload.card.displayName || '',
+        title: payload.card.title || '',
+        businessName: payload.card.businessName || '',
+        phone: payload.card.phone || '',
+        handle: payload.card.handle || '',
+        email: payload.card.email || '',
+        bio: payload.card.bio || '',
+        avatarUrl: payload.card.avatarUrl || '',
+        theme: payload.card.theme || 'navy',
+      };
+      const links = {
+        deepLink: payload.deepLink || `zynkup://card/${nextCard.code}`,
+        webUrl: payload.webUrl || `${WEB_BASE_URL}/?card=${encodeURIComponent(nextCard.code)}`,
+        qrPayload: payload.qrPayload || payload.deepLink || `zynkup://card/${nextCard.code}`,
+      };
+      setDigitalCard(nextCard);
+      setDigitalCardLinks(links);
+      await refreshDigitalCardQr(links.qrPayload);
+      showToast('Digital card saved');
+    } catch {
+      showToast('Could not save your card.');
+    } finally {
+      setCardBusy(false);
+    }
+  };
 
   const verifyDesktopPin = async () => {
     if (!linkRequestId || !linkToken || desktopPin.trim().length !== 4) {
@@ -14720,6 +14852,151 @@ function App() {
       );
     }
 
+    if (settingsPanel === 'myCard') {
+      const themeAccent =
+        digitalCard?.theme === 'magenta'
+          ? '#EC4899'
+          : digitalCard?.theme === 'lime'
+            ? '#A3E635'
+            : digitalCard?.theme === 'sunset'
+              ? '#FB923C'
+              : '#22D3EE';
+      const themeBg =
+        digitalCard?.theme === 'cyan'
+          ? '#083344'
+          : digitalCard?.theme === 'magenta'
+            ? '#3B0764'
+            : digitalCard?.theme === 'lime'
+              ? '#14532D'
+              : digitalCard?.theme === 'sunset'
+                ? '#7C2D12'
+                : '#0A0B30';
+      return (
+        <>
+          <h2>My card</h2>
+          <p>Share your digital business card. QR opens `zynkup://card/:code` or the public web link.</p>
+          {!digitalCard ? (
+            <button className="send-button" disabled={cardBusy} onClick={() => void loadMyDigitalCard()} type="button">
+              {cardBusy ? 'Loading…' : 'Load my card'}
+            </button>
+          ) : (
+            <>
+              <div className="digital-card-preview" style={{ background: themeBg, borderColor: themeAccent }}>
+                {digitalCard.avatarUrl ? (
+                  <img alt="" className="digital-card-avatar" src={digitalCard.avatarUrl} />
+                ) : null}
+                <strong>{digitalCard.displayName || 'Your name'}</strong>
+                {digitalCard.title ? <span>{digitalCard.title}</span> : null}
+                {digitalCard.businessName ? <span style={{ color: themeAccent }}>{digitalCard.businessName}</span> : null}
+                <small>{[digitalCard.handle, digitalCard.phone, digitalCard.email].filter(Boolean).join(' · ')}</small>
+                {digitalCard.bio ? <p>{digitalCard.bio}</p> : null}
+                <small style={{ color: themeAccent }}>zynkup.app/?card={digitalCard.code}</small>
+              </div>
+              <div className="desktop-link-qr-panel digital-card-qr">
+                {digitalCardQrDataUrl ? (
+                  <img alt="My ZynkUp card QR" src={digitalCardQrDataUrl} />
+                ) : (
+                  <div className="desktop-link-qr-placeholder">Preparing QR…</div>
+                )}
+              </div>
+              <label>
+                <span>Display name</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, displayName: event.target.value } : current)}
+                  value={digitalCard.displayName}
+                />
+              </label>
+              <label>
+                <span>Title</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, title: event.target.value } : current)}
+                  value={digitalCard.title}
+                />
+              </label>
+              <label>
+                <span>Business</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, businessName: event.target.value } : current)}
+                  value={digitalCard.businessName}
+                />
+              </label>
+              <label>
+                <span>Phone / WhatsApp</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, phone: event.target.value } : current)}
+                  value={digitalCard.phone}
+                />
+              </label>
+              <label>
+                <span>Handle</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, handle: event.target.value } : current)}
+                  value={digitalCard.handle}
+                />
+              </label>
+              <label>
+                <span>Email (optional)</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, email: event.target.value } : current)}
+                  value={digitalCard.email}
+                />
+              </label>
+              <label>
+                <span>Bio</span>
+                <textarea
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, bio: event.target.value } : current)}
+                  value={digitalCard.bio}
+                />
+              </label>
+              <label>
+                <span>Short code</span>
+                <input
+                  onChange={(event) => setDigitalCard((current) => current ? { ...current, code: event.target.value } : current)}
+                  value={digitalCard.code}
+                />
+              </label>
+              <label>
+                <span>Theme</span>
+                <select
+                  onChange={(event) =>
+                    setDigitalCard((current) =>
+                      current ? { ...current, theme: event.target.value as DigitalCardState['theme'] } : current)
+                  }
+                  value={digitalCard.theme}
+                >
+                  {CARD_THEME_OPTIONS.map((theme) => (
+                    <option key={theme.id} value={theme.id}>{theme.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="digital-card-actions">
+                <button className="send-button" disabled={cardBusy} onClick={() => void saveMyDigitalCard()} type="button">
+                  {cardBusy ? 'Saving…' : 'Save card'}
+                </button>
+                <button
+                  className="ghost-button"
+                  onClick={() => {
+                    const link = digitalCardLinks.webUrl || digitalCardLinks.deepLink;
+                    if (!link) return;
+                    void navigator.clipboard?.writeText(link).then(
+                      () => showToast('Card link copied'),
+                      () => showToast(link),
+                    );
+                  }}
+                  type="button"
+                >
+                  Copy link
+                </button>
+                <a className="ghost-button" href={digitalCardLinks.webUrl || '#'} rel="noreferrer" target="_blank">
+                  Open public card
+                </a>
+              </div>
+            </>
+          )}
+        </>
+      );
+    }
+
     const profileStill = stillAvatarUri({
       photoUrl: profile.photoUrl,
       profileVideoPosterUri: profile.profileVideoPosterUri,
@@ -14887,6 +15164,7 @@ function App() {
                 setSettingsPanel(section.id);
                 if (section.id === 'privacy') void loadCustomerPreferences();
                 if (section.id === 'blocked') void refreshBlockedContacts();
+                if (section.id === 'myCard') void loadMyDigitalCard();
                 if (section.id === 'business') {
                   void loadHomeSummary('business');
                   void loadCommerceOrders('seller');

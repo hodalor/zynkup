@@ -3,17 +3,25 @@ import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
 import LegalPage, { isLegalPath } from './LegalPage';
+import PublicCardPage, { getCardCodeFromLocation } from './PublicCardPage';
 import './firebase';
 import reportWebVitals from './reportWebVitals';
 
 const path = window.location.pathname.replace(/\/+$/, '') || '/';
+const cardCode = getCardCodeFromLocation(window.location.search, path);
 
 const root = ReactDOM.createRoot(
   document.getElementById('root') as HTMLElement
 );
 root.render(
   <React.StrictMode>
-    {isLegalPath(path) ? <LegalPage path={path} /> : <App />}
+    {isLegalPath(path) ? (
+      <LegalPage path={path} />
+    ) : cardCode ? (
+      <PublicCardPage code={cardCode} />
+    ) : (
+      <App />
+    )}
   </React.StrictMode>
 );
 
