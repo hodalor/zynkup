@@ -816,6 +816,27 @@ type SalesDashboard = {
   lowStock?: Array<{ id: string; title: string; stockQuantity: number; lowStockThreshold: number }>;
 };
 
+type HomeSummary = {
+  identity: 'personal' | 'business';
+  businessId?: string | null;
+  lastUpdatedAt?: string;
+  counts?: {
+    unreadChats?: number;
+    unreadMessages?: number;
+    unreadBusinessChats?: number;
+    unreadBusinessMessages?: number;
+    pendingChatRequests?: number;
+    upcomingEvents?: number;
+    liveStatusesFromOthers?: number;
+    openPaymentRequests?: number;
+    pendingBuyerOrders?: number;
+    pendingSellerOrders?: number;
+    lowStockCount?: number;
+    unpaidInvoices?: number;
+    catalogCount?: number;
+  };
+};
+
 type InventoryAlert = {
   id: string;
   catalogItemId?: string;
@@ -1929,6 +1950,16 @@ function App() {
   const [businessHubTab, setBusinessHubTab] = useState<BusinessHubTab>('catalog');
   const [salesDashboard, setSalesDashboard] = useState<SalesDashboard | null>(null);
   const [salesDashboardPeriod, setSalesDashboardPeriod] = useState<'today' | '7d' | '30d'>('7d');
+  const [homeSummary, setHomeSummary] = useState<HomeSummary | null>(null);
+  const [dismissedHomeCards, setDismissedHomeCards] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('zynkup-web-dismissed-home-cards');
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  });
   const [commerceOrders, setCommerceOrders] = useState<CommerceOrder[]>([]);
   const [buyerOrders, setBuyerOrders] = useState<CommerceOrder[]>([]);
   const [payPanel, setPayPanel] = useState<PayPanel>('home');
@@ -3661,6 +3692,13 @@ function App() {
   useEffect(() => {
     if (!authRequired && currentUserId) {
       void fetchLinkedDevices(currentUserId);
+      void loadHomeSummary('personal');
+      void loadPaymentRequests();
+      void loadCommerceOrders('buyer');
+      void loadCommerceOrders('seller');
+      void loadEventsList();
+      void loadCommerceDocuments('');
+      void loadInventoryAlerts();
     }
   }, [authRequired, currentUserId, fetchLinkedDevices]);
 
@@ -5051,6 +5089,34 @@ function App() {
     } catch {
       showToast('Could not load sales dashboard');
     }
+  };
+
+  const loadHomeSummary = async (identity: 'personal' | 'business' = 'personal') => {
+    if (!currentUserId) return;
+    try {
+      const query = new URLSearchParams({
+        userId: currentUserId,
+        identity,
+      });
+      const response = await fetch(`${API_BASE_URL}/api/home?${query.toString()}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) return;
+      setHomeSummary(payload as HomeSummary);
+    } catch {
+      // Local command-centre rows still work from cached lists.
+    }
+  };
+
+  const dismissHomeCard = (cardId: string) => {
+    setDismissedHomeCards((current) => {
+      const next = current.includes(cardId) ? current : [...current, cardId];
+      try {
+        localStorage.setItem('zynkup-web-dismissed-home-cards', JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
   };
 
   const loadCommerceOrders = async (role: 'seller' | 'buyer' | 'all' = 'seller') => {
@@ -11046,11 +11112,285 @@ function App() {
     }
   };
 
+  const buildCommandCentreCards = (mode: 'personal' | 'business') => {
+    const counts = homeSummary?.counts || {};
+    const unreadChats = visibleChatItems.filter((chat) => Number(chat.unread || 0) > 0);
+    const localUnread = unreadChats.reduce((sum, chat) => sum + Number(chat.unread || 0), 0);
+    const unreadMessages = mode === 'business'
+      ? (Number(counts.unreadBusinessMessages) || localUnread)
+      : (Number(counts.unreadMessages) || localUnread);
+    const unreadChatCount = mode === 'business'
+      ? (Number(counts.unreadBusinessChats) || unreadChats.length)
+      : (Number(counts.unreadChats) || unreadChats.length);
+    const openPayRequests = paymentRequests.filter((request) => ['open', 'partial'].includes(String(request.status || '')));
+    const upcomingEvents = (eventsList || []).filter((event) => {
+      if (!(event.status === 'scheduled' || event.status === 'live')) return false;
+      const starts = event.startsAt ? new Date(event.startsAt).getTime() : 0;
+      return !Number.isFinite(starts) || starts >= Date.now() - 60 * 60 * 1000;
+    });
+    const upcomingEventCount = Number(counts.upcomingEvents) || upcomingEvents.length;
+    const unseenStatuses = updatesFeed.flatMap((entry) => {
+      if (!entry || entry.userId === currentUserId) return [];
+      return (entry.items || []).filter((item) => !(item.views || []).some((view) => view.userId === currentUserId));
+    });
+    const statusCount = unseenStatuses.length || Number(counts.liveStatusesFromOthers) || 0;
+    const pendingBuyer = buyerOrders.filter((order) =>
+      ['pending_payment', 'paid', 'processing', 'dispatched'].includes(order.state),
+    );
+    const pendingSeller = commerceOrders.filter((order) =>
+      order.sellerUserId === currentUserId
+      && ['pending_payment', 'paid', 'processing', 'dispatched'].includes(order.state),
+    );
+    const pendingSellerCount = Number(counts.pendingSellerOrders)
+      || Number(salesDashboard?.metrics?.pendingOrders)
+      || pendingSeller.length;
+    const openInventory = inventoryAlerts.filter((alert) => !alert.reviewedAt);
+    const lowStockCount = Number(counts.lowStockCount)
+      || Number(salesDashboard?.metrics?.lowStockCount)
+      || openInventory.length;
+    const unpaidInvoices = commerceDocuments.filter((doc) =>
+      doc.kind === 'invoice' && ['sent', 'accepted', 'overdue'].includes(doc.state),
+    );
+    const unpaidInvoiceCount = Number(counts.unpaidInvoices) || unpaidInvoices.length;
+    const cards: Array<{
+      id: string;
+      title: string;
+      body: string;
+      dismissible?: boolean;
+      onClick: () => void;
+    }> = [];
+
+    if (mode === 'personal') {
+      if (unreadMessages > 0 || unreadChatCount > 0) {
+        cards.push({
+          id: 'personal-unread',
+          title: unreadChatCount === 1
+            ? (unreadMessages === 1 ? '1 unread chat' : `${unreadMessages} unread messages`)
+            : `${unreadChatCount || unreadMessages} unread chats`,
+          body: unreadChats[0]?.name ? `Latest in ${unreadChats[0].name}` : 'Open a chat to catch up',
+          onClick: () => {
+            setActiveView('chats');
+            if (unreadChats[0]?.id) setSelectedChatId(unreadChats[0].id);
+          },
+        });
+      }
+      if (upcomingEventCount > 0) {
+        cards.push({
+          id: 'personal-events',
+          title: upcomingEventCount === 1 ? '1 upcoming event' : `${upcomingEventCount} upcoming events`,
+          body: upcomingEvents[0]?.title || 'See what is next',
+          dismissible: true,
+          onClick: () => setActiveView('events'),
+        });
+      }
+      if (statusCount > 0) {
+        cards.push({
+          id: 'personal-statuses',
+          title: statusCount === 1 ? '1 status to view' : `${statusCount} statuses to view`,
+          body: 'Catch up on updates',
+          dismissible: true,
+          onClick: () => setActiveView('updates'),
+        });
+      }
+      if (openPayRequests.length || Number(counts.openPaymentRequests) > 0) {
+        const count = openPayRequests.length || Number(counts.openPaymentRequests) || 0;
+        cards.push({
+          id: 'personal-pay-requests',
+          title: count === 1 ? '1 payment request open' : `${count} payment requests open`,
+          body: 'Open Pay to settle or follow up',
+          onClick: () => {
+            setActiveView('pay');
+            setPayPanel('history');
+          },
+        });
+      }
+      if (pendingBuyer.length || Number(counts.pendingBuyerOrders) > 0) {
+        const count = pendingBuyer.length || Number(counts.pendingBuyerOrders) || 0;
+        cards.push({
+          id: 'personal-buyer-orders',
+          title: count === 1 ? '1 order in progress' : `${count} orders in progress`,
+          body: 'Track delivery in Pay',
+          dismissible: true,
+          onClick: () => {
+            setActiveView('pay');
+            setPayPanel('orders');
+            void loadCommerceOrders('buyer');
+          },
+        });
+      }
+      if (!cards.length) {
+        cards.push({
+          id: 'personal-quiet',
+          title: 'You are caught up',
+          body: 'Start a chat or browse updates',
+          dismissible: true,
+          onClick: () => setNewChatVisible(true),
+        });
+      }
+    } else {
+      if (pendingSellerCount > 0) {
+        cards.push({
+          id: 'business-pending-orders',
+          title: pendingSellerCount === 1 ? '1 pending order' : `${pendingSellerCount} pending orders`,
+          body: 'Confirm payment, pack, or dispatch',
+          onClick: () => {
+            setSettingsPanel('business');
+            setBusinessHubTab('orders');
+            setActiveView('settings');
+            void loadCommerceOrders('seller');
+          },
+        });
+      }
+      if (lowStockCount > 0) {
+        cards.push({
+          id: 'business-low-stock',
+          title: lowStockCount === 1 ? '1 product is low on stock' : `${lowStockCount} products are low on stock`,
+          body: openInventory[0]?.title || 'Open inventory alerts',
+          onClick: () => {
+            setSettingsPanel('business');
+            setBusinessHubTab('inventory');
+            setActiveView('settings');
+            void loadInventoryAlerts();
+          },
+        });
+      }
+      if (unpaidInvoiceCount > 0) {
+        cards.push({
+          id: 'business-unpaid-invoices',
+          title: unpaidInvoiceCount === 1 ? '1 unpaid invoice' : `${unpaidInvoiceCount} unpaid invoices`,
+          body: unpaidInvoices[0]?.customerName
+            ? `Follow up with ${unpaidInvoices[0].customerName}`
+            : 'Open documents to chase payment',
+          onClick: () => {
+            setSettingsPanel('business');
+            setBusinessHubTab('documents');
+            setActiveView('settings');
+            void loadCommerceDocuments('invoice');
+          },
+        });
+      }
+      if (openPayRequests.length || Number(counts.openPaymentRequests) > 0) {
+        const count = openPayRequests.length || Number(counts.openPaymentRequests) || 0;
+        cards.push({
+          id: 'business-pay-requests',
+          title: count === 1 ? '1 payment request open' : `${count} payment requests open`,
+          body: 'Check Pay history for unpaid shares',
+          dismissible: true,
+          onClick: () => {
+            setActiveView('pay');
+            setPayPanel('history');
+          },
+        });
+      }
+      if (unreadMessages > 0 || unreadChatCount > 0) {
+        cards.push({
+          id: 'business-unread',
+          title: unreadChatCount === 1
+            ? '1 unread business chat'
+            : `${unreadChatCount || unreadMessages} unread business chats`,
+          body: unreadChats[0]?.name ? `Latest in ${unreadChats[0].name}` : 'Customer messages waiting',
+          onClick: () => {
+            setActiveView('chats');
+            if (unreadChats[0]?.id) setSelectedChatId(unreadChats[0].id);
+          },
+        });
+      }
+      if (!cards.length) {
+        cards.push({
+          id: 'business-quiet',
+          title: 'Shop looks clear',
+          body: 'Catalogue and orders are ready when you need them',
+          dismissible: true,
+          onClick: () => {
+            setSettingsPanel('business');
+            setBusinessHubTab('catalog');
+            setActiveView('settings');
+          },
+        });
+      }
+    }
+
+    return cards
+      .filter((card) => !card.dismissible || !dismissedHomeCards.includes(card.id))
+      .slice(0, 3);
+  };
+
+  const renderCommandCentre = (mode: 'personal' | 'business') => {
+    const cards = buildCommandCentreCards(mode);
+    const quickActions = mode === 'business'
+      ? [
+          {
+            id: 'catalog',
+            label: 'Catalogue',
+            onClick: () => {
+              setSettingsPanel('business');
+              setBusinessHubTab('catalog');
+              setActiveView('settings');
+            },
+          },
+          {
+            id: 'orders',
+            label: 'Orders',
+            onClick: () => {
+              setSettingsPanel('business');
+              setBusinessHubTab('orders');
+              setActiveView('settings');
+              void loadCommerceOrders('seller');
+            },
+          },
+        ]
+      : [
+          { id: 'new-chat', label: 'New chat', onClick: () => setNewChatVisible(true) },
+          {
+            id: 'link-device',
+            label: 'Link phone',
+            onClick: () => void fetchLinkedDevices(currentUserId),
+          },
+        ];
+
+    return (
+      <div className="command-centre">
+        <div className="command-centre-label">{mode === 'business' ? 'Needs attention' : 'For you'}</div>
+        <div className="command-centre-quick">
+          {quickActions.map((action) => (
+            <button key={action.id} className="command-centre-chip" onClick={action.onClick} type="button">
+              {action.label}
+            </button>
+          ))}
+        </div>
+        {cards.map((card) => (
+          <div className="command-centre-row" key={card.id}>
+            <button className="command-centre-row-main" onClick={card.onClick} type="button">
+              <strong>{card.title}</strong>
+              <span>{card.body}</span>
+            </button>
+            {card.dismissible ? (
+              <button
+                className="command-centre-hide"
+                onClick={() => dismissHomeCard(card.id)}
+                type="button"
+              >
+                Hide
+              </button>
+            ) : (
+              <span className="command-centre-chevron">›</span>
+            )}
+          </div>
+        ))}
+        {homeSummary?.lastUpdatedAt ? (
+          <div className="command-centre-meta">
+            Updated {new Date(homeSummary.lastUpdatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
   const renderChatsView = () => (
     <>
       <section className="chat-sidebar">
         <header className="chat-sidebar-header">
-          <h1>Chats</h1>
+          <h1>ZynkUp</h1>
           <div className="sidebar-header-actions">
             <button className="compose-square" onClick={() => void fetchLinkedDevices(currentUserId)} type="button">🖥</button>
             <button className="compose-square" onClick={() => setNewChatVisible(true)} type="button">✎</button>
@@ -11065,6 +11405,8 @@ function App() {
             value={chatSearchQuery}
           />
         </div>
+
+        {renderCommandCentre('personal')}
 
         {archivedChatIds.length ? (
           <button className="archive-toggle" onClick={() => setShowArchivedChats((current) => !current)} type="button">
@@ -12512,6 +12854,7 @@ function App() {
       ).filter(Boolean);
       return (
         <>
+          {renderCommandCentre('business')}
           <button className="settings-list-row" onClick={() => setActiveView('catalog')} type="button">
             Open public catalog
           </button>
@@ -14544,6 +14887,13 @@ function App() {
                 setSettingsPanel(section.id);
                 if (section.id === 'privacy') void loadCustomerPreferences();
                 if (section.id === 'blocked') void refreshBlockedContacts();
+                if (section.id === 'business') {
+                  void loadHomeSummary('business');
+                  void loadCommerceOrders('seller');
+                  void loadInventoryAlerts();
+                  void loadCommerceDocuments('invoice');
+                  void loadPaymentRequests();
+                }
               }}
               type="button"
             >
