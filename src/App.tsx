@@ -17,6 +17,7 @@ type OutboxMessageBody = {
   replyPreview?: string;
   anonymous?: boolean;
   durationSeconds?: number;
+  viewOnce?: boolean;
 };
 
 type OutboxEntry = {
@@ -84,6 +85,10 @@ type Message = {
   transcriptUpdatedAt?: string;
   transcriptNotice?: string;
   reactions?: MessageReaction[];
+  viewOnce?: boolean;
+  viewOnceOpenedAt?: string;
+  viewOnceOpenedBy?: string;
+  protectedMedia?: boolean;
 };
 
 type TranslateLanguage = 'en' | 'tw' | 'ga' | 'ee' | 'pcm';
@@ -1050,7 +1055,7 @@ const TRANSLATE_LANGUAGES: Array<{ id: TranslateLanguage; label: string }> = [
   { id: 'tw', label: 'Twi' },
   { id: 'ga', label: 'Ga' },
   { id: 'ee', label: 'Ewe' },
-  { id: 'pcm', label: 'Pidgin' },
+  { id: 'pcm', label: 'Pidgin (pcm)' },
 ];
 const DEVICE_STORAGE_KEY = 'zynkup-web-device-id';
 const SETTINGS_STORAGE_KEY = 'zynkup-web-app-settings';
@@ -1173,6 +1178,7 @@ const DEFAULT_APP_SETTINGS = {
   /** Reaction sound cues — off by default; never autoplay on history load. */
   reactionSoundEnabled: false,
   reactionAnimationEnabled: true,
+  preferredLanguage: 'en' as TranslateLanguage,
 };
 
 const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; subtitle: string }> = [
@@ -1482,6 +1488,10 @@ const mapServerMessage = (message: any, userId: string): Message => ({
   transcriptLanguage: typeof message.transcriptLanguage === 'string' ? message.transcriptLanguage : undefined,
   transcriptUpdatedAt: typeof message.transcriptUpdatedAt === 'string' ? message.transcriptUpdatedAt : undefined,
   reactions: mapMessageReactions(message.reactions),
+  viewOnce: Boolean(message.viewOnce),
+  viewOnceOpenedAt: typeof message.viewOnceOpenedAt === 'string' ? message.viewOnceOpenedAt : undefined,
+  viewOnceOpenedBy: typeof message.viewOnceOpenedBy === 'string' ? message.viewOnceOpenedBy : undefined,
+  protectedMedia: Boolean(message.protectedMedia || message.viewOnce),
 });
 
 const describeCallMessage = (message: Message) => {
@@ -1778,7 +1788,13 @@ function App() {
   const [callAudioOnly, setCallAudioOnly] = useState(false);
   const [peerScreenSharing, setPeerScreenSharing] = useState(false);
   const [localScreenSharing, setLocalScreenSharing] = useState(false);
-  const [mediaViewer, setMediaViewer] = useState<string | null>(null);
+  const [mediaViewer, setMediaViewer] = useState<{
+    url: string;
+    protectedMedia?: boolean;
+    viewOnce?: boolean;
+    label?: string;
+  } | null>(null);
+  const [composeViewOnce, setComposeViewOnce] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [currentUserId, setCurrentUserId] = useState('');
@@ -2814,6 +2830,11 @@ function App() {
           appLockEnabled: nextSettings.appLockEnabled,
           reactionSoundEnabled: nextSettings.reactionSoundEnabled,
           reactionAnimationEnabled: nextSettings.reactionAnimationEnabled,
+          preferredLanguage: (['en', 'tw', 'ga', 'ee', 'pcm'] as TranslateLanguage[]).includes(
+            nextSettings.preferredLanguage,
+          )
+            ? nextSettings.preferredLanguage
+            : 'en',
         }),
       });
       if (!response.ok) {
@@ -3206,9 +3227,15 @@ function App() {
             payload.profile.reactionAnimationEnabled == null
               ? current.reactionAnimationEnabled
               : Boolean(payload.profile.reactionAnimationEnabled),
+          preferredLanguage: (['en', 'tw', 'ga', 'ee', 'pcm'] as TranslateLanguage[]).includes(
+            payload.profile.preferredLanguage,
+          )
+            ? payload.profile.preferredLanguage
+            : current.preferredLanguage || 'en',
         };
         appSettingsRef.current = next;
         localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(next));
+        setTranslateTargetLanguage(next.preferredLanguage || 'en');
         return next;
       });
     }
@@ -5310,7 +5337,10 @@ function App() {
     }
   };
 
-  const requestTranslate = async (message: Message, targetLanguage: TranslateLanguage = translateTargetLanguage) => {
+  const requestTranslate = async (
+    message: Message,
+    targetLanguage: TranslateLanguage = (appSettings.preferredLanguage || translateTargetLanguage),
+  ) => {
     const text = (message.text || '').trim();
     if (!currentUserId || !activeChat || !text || message.deletedForEveryone) return;
     if (translatingMessageId === message.id) return;
@@ -6224,7 +6254,12 @@ function App() {
     const objectUrl = URL.createObjectURL(file);
     const clientRef = `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const sendAnonymous = Boolean(anonymousCompose && canComposeAnonymous);
-    const kind = file.type.startsWith('image/') ? 'image' as const : 'file' as const;
+    const kind = file.type.startsWith('image/')
+      ? 'image' as const
+      : file.type.startsWith('video/')
+        ? 'video' as const
+        : 'file' as const;
+    const viewOnce = Boolean(composeViewOnce) && (kind === 'image' || kind === 'video');
     const message: Message = {
       id: `local-${clientRef}`,
       clientRef,
@@ -6234,8 +6269,11 @@ function App() {
       text: file.name,
       time: WAITING_FOR_CONNECTION,
       imageUrl: kind === 'image' ? objectUrl : undefined,
+      videoUrl: kind === 'video' ? objectUrl : undefined,
       receiptState: 'pending',
       anonymous: sendAnonymous,
+      viewOnce,
+      protectedMedia: viewOnce,
     };
 
     setMessagesByChat((current) => ({
@@ -6243,6 +6281,7 @@ function App() {
       [activeChat.id]: [...(current[activeChat.id] ?? []), message],
     }));
     event.target.value = '';
+    setComposeViewOnce(false);
     const uploadedUrls = await uploadFiles([file]).catch(() => []);
     const chatId = activeChat.id;
     queueOutgoing({
@@ -6253,6 +6292,70 @@ function App() {
       text: file.name,
       mediaUrls: uploadedUrls.length ? uploadedUrls : [objectUrl],
       anonymous: sendAnonymous,
+      ...(viewOnce ? { viewOnce: true } : {}),
+    });
+  };
+
+  const openProtectedMedia = async (message: Message) => {
+    if (message.viewOnce && message.sender !== 'me') {
+      if (message.viewOnceOpenedAt || !message.imageUrl) {
+        showToast('View-once media was already opened.');
+        return;
+      }
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/api/messages/${encodeURIComponent(message.id)}/view-once`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: currentUserId }),
+          },
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          showToast(payload.error || 'Could not open view-once media.');
+          return;
+        }
+        const mediaUrl = payload.message?.mediaUrls?.[0] || message.imageUrl;
+        if (mediaUrl) {
+          setMediaViewer({
+            url: mediaUrl,
+            viewOnce: true,
+            protectedMedia: true,
+            label: message.text,
+          });
+        }
+        setMessagesByChat((current) => {
+          const chatId = activeChat?.id;
+          if (!chatId) return current;
+          return {
+            ...current,
+            [chatId]: (current[chatId] ?? []).map((item) => (
+              item.id === message.id
+                ? {
+                    ...item,
+                    viewOnceOpenedAt: payload.message?.viewOnceOpenedAt || new Date().toISOString(),
+                    viewOnceOpenedBy: currentUserId,
+                    imageUrl: undefined,
+                    videoUrl: undefined,
+                  }
+                : item
+            )),
+          };
+        });
+      } catch {
+        showToast('Could not open view-once media.');
+      }
+      return;
+    }
+
+    const url = message.imageUrl || message.videoUrl;
+    if (!url) return;
+    setMediaViewer({
+      url,
+      viewOnce: Boolean(message.viewOnce),
+      protectedMedia: Boolean(message.protectedMedia || message.viewOnce),
+      label: message.text,
     });
   };
 
@@ -10983,10 +11086,28 @@ function App() {
                 </span>
               ) : null}
               {message.replyPreview ? <div className="reply-quote">{message.replyPreview}</div> : null}
-              {message.kind === 'image' && message.imageUrl ? (
-                <button className="message-image-button" onClick={() => setMediaViewer(message.imageUrl ?? null)} type="button">
-                  <img alt={message.text} className="message-image" src={message.imageUrl} />
-                </button>
+              {message.kind === 'image' ? (
+                message.viewOnce && message.sender !== 'me' && !message.viewOnceOpenedAt && message.imageUrl ? (
+                  <button className="message-image-button view-once-button" onClick={() => void openProtectedMedia(message)} type="button">
+                    <span className="view-once-chip">👁 View once</span>
+                    <span className="protected-media-badge">⚠ Protected</span>
+                  </button>
+                ) : message.viewOnce && (message.viewOnceOpenedAt || (!message.imageUrl && message.sender !== 'me')) ? (
+                  <div className="view-once-consumed">
+                    <span>Opened · Photo</span>
+                    <span className="protected-media-badge">⚠ Protected</span>
+                  </div>
+                ) : message.imageUrl ? (
+                  <button className="message-image-button" onClick={() => void openProtectedMedia(message)} type="button">
+                    <img alt={message.text} className="message-image" src={message.imageUrl} />
+                    {message.viewOnce || message.protectedMedia ? (
+                      <span className="protected-media-badge">
+                        {message.viewOnce ? (message.viewOnceOpenedAt ? 'View once · opened' : 'View once') : ''}
+                        {message.protectedMedia ? ' ⚠ Protected' : ''}
+                      </span>
+                    ) : null}
+                  </button>
+                ) : null
               ) : null}
 
               {message.kind === 'voice' ? (
@@ -11291,6 +11412,14 @@ function App() {
             ref={attachmentInputRef}
             type="file"
           />
+          <label className="view-once-compose">
+            <input
+              checked={composeViewOnce}
+              onChange={(event) => setComposeViewOnce(event.target.checked)}
+              type="checkbox"
+            />
+            View once (photos/videos)
+          </label>
         </footer>
         {!speechRecognitionSupported ? (
           <p className="dictation-notice muted">Dictation unavailable in this browser</p>
@@ -13239,6 +13368,25 @@ function App() {
             (value) => updateAppSetting('reactionSoundEnabled', value, { syncProfile: true }),
             'Short cues when reacting or receiving a sound reaction — off by default',
           )}
+          <label className="settings-select-row">
+            <span>Preferred language</span>
+            <select
+              aria-label="Preferred translation language"
+              onChange={(event) => {
+                const nextLanguage = event.target.value as TranslateLanguage;
+                updateAppSetting('preferredLanguage', nextLanguage, { syncProfile: true });
+                setTranslateTargetLanguage(nextLanguage);
+              }}
+              value={appSettings.preferredLanguage || 'en'}
+            >
+              {TRANSLATE_LANGUAGES.map((language) => (
+                <option key={language.id} value={language.id}>
+                  {language.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="muted">Used for Translate. Pidgin (pcm) included. OpenAI powers full MT.</p>
           {activeChat ? (
             <button
               className="settings-list-row"
@@ -14543,7 +14691,13 @@ function App() {
       {mediaViewer ? (
         <div className="modal-overlay" onClick={() => setMediaViewer(null)}>
           <div className="viewer-card" onClick={(event) => event.stopPropagation()}>
-            <img alt="Selected media" src={mediaViewer} />
+            {mediaViewer.protectedMedia || mediaViewer.viewOnce ? (
+              <p className="protected-media-badge">⚠ Protected · screenshots discouraged</p>
+            ) : null}
+            <img alt={mediaViewer.label || 'Selected media'} src={mediaViewer.url} />
+            {mediaViewer.viewOnce ? (
+              <p className="muted">View once — closes when you leave</p>
+            ) : null}
           </div>
         </div>
       ) : null}
