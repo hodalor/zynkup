@@ -66,11 +66,30 @@ type SettingsPanelId =
   | 'history'
   | 'account'
   | 'privacy'
+  | 'blocked'
   | 'chats'
   | 'notifications'
   | 'storage'
   | 'help'
   | '';
+
+type ReportReasonId = 'spam' | 'harassment' | 'scam' | 'inappropriate' | 'impersonation' | 'other';
+
+type ReportTargetState = {
+  targetUserId?: string;
+  targetPhone?: string;
+  messageId?: string;
+  chatId?: string;
+  name?: string;
+};
+
+type BlockedContact = {
+  id: string;
+  name: string;
+  phone?: string;
+  username?: string;
+  photoUri?: string;
+};
 
 type ReactionKind = 'standard' | 'animated' | 'sound';
 
@@ -1015,6 +1034,7 @@ type ProfileState = {
   profileVideoUri: string;
   profileVideoPosterUri: string;
   profileVideoDurationSeconds: number;
+  blockedUserIds: string[];
 };
 
 type AppUser = {
@@ -1228,10 +1248,20 @@ const SETTINGS_MENU: Array<{ id: Exclude<SettingsPanelId, ''>; title: string; su
   { id: 'history', title: 'Chat history', subtitle: 'Export or clear conversations' },
   { id: 'account', title: 'Account', subtitle: 'Profile and security' },
   { id: 'privacy', title: 'Privacy', subtitle: 'Last seen, read receipts, marketing' },
+  { id: 'blocked', title: 'Blocked contacts', subtitle: 'People you blocked' },
   { id: 'chats', title: 'Chats', subtitle: 'Enter is send and media' },
   { id: 'notifications', title: 'Notifications', subtitle: 'Message alerts and previews' },
   { id: 'storage', title: 'Storage and data', subtitle: 'Network usage and cache' },
   { id: 'help', title: 'Help and feedback', subtitle: 'FAQ and support' },
+];
+
+const REPORT_REASON_OPTIONS: Array<{ id: ReportReasonId; label: string }> = [
+  { id: 'spam', label: 'Spam' },
+  { id: 'harassment', label: 'Harassment or bullying' },
+  { id: 'scam', label: 'Scam or fraud' },
+  { id: 'inappropriate', label: 'Inappropriate content' },
+  { id: 'impersonation', label: 'Impersonation' },
+  { id: 'other', label: 'Something else' },
 ];
 
 const initialChats: Chat[] = [];
@@ -1884,7 +1914,13 @@ function App() {
     profileVideoUri: '',
     profileVideoPosterUri: '',
     profileVideoDurationSeconds: 0,
+    blockedUserIds: [],
   });
+  const [blockedContacts, setBlockedContacts] = useState<BlockedContact[]>([]);
+  const [reportTarget, setReportTarget] = useState<ReportTargetState | null>(null);
+  const [reportReason, setReportReason] = useState<ReportReasonId | ''>('');
+  const [reportDetails, setReportDetails] = useState('');
+  const [reportBusy, setReportBusy] = useState(false);
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
   );
@@ -2985,6 +3021,148 @@ function App() {
     showToast(exists ? 'Chat unarchived' : 'Chat archived');
   };
 
+  const refreshBlockedContacts = async (idsOverride?: string[]) => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/users/blocked?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && Array.isArray(payload.blocked)) {
+        setBlockedContacts(payload.blocked as BlockedContact[]);
+        if (Array.isArray(payload.blockedUserIds)) {
+          setProfile((current) => ({ ...current, blockedUserIds: payload.blockedUserIds }));
+        }
+        return;
+      }
+    } catch {
+      // Fall back to local profile ids.
+    }
+    const ids = idsOverride || profile.blockedUserIds || [];
+    setBlockedContacts(
+      ids.map((id) => {
+        const user = users.find((item) => item.id === id);
+        return {
+          id,
+          name: user?.name || 'Blocked user',
+          phone: user?.phone || '',
+        };
+      }),
+    );
+  };
+
+  const blockUser = async (targetUserId?: string, targetPhone?: string) => {
+    if (!currentUserId || (!targetUserId && !targetPhone) || targetUserId === currentUserId) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/users/block`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          ...(targetUserId ? { targetUserId } : {}),
+          ...(targetPhone ? { targetPhone } : {}),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not block this person.');
+        return;
+      }
+      const nextIds = Array.isArray(payload.blockedUserIds) ? payload.blockedUserIds : [];
+      setProfile((current) => ({ ...current, blockedUserIds: nextIds }));
+      void refreshBlockedContacts(nextIds);
+      showToast('Blocked. They can no longer message or call you.');
+    } catch {
+      showToast('Could not block this person.');
+    }
+  };
+
+  const unblockUser = async (targetUserId?: string, targetPhone?: string) => {
+    if (!currentUserId || (!targetUserId && !targetPhone)) return;
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/users/unblock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          ...(targetUserId ? { targetUserId } : {}),
+          ...(targetPhone ? { targetPhone } : {}),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not unblock this person.');
+        return;
+      }
+      const nextIds = Array.isArray(payload.blockedUserIds) ? payload.blockedUserIds : [];
+      setProfile((current) => ({ ...current, blockedUserIds: nextIds }));
+      void refreshBlockedContacts(nextIds);
+      showToast('Unblocked.');
+    } catch {
+      showToast('Could not unblock this person.');
+    }
+  };
+
+  const confirmBlockPeer = (targetUserId?: string, targetPhone?: string, name?: string) => {
+    if (!targetUserId && !targetPhone) return;
+    const alreadyBlocked = targetUserId ? profile.blockedUserIds.includes(targetUserId) : false;
+    const ok = window.confirm(
+      alreadyBlocked
+        ? 'Unblock this person? They will be able to message and call you again.'
+        : `Block ${name || 'this person'}? They will not be able to message or call you.`,
+    );
+    if (!ok) return;
+    if (alreadyBlocked) {
+      void unblockUser(targetUserId, targetPhone);
+      return;
+    }
+    void blockUser(targetUserId, targetPhone);
+  };
+
+  const openReportSheet = (target: ReportTargetState) => {
+    if (!target.targetUserId && !target.targetPhone && !target.messageId) return;
+    setReportReason('');
+    setReportDetails('');
+    setReportTarget(target);
+  };
+
+  const submitUserReport = async () => {
+    if (!reportTarget || !currentUserId) return;
+    if (!reportReason) {
+      showToast('Pick a reason for this report.');
+      return;
+    }
+    setReportBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/users/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          targetUserId: reportTarget.targetUserId || undefined,
+          targetPhone: reportTarget.targetPhone || undefined,
+          messageId: reportTarget.messageId || undefined,
+          chatId: reportTarget.chatId || undefined,
+          reason: reportReason,
+          details: reportDetails.trim() || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not send report.');
+        return;
+      }
+      setReportTarget(null);
+      setReportReason('');
+      setReportDetails('');
+      showToast(payload.message || 'Report sent. Thanks for helping keep ZynkUp safe.');
+    } catch {
+      showToast('Could not send report.');
+    } finally {
+      setReportBusy(false);
+    }
+  };
+
   const clearChatUnread = (chatId: string) => {
     if (!chatId || !currentUserId) {
       return;
@@ -3250,6 +3428,7 @@ function App() {
       profileVideoUri: payload.profile?.profileVideoUri || '',
       profileVideoPosterUri: payload.profile?.profileVideoPosterUri || '',
       profileVideoDurationSeconds: payload.profile?.profileVideoDurationSeconds ?? 0,
+      blockedUserIds: Array.isArray(payload.profile?.blockedUserIds) ? payload.profile.blockedUserIds : [],
     });
     if (payload.profile) {
       setAppSettings((current) => {
@@ -11018,8 +11197,13 @@ function App() {
                 const muteReactionLabel = reactionSoundMutedChatIds.includes(activeChat.id)
                   ? 'Unmute reaction sounds'
                   : 'Mute reaction sounds';
+                const peerId = activeChat.peerUserId;
+                const canSafety = Boolean(peerId && activeChat.kind !== 'group');
+                const alreadyBlocked = peerId ? profile.blockedUserIds.includes(peerId) : false;
                 const action = window.prompt(
-                  `1 Mute  2 Archive  3 Pin  4 Play a game  5 ${muteReactionLabel}`,
+                  canSafety
+                    ? `1 Mute  2 Archive  3 Pin  4 Play a game  5 ${muteReactionLabel}  6 Report  7 ${alreadyBlocked ? 'Unblock' : 'Block'}`
+                    : `1 Mute  2 Archive  3 Pin  4 Play a game  5 ${muteReactionLabel}`,
                   '1',
                 );
                 if (action === '1') {
@@ -11032,6 +11216,15 @@ function App() {
                   openPlayGameFromChat();
                 } else if (action === '5') {
                   void toggleReactionSoundMuteForChat(activeChat.id);
+                } else if (action === '6' && canSafety && peerId) {
+                  openReportSheet({
+                    targetUserId: peerId,
+                    chatId: activeChat.id,
+                    name: activeChat.name,
+                  });
+                } else if (action === '7' && canSafety && peerId) {
+                  const peer = users.find((user) => user.id === peerId);
+                  confirmBlockPeer(peerId, peer?.phone, activeChat.name);
                 }
               }}
               type="button"
@@ -13936,6 +14129,45 @@ function App() {
         </>
       );
     }
+    if (settingsPanel === 'blocked') {
+      const rows = blockedContacts.length
+        ? blockedContacts
+        : profile.blockedUserIds.map((id) => {
+          const user = users.find((item) => item.id === id);
+          return { id, name: user?.name || 'Blocked user', phone: user?.phone || '' };
+        });
+      return (
+        <>
+          <p>
+            Blocked people cannot message or call you. Click a contact to unblock.
+          </p>
+          <button
+            className="settings-list-row"
+            onClick={() => void refreshBlockedContacts()}
+            type="button"
+          >
+            Refresh blocked list
+          </button>
+          {rows.length ? rows.map((row) => (
+            <button
+              className="settings-list-row"
+              key={row.id}
+              onClick={() => {
+                if (window.confirm(`Unblock ${row.name}?`)) {
+                  void unblockUser(row.id, row.phone);
+                }
+              }}
+              type="button"
+            >
+              <strong>{row.name}</strong>
+              <span>{row.phone || 'Tap to unblock'}</span>
+            </button>
+          )) : (
+            <p>Nobody is blocked. Use chat ⋮ or a message menu to block someone.</p>
+          )}
+        </>
+      );
+    }
     if (settingsPanel === 'privacy') {
       return (
         <>
@@ -13970,6 +14202,17 @@ function App() {
             (value) => updateAppSetting('readReceiptsEnabled', value, { syncProfile: true }),
             'If off, you won’t send or see read ticks',
           )}
+          <button
+            className="settings-list-row"
+            onClick={() => {
+              void refreshBlockedContacts();
+              setSettingsPanel('blocked');
+            }}
+            type="button"
+          >
+            Blocked contacts
+            <span>{profile.blockedUserIds.length ? `${profile.blockedUserIds.length} blocked` : 'Nobody blocked'}</span>
+          </button>
           <div className="business-panel">
             <h3>Marketing preferences</h3>
             <p>Businesses that keep a CRM record for you can send marketing only if you opt in.</p>
@@ -14300,6 +14543,7 @@ function App() {
               onClick={() => {
                 setSettingsPanel(section.id);
                 if (section.id === 'privacy') void loadCustomerPreferences();
+                if (section.id === 'blocked') void refreshBlockedContacts();
               }}
               type="button"
             >
@@ -15172,6 +15416,40 @@ function App() {
               Copy
             </button>
             <button onClick={() => void forwardMessage(messageActionTarget)} type="button">Forward</button>
+            {messageActionTarget.sender !== 'me' && !messageActionTarget.deletedForEveryone ? (
+              <button
+                onClick={() => {
+                  const rawSender = messageActionTarget.senderId;
+                  const peerId = rawSender && rawSender !== 'anonymous'
+                    ? rawSender
+                    : activeChat?.peerUserId;
+                  openReportSheet({
+                    targetUserId: peerId,
+                    messageId: messageActionTarget.id,
+                    chatId: activeChat?.id,
+                    name: activeChat?.name || 'this person',
+                  });
+                  setMessageActionTarget(null);
+                }}
+                type="button"
+              >
+                Report
+              </button>
+            ) : null}
+            {messageActionTarget.sender !== 'me' && activeChat?.peerUserId && activeChat.kind !== 'group' ? (
+              <button
+                className="danger"
+                onClick={() => {
+                  const peerId = activeChat.peerUserId;
+                  const peer = users.find((user) => user.id === peerId);
+                  setMessageActionTarget(null);
+                  confirmBlockPeer(peerId, peer?.phone, activeChat.name);
+                }}
+                type="button"
+              >
+                {profile.blockedUserIds.includes(activeChat.peerUserId) ? 'Unblock' : 'Block'}
+              </button>
+            ) : null}
             <button onClick={() => void deleteMessage(messageActionTarget, 'me')} type="button">Delete for me</button>
             {messageActionTarget.sender === 'me' ? (
               <button onClick={() => void deleteMessage(messageActionTarget, 'everyone')} type="button">Delete for everyone</button>
@@ -15185,6 +15463,37 @@ function App() {
                 Reveal author
               </button>
             ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {reportTarget ? (
+        <div className="modal-overlay" onClick={() => !reportBusy && setReportTarget(null)}>
+          <div className="dialog-card" onClick={(event) => event.stopPropagation()}>
+            <h3>Report {reportTarget.name || 'contact'}</h3>
+            <p>Reports go to ZynkUp safety review. Blocking is separate.</p>
+            {REPORT_REASON_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                onClick={() => setReportReason(option.id)}
+                type="button"
+              >
+                {reportReason === option.id ? `✓ ${option.label}` : option.label}
+              </button>
+            ))}
+            <textarea
+              maxLength={500}
+              onChange={(event) => setReportDetails(event.target.value)}
+              placeholder="Optional details"
+              rows={3}
+              value={reportDetails}
+            />
+            <button disabled={reportBusy || !reportReason} onClick={() => void submitUserReport()} type="button">
+              {reportBusy ? 'Sending…' : 'Submit report'}
+            </button>
+            <button disabled={reportBusy} onClick={() => setReportTarget(null)} type="button">
+              Cancel
+            </button>
           </div>
         </div>
       ) : null}
