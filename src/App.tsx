@@ -4,7 +4,7 @@ import { io, Socket } from 'socket.io-client';
 import './App.css';
 
 type View = 'chats' | 'calls' | 'catalog' | 'settings' | 'updates' | 'communities' | 'voiceRooms' | 'games' | 'events' | 'pay';
-type PayPanel = 'home' | 'send' | 'request' | 'topup' | 'orders' | 'history';
+type PayPanel = 'home' | 'send' | 'request' | 'split' | 'topup' | 'orders' | 'history';
 type PayHistoryItem = {
   id: string;
   title: string;
@@ -14,6 +14,31 @@ type PayHistoryItem = {
   status?: string;
   authorizationUrl?: string | null;
   orderId?: string | null;
+  paymentRequestId?: string | null;
+};
+type PaymentShare = {
+  userId: string;
+  phone?: string;
+  name?: string;
+  amount: number;
+  status: string;
+  paymentId?: string | null;
+  authorizationUrl?: string | null;
+  paidAt?: string | null;
+};
+type PaymentRequestRecord = {
+  id: string;
+  kind: 'request' | 'split';
+  creatorUserId: string;
+  recipientUserId: string;
+  amount: number;
+  currency: string;
+  note?: string;
+  chatId?: string | null;
+  shares: PaymentShare[];
+  status: string;
+  createdAt: string;
+  updatedAt: string;
 };
 type ReceiptState = 'pending' | 'sent' | 'delivered' | 'read';
 
@@ -729,6 +754,8 @@ type SaleReceipt = {
   id: string;
   receiptNumber: string;
   orderId: string;
+  buyerUserId?: string;
+  sellerUserId?: string;
   buyerName: string;
   sellerName: string;
   businessName: string;
@@ -738,6 +765,9 @@ type SaleReceipt = {
   items: Array<{ title: string; quantity: number; price: number }>;
   paymentMethod?: string;
   paymentReference?: string;
+  disputeNote?: string | null;
+  disputeByUserId?: string | null;
+  disputedAt?: string | null;
   issuedAt: string;
   createdAt: string;
 };
@@ -1866,11 +1896,14 @@ function App() {
   const [commerceOrders, setCommerceOrders] = useState<CommerceOrder[]>([]);
   const [buyerOrders, setBuyerOrders] = useState<CommerceOrder[]>([]);
   const [payPanel, setPayPanel] = useState<PayPanel>('home');
-  const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '' });
+  const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '', chatId: '' });
   const [payHistoryItems, setPayHistoryItems] = useState<PayHistoryItem[]>([]);
   const [payBusy, setPayBusy] = useState(false);
+  const [paymentRequests, setPaymentRequests] = useState<PaymentRequestRecord[]>([]);
   const [saleReceipts, setSaleReceipts] = useState<SaleReceipt[]>([]);
   const [receiptDetail, setReceiptDetail] = useState<SaleReceipt | null>(null);
+  const [disputeNote, setDisputeNote] = useState('');
+  const [disputeBusy, setDisputeBusy] = useState(false);
   const [inventoryAlerts, setInventoryAlerts] = useState<InventoryAlert[]>([]);
   const [businessCustomers, setBusinessCustomers] = useState<BusinessCustomer[]>([]);
   const [selectedCustomer, setSelectedCustomer] = useState<BusinessCustomer | null>(null);
@@ -3843,6 +3876,21 @@ function App() {
       setSaleReceipts((current) => [receipt, ...current.filter((entry) => entry.id !== receipt.id)]);
       setReceiptDetail((current) => (current?.id === receipt.id ? receipt : current));
     });
+    socket.on('receipt:updated', ({ receipt }: { receipt: SaleReceipt }) => {
+      if (!receipt?.id) return;
+      setSaleReceipts((current) => [receipt, ...current.filter((entry) => entry.id !== receipt.id)]);
+      setReceiptDetail((current) => (current?.id === receipt.id ? receipt : current));
+    });
+    socket.on('payment:request', ({ request }: { request: PaymentRequestRecord }) => {
+      if (!request?.id) return;
+      setPaymentRequests((current) => [request, ...current.filter((entry) => entry.id !== request.id)]);
+      showToast(
+        request.kind === 'split'
+          ? `Split request · ${request.currency} ${request.amount}`
+          : `Payment request · ${request.currency} ${request.amount}`,
+        3600,
+      );
+    });
     socket.on('inventory:alert', (alert: InventoryAlert) => {
       if (!alert?.id) return;
       setInventoryAlerts((current) => [alert, ...current.filter((entry) => entry.id !== alert.id)]);
@@ -4918,6 +4966,109 @@ function App() {
     return { response, payload };
   };
 
+  const loadPaymentRequests = async () => {
+    if (!currentUserId) return;
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/payments/requests?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not load payment requests');
+        return;
+      }
+      setPaymentRequests(payload.requests ?? []);
+    } catch {
+      showToast('Could not load payment requests');
+    }
+  };
+
+  const payPaymentRequestShare = async (request: PaymentRequestRecord) => {
+    if (!currentUserId || payBusy) return;
+    setPayBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/payments/requests/${encodeURIComponent(request.id)}/pay`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not start share payment.', 3600);
+        return;
+      }
+      if (payload.paymentRequest) {
+        setPaymentRequests((current) => [
+          payload.paymentRequest,
+          ...current.filter((entry) => entry.id !== payload.paymentRequest.id),
+        ]);
+      }
+      const share = (payload.paymentRequest?.shares || request.shares || [])
+        .find((item: PaymentShare) => item.userId === currentUserId);
+      appendPayHistoryEntry(payload.intent, {
+        title: request.kind === 'split' ? `Split share · ${request.id}` : `Pay request · ${request.id}`,
+        amount: Number(share?.amount || request.amount),
+        currency: request.currency || profile.currency || 'GHS',
+        positive: false,
+      });
+      openPaystackCheckout(payload.intent, payload.message);
+    } catch {
+      showToast('Network error while starting share payment.');
+    } finally {
+      setPayBusy(false);
+    }
+  };
+
+  const submitSplitPayment = async () => {
+    if (!currentUserId || payBusy) return;
+    const amount = Number.parseFloat(payForm.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showToast('Enter a valid amount first.');
+      return;
+    }
+    const chatId = payForm.chatId.trim() || activeChat?.id || '';
+    if (!chatId) {
+      showToast('Open a group chat first, or paste a chat id to split among participants.');
+      return;
+    }
+    setPayBusy(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/payments/split`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUserId,
+          amount,
+          currency: profile.currency || 'GHS',
+          note: payForm.note.trim() || undefined,
+          chatId,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not create split request.', 3600);
+        return;
+      }
+      if (payload.request) {
+        setPaymentRequests((current) => [
+          payload.request,
+          ...current.filter((entry) => entry.id !== payload.request.id),
+        ]);
+      }
+      showToast(payload.message || 'Split request sent.', 3600);
+      setPayForm({ amount: '', phone: '', note: '', chatId: '' });
+      setPayPanel('history');
+      void loadPaymentRequests();
+    } catch {
+      showToast('Network error while creating split.');
+    } finally {
+      setPayBusy(false);
+    }
+  };
+
   const submitPayAction = async (action: 'send' | 'request' | 'topup') => {
     if (!currentUserId || payBusy) return;
     const amount = Number.parseFloat(payForm.amount);
@@ -4937,10 +5088,17 @@ function App() {
         currency: profile.currency || 'GHS',
         phone: payForm.phone.trim() || profile.phone || undefined,
         note: payForm.note.trim() || undefined,
+        chatId: payForm.chatId.trim() || activeChat?.id || undefined,
       });
       if (!response.ok) {
         showToast(payload.error || 'Payment could not start.', 3600);
         return;
+      }
+      if (payload.paymentRequest) {
+        setPaymentRequests((current) => [
+          payload.paymentRequest,
+          ...current.filter((entry) => entry.id !== payload.paymentRequest.id),
+        ]);
       }
       appendPayHistoryEntry(payload.intent, {
         title:
@@ -4953,13 +5111,55 @@ function App() {
         currency: profile.currency || 'GHS',
         positive: action === 'request' || action === 'topup',
       });
-      openPaystackCheckout(payload.intent, payload.message);
-      setPayForm({ amount: '', phone: '', note: '' });
-      setPayPanel('home');
+      if (action === 'request' || payload.intent?.status === 'request_sent') {
+        showToast(payload.message || 'Payment request sent.', 3600);
+      } else {
+        openPaystackCheckout(payload.intent, payload.message);
+      }
+      setPayForm({ amount: '', phone: '', note: '', chatId: '' });
+      setPayPanel(action === 'request' ? 'history' : 'home');
     } catch {
       showToast('Network error while starting payment.');
     } finally {
       setPayBusy(false);
+    }
+  };
+
+  const submitReceiptDispute = async () => {
+    if (!currentUserId || !receiptDetail || disputeBusy) return;
+    const note = disputeNote.trim();
+    if (note.length < 4) {
+      showToast('Enter a short reason (at least 4 characters).');
+      return;
+    }
+    setDisputeBusy(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/receipts/${encodeURIComponent(receiptDetail.id)}/dispute`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUserId, note }),
+        },
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(payload.error || 'Could not report this problem.');
+        return;
+      }
+      if (payload.receipt) {
+        setReceiptDetail(payload.receipt);
+        setSaleReceipts((current) => [
+          payload.receipt,
+          ...current.filter((entry) => entry.id !== payload.receipt.id),
+        ]);
+      }
+      setDisputeNote('');
+      showToast(payload.message || 'Problem reported.');
+    } catch {
+      showToast('Network error while reporting the problem.');
+    } finally {
+      setDisputeBusy(false);
     }
   };
 
@@ -5772,6 +5972,7 @@ function App() {
   };
 
   const openReceiptDetail = async (receiptId: string) => {
+    setDisputeNote('');
     try {
       const response = await fetch(
         `${API_BASE_URL}/api/receipts/${encodeURIComponent(receiptId)}?userId=${encodeURIComponent(currentUserId)}`,
@@ -11630,7 +11831,7 @@ function App() {
         <header className="panel-header">
           <div>
             <h2>ZynkUp Pay</h2>
-            <p>F1 Pay / MoMo checkout via Paystack — no stored wallet balance.</p>
+            <p>Paystack checkout · request &amp; split bills · receipts — no stored wallet.</p>
           </div>
         </header>
 
@@ -11642,6 +11843,7 @@ function App() {
             {([
               ['send', 'Send'],
               ['request', 'Request'],
+              ['split', 'Split'],
               ['topup', 'Pay in'],
               ['orders', 'Orders'],
               ['history', 'History'],
@@ -11650,11 +11852,12 @@ function App() {
                 key={id}
                 className={payPanel === id ? 'active' : ''}
                 onClick={() => {
-                  setPayForm({ amount: '', phone: '', note: '' });
+                  setPayForm({ amount: '', phone: '', note: '', chatId: activeChat?.id || '' });
                   setPayPanel(id);
                   if (id === 'orders' || id === 'history') {
                     void loadCommerceOrders('buyer');
                     void loadSaleReceipts();
+                    void loadPaymentRequests();
                   }
                 }}
                 type="button"
@@ -11665,16 +11868,29 @@ function App() {
           </div>
         </section>
 
-        {payPanel === 'send' || payPanel === 'request' || payPanel === 'topup' ? (
+        {payPanel === 'send' || payPanel === 'request' || payPanel === 'topup' || payPanel === 'split' ? (
           <section className="business-panel pay-form-panel">
             <h3>
-              {payPanel === 'send' ? 'Send money' : payPanel === 'request' ? 'Request money' : 'Pay in via Paystack'}
+              {payPanel === 'send'
+                ? 'Send money'
+                : payPanel === 'request'
+                  ? 'Request money'
+                  : payPanel === 'split'
+                    ? 'Split a bill'
+                    : 'Pay in via Paystack'}
             </h3>
             {(payPanel === 'send' || payPanel === 'request') ? (
               <input
                 onChange={(event) => setPayForm((current) => ({ ...current, phone: event.target.value }))}
                 placeholder="Phone number"
                 value={payForm.phone}
+              />
+            ) : null}
+            {payPanel === 'split' ? (
+              <input
+                onChange={(event) => setPayForm((current) => ({ ...current, chatId: event.target.value }))}
+                placeholder={activeChat?.id ? `Chat id (${activeChat.name || activeChat.id})` : 'Group chat id'}
+                value={payForm.chatId}
               />
             ) : null}
             <input
@@ -11689,16 +11905,31 @@ function App() {
               value={payForm.note}
             />
             <p className="muted">
-              Opens Paystack checkout (card / MoMo). If keys are missing, you will see awaiting provider keys.
+              {payPanel === 'request'
+                ? 'Sends a request in chat. They pay their amount via Paystack when ready.'
+                : payPanel === 'split'
+                  ? 'Splits equally among chat participants. Each person pays their share via Paystack.'
+                  : 'Opens Paystack checkout (card / MoMo). If keys are missing, you will see awaiting provider keys.'}
             </p>
-            <button disabled={payBusy} onClick={() => void submitPayAction(payPanel)} type="button">
+            <button
+              disabled={payBusy}
+              onClick={() => {
+                if (payPanel === 'split') void submitSplitPayment();
+                else if (payPanel === 'send' || payPanel === 'request' || payPanel === 'topup') {
+                  void submitPayAction(payPanel);
+                }
+              }}
+              type="button"
+            >
               {payBusy
                 ? 'Starting…'
                 : payPanel === 'send'
                   ? 'Send with Paystack'
                   : payPanel === 'request'
-                    ? 'Request'
-                    : 'Pay with Paystack'}
+                    ? 'Send request'
+                    : payPanel === 'split'
+                      ? 'Create split'
+                      : 'Pay with Paystack'}
             </button>
             <button onClick={() => setPayPanel('home')} type="button">Back</button>
           </section>
@@ -11732,9 +11963,43 @@ function App() {
         {payPanel === 'history' ? (
           <section className="business-panel">
             <h3>Payment history</h3>
-            {payHistoryItems.length || buyerOrders.length || saleReceipts.length ? null : (
+            <button
+              onClick={() => {
+                void loadCommerceOrders('buyer');
+                void loadSaleReceipts();
+                void loadPaymentRequests();
+              }}
+              type="button"
+            >
+              Refresh
+            </button>
+            {payHistoryItems.length || buyerOrders.length || saleReceipts.length || paymentRequests.length ? null : (
               <p>No payments yet.</p>
             )}
+            {paymentRequests.map((request) => {
+              const myShare = request.shares.find((share) => share.userId === currentUserId);
+              const canPay = Boolean(myShare && myShare.status !== 'paid' && request.status !== 'cancelled');
+              return (
+                <div className="settings-list-row" key={`preq-${request.id}`}>
+                  <span>
+                    {request.kind === 'split' ? 'Split' : 'Request'} · {moneyLabel(request.amount, request.currency)}
+                    <small>
+                      {' '}
+                      · {request.status}
+                      {myShare ? ` · your share ${moneyLabel(myShare.amount, request.currency)} (${myShare.status})` : ''}
+                      {request.note ? ` · ${request.note}` : ''}
+                    </small>
+                  </span>
+                  {canPay ? (
+                    <button disabled={payBusy} onClick={() => void payPaymentRequestShare(request)} type="button">
+                      Pay share
+                    </button>
+                  ) : (
+                    <strong>·</strong>
+                  )}
+                </div>
+              );
+            })}
             {payHistoryItems.map((item) => (
               <button
                 className="settings-list-row"
@@ -12417,6 +12682,26 @@ function App() {
                   <p>
                     Payment: {receiptDetail.paymentMethod || '—'} · {receiptDetail.paymentReference || '—'}
                   </p>
+                  {receiptDetail.state === 'disputed' ? (
+                    <p className="muted">
+                      Dispute: {receiptDetail.disputeNote || 'Reported'}
+                      {receiptDetail.disputedAt
+                        ? ` · ${new Date(receiptDetail.disputedAt).toLocaleString()}`
+                        : ''}
+                    </p>
+                  ) : (
+                    <div className="pay-form-panel">
+                      <h4>Report a problem</h4>
+                      <input
+                        onChange={(event) => setDisputeNote(event.target.value)}
+                        placeholder="Short reason"
+                        value={disputeNote}
+                      />
+                      <button disabled={disputeBusy} onClick={() => void submitReceiptDispute()} type="button">
+                        {disputeBusy ? 'Sending…' : 'Report a problem'}
+                      </button>
+                    </div>
+                  )}
                   <button onClick={() => setReceiptDetail(null)} type="button">
                     Close detail
                   </button>
