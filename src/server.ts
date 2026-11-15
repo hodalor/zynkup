@@ -125,6 +125,12 @@ type Message = {
     reactionId?: string;
     reactedAt: string;
   }>;
+  /** WhatsApp-like view-once photo/video — recipient opens once, then media is consumed. */
+  viewOnce?: boolean;
+  viewOnceOpenedAt?: string;
+  viewOnceOpenedBy?: string;
+  /** Screenshot-sensitive / protected media flag (shown as ⚠ Protected in clients). */
+  protectedMedia?: boolean;
 };
 
 type Chat = {
@@ -569,6 +575,8 @@ type Profile = {
   reactionSoundEnabled?: boolean;
   /** When false, clients should use static emoji only (reduced-motion friendly). */
   reactionAnimationEnabled?: boolean;
+  /** Preferred translation / AI language (en, Twi, Ga, Ewe, Pidgin). */
+  preferredLanguage?: 'en' | 'tw' | 'ga' | 'ee' | 'pcm';
   blockedUserIds?: string[];
   blocked?: boolean;
   blockedUntil?: string | null;
@@ -716,6 +724,7 @@ const emptyProfile: Profile = {
   readReceiptsEnabled: true,
   reactionSoundEnabled: false,
   reactionAnimationEnabled: true,
+  preferredLanguage: 'en',
   blockedUserIds: [],
 };
 
@@ -844,6 +853,8 @@ const sendMessageSchema = z.object({
   catalogItemId: z.string().min(1).max(80).optional(),
   anonymous: z.boolean().optional(),
   businessId: z.string().min(1).max(80).optional(),
+  /** View-once media (image/video only). Implies protectedMedia. */
+  viewOnce: z.boolean().optional(),
 });
 
 const clearChatUnreadSchema = z.object({
@@ -900,6 +911,7 @@ const updateProfileSchema = z.object({
   readReceiptsEnabled: z.boolean().optional(),
   reactionSoundEnabled: z.boolean().optional(),
   reactionAnimationEnabled: z.boolean().optional(),
+  preferredLanguage: z.enum(['en', 'tw', 'ga', 'ee', 'pcm']).optional(),
   appLockEnabled: z.boolean().optional(),
   pin: z.string().regex(/^\d{4,6}$/).optional(),
 });
@@ -1801,10 +1813,16 @@ const anonymousDayKey = () =>
   new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Lusaka' }).format(new Date());
 
 const presentMessage = (message: Message, viewerId: string): Message => {
-  if (!message.anonymous || message.senderId === viewerId) {
-    return message;
+  let next: Message = message;
+  if (message.anonymous && message.senderId !== viewerId) {
+    next = { ...next, senderId: 'anonymous' };
   }
-  return { ...message, senderId: 'anonymous' };
+  // View-once: after open, strip media for everyone (consumed). Before open, recipients
+  // still receive URLs so they can open once; senders keep their local copy until then.
+  if (next.viewOnce && next.viewOnceOpenedAt) {
+    next = { ...next, mediaUrls: [] };
+  }
+  return next;
 };
 
 const chatAdmins = (chat: Chat) => (chat.adminIds?.length ? chat.adminIds : chat.participants.slice(0, 1));
@@ -2559,6 +2577,7 @@ const withReactionPrefs = (profile: Profile): Profile => ({
   ...profile,
   reactionSoundEnabled: profile.reactionSoundEnabled ?? false,
   reactionAnimationEnabled: profile.reactionAnimationEnabled ?? true,
+  preferredLanguage: profile.preferredLanguage || 'en',
 });
 
 const readProfile = async (userId = DEFAULT_USER_ID) => {
@@ -7436,7 +7455,7 @@ const buildSuggestedReplies = (incomingText: string, tone?: z.infer<typeof aiTon
     text: entry.text,
     tone: entry.tone,
     reason: entry.reason,
-    source: 'template' as const,
+    source: 'template' as 'template' | 'openai',
   }));
 };
 
@@ -7888,6 +7907,22 @@ app.post('/api/messages/:messageId/transcribe', async (req, res) => {
       message: failed,
     });
   }
+});
+
+app.get('/api/ai/languages', (_req, res) => {
+  return res.json({
+    languages: [
+      { code: 'en', label: 'English' },
+      { code: 'tw', label: 'Twi' },
+      { code: 'ga', label: 'Ga' },
+      { code: 'ee', label: 'Ewe' },
+      { code: 'pcm', label: 'Pidgin' },
+    ],
+    defaultLanguage: 'en',
+    testedPairs: ['en↔tw', 'en↔ga', 'en↔ee', 'en↔pcm'],
+    notice: 'OpenAI powers full machine translation for en / tw / ga / ee / pcm. Common phrases also use a built-in Pidgin glossary. Always review names, amounts, and promises.',
+    provider: hasOpenAi() ? 'openai' : 'glossary',
+  });
 });
 
 app.post('/api/ai/translate', async (req, res) => {
@@ -9978,6 +10013,8 @@ app.post('/api/messages', async (req, res) => {
     }
   }
 
+  const viewOnceAllowed = Boolean(payload.viewOnce)
+    && (payload.kind === 'image' || payload.kind === 'video');
   const message: Message = {
     id: `m${Date.now()}`,
     chatId: payload.chatId,
@@ -9999,6 +10036,9 @@ app.post('/api/messages', async (req, res) => {
     expiresAt: chat.disappearAfterSeconds
       ? new Date(Date.now() + chat.disappearAfterSeconds * 1000).toISOString()
       : undefined,
+    ...(viewOnceAllowed
+      ? { viewOnce: true, protectedMedia: true }
+      : {}),
   };
 
   await persistMessage(message);
@@ -10271,6 +10311,73 @@ app.delete('/api/messages/:messageId', async (req, res) => {
     });
   }
   return res.json({ message: presentMessage(nextMessage, parseResult.data.userId) });
+});
+
+const viewOnceOpenSchema = z.object({
+  userId: z.string().min(1).optional(),
+});
+
+app.post('/api/messages/:messageId/view-once', async (req, res) => {
+  const parseResult = viewOnceOpenSchema.safeParse(req.body ?? {});
+  if (!parseResult.success) {
+    return res.status(400).json({ error: 'Invalid view-once payload' });
+  }
+
+  const actorUserId = parseResult.data.userId?.trim() || await resolveRequestUserId(req);
+  if (!actorUserId) {
+    return res.status(400).json({ error: 'Missing user' });
+  }
+
+  const message = (await readMessages()).find((item) => item.id === req.params.messageId);
+  if (!message) {
+    return res.status(404).json({ error: 'Message not found' });
+  }
+  if (!message.viewOnce) {
+    return res.status(400).json({ error: 'This message is not view-once media.' });
+  }
+  if (message.senderId === actorUserId) {
+    return res.status(403).json({ error: 'Only the recipient can open view-once media.' });
+  }
+
+  const chat = (await readChats()).find((item) => item.id === message.chatId);
+  if (!chat || !chat.participants.includes(actorUserId)) {
+    return res.status(403).json({ error: 'You cannot open this message.' });
+  }
+
+  if (message.viewOnceOpenedAt) {
+    return res.status(410).json({
+      error: 'View-once media was already opened.',
+      message: presentMessage(message, actorUserId),
+    });
+  }
+
+  const mediaUrls = [...(message.mediaUrls || [])];
+  const openedAt = new Date().toISOString();
+  const nextMessage: Message = {
+    ...message,
+    viewOnceOpenedAt: openedAt,
+    viewOnceOpenedBy: actorUserId,
+    protectedMedia: true,
+    mediaUrls: [],
+  };
+  await saveMessageUpdate(nextMessage);
+
+  for (const participantId of chat.participants) {
+    io.to(`user:${participantId}`).emit('message:updated', {
+      message: presentMessage(nextMessage, participantId),
+    });
+  }
+
+  // Return media once to the opener; stored message already has URLs cleared.
+  return res.json({
+    message: {
+      ...presentMessage({ ...nextMessage, mediaUrls }, actorUserId),
+      mediaUrls,
+      viewOnceOpenedAt: openedAt,
+      viewOnceOpenedBy: actorUserId,
+    },
+    notice: 'Viewed once. Media will not be available again.',
+  });
 });
 
 app.post('/api/messages/:messageId/reveal-author', async (req, res) => {
