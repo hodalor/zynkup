@@ -48,6 +48,10 @@ import {
   type BadgesDeps,
 } from './badgesApi.js';
 import {
+  registerCardsApi,
+  type CardsDeps,
+} from './cardsApi.js';
+import {
   hasOpenAi,
   openaiChat,
   openaiRewrite,
@@ -12054,6 +12058,22 @@ const badgesDeps: BadgesDeps = {
   readMessages,
 };
 registerBadgesApi(app, badgesDeps);
+
+const cardsDeps: CardsDeps = {
+  getDb,
+  resolveRequestUserId,
+  readProfile,
+  readUsers: async () =>
+    (await readUsers()).map((user) => ({
+      id: user.id,
+      name: user.name,
+      avatar: user.avatar,
+      phone: user.phone,
+      username: user.username,
+      about: user.about,
+    })),
+};
+registerCardsApi(app, cardsDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
