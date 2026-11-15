@@ -506,11 +506,44 @@ type CommerceOrder = {
   totalAmount: number;
   currency: string;
   state: OrderState;
+  /** @deprecated Prefer trackingCode; kept for older clients. */
   deliveryReference?: string | null;
   fulfilmentNote?: string | null;
+  courier?: string | null;
+  trackingCode?: string | null;
+  estimatedDelivery?: string | null;
   history: Array<{ state: OrderState; at: string; byUserId: string; note?: string }>;
   createdAt: string;
   updatedAt: string;
+};
+
+type OrderTrackingView = {
+  orderId: string;
+  state: OrderState;
+  courier: string | null;
+  trackingCode: string | null;
+  estimatedDelivery: string | null;
+  fulfilmentNote: string | null;
+  deliveryReference: string | null;
+  history: CommerceOrder['history'];
+  updatedAt: string;
+  source: 'manual';
+};
+
+const orderTrackingView = (order: CommerceOrder): OrderTrackingView => {
+  const trackingCode = order.trackingCode ?? order.deliveryReference ?? null;
+  return {
+    orderId: order.id,
+    state: order.state,
+    courier: order.courier ?? null,
+    trackingCode,
+    estimatedDelivery: order.estimatedDelivery ?? null,
+    fulfilmentNote: order.fulfilmentNote ?? null,
+    deliveryReference: order.deliveryReference ?? trackingCode,
+    history: order.history || [],
+    updatedAt: order.updatedAt,
+    source: 'manual',
+  };
 };
 
 type SaleReceiptState = 'issued' | 'voided' | 'refunded' | 'disputed';
@@ -1464,11 +1497,68 @@ const createOrderSchema = z.object({
 
 const updateOrderSchema = z.object({
   userId: z.string().min(1),
-  state: z.enum(['pending_payment', 'paid', 'processing', 'dispatched', 'completed', 'cancelled', 'refunded']),
+  /** Omit (or send current state) to update fulfilment fields only. */
+  state: z.enum(['pending_payment', 'paid', 'processing', 'dispatched', 'completed', 'cancelled', 'refunded']).optional(),
   note: z.string().trim().max(200).optional(),
   deliveryReference: z.string().trim().max(120).optional().nullable(),
   fulfilmentNote: z.string().trim().max(400).optional().nullable(),
+  courier: z.string().trim().max(80).optional().nullable(),
+  trackingCode: z.string().trim().max(120).optional().nullable(),
+  estimatedDelivery: z.string().trim().max(40).optional().nullable(),
 });
+
+const FULFILMENT_EDITABLE_STATES: OrderState[] = ['paid', 'processing', 'dispatched', 'completed'];
+
+const mergeOrderFulfilmentFields = (
+  order: CommerceOrder,
+  patch: {
+    deliveryReference?: string | null;
+    fulfilmentNote?: string | null;
+    courier?: string | null;
+    trackingCode?: string | null;
+    estimatedDelivery?: string | null;
+  },
+) => {
+  let trackingCode = order.trackingCode ?? order.deliveryReference ?? null;
+  let deliveryReference = order.deliveryReference ?? order.trackingCode ?? null;
+  if (patch.trackingCode !== undefined) {
+    trackingCode = patch.trackingCode;
+    if (patch.deliveryReference === undefined) deliveryReference = trackingCode;
+  }
+  if (patch.deliveryReference !== undefined) {
+    deliveryReference = patch.deliveryReference;
+    if (patch.trackingCode === undefined) trackingCode = deliveryReference;
+  }
+  return {
+    courier: patch.courier !== undefined ? patch.courier : (order.courier ?? null),
+    trackingCode,
+    deliveryReference,
+    estimatedDelivery: patch.estimatedDelivery !== undefined
+      ? patch.estimatedDelivery
+      : (order.estimatedDelivery ?? null),
+    fulfilmentNote: patch.fulfilmentNote !== undefined
+      ? patch.fulfilmentNote
+      : (order.fulfilmentNote ?? null),
+  };
+};
+
+const buildFulfilmentHistoryNote = (
+  baseNote: string | undefined,
+  fields: {
+    courier: string | null;
+    trackingCode: string | null;
+    estimatedDelivery: string | null;
+  },
+  includeTracking: boolean,
+) => {
+  const parts = [baseNote || ''];
+  if (includeTracking) {
+    if (fields.courier) parts.push(`Courier ${fields.courier}`);
+    if (fields.trackingCode) parts.push(`Tracking ${fields.trackingCode}`);
+    if (fields.estimatedDelivery) parts.push(`ETA ${fields.estimatedDelivery}`);
+  }
+  return parts.filter(Boolean).join(' · ');
+};
 
 const ORDER_TRANSITIONS: Record<OrderState, OrderState[]> = {
   pending_payment: ['paid', 'cancelled'],
@@ -6530,6 +6620,11 @@ app.post('/api/orders', async (req, res) => {
     totalAmount: Number((item.price * quantity).toFixed(2)),
     currency: item.currency,
     state: 'pending_payment',
+    courier: null,
+    trackingCode: null,
+    estimatedDelivery: null,
+    deliveryReference: null,
+    fulfilmentNote: null,
     history: [{ state: 'pending_payment', at: now, byUserId: parseResult.data.buyerUserId, note: 'Order created from product' }],
     createdAt: now,
     updatedAt: now,
@@ -6571,6 +6666,17 @@ app.get('/api/orders/:orderId', async (req, res) => {
   return res.json({ order });
 });
 
+app.get('/api/orders/:orderId/tracking', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (order.buyerUserId !== userId && order.sellerUserId !== userId) {
+    return res.status(403).json({ error: 'You cannot view this order tracking.' });
+  }
+  return res.json({ tracking: orderTrackingView(order), order });
+});
+
 app.patch('/api/orders/:orderId', async (req, res) => {
   const parseResult = updateOrderSchema.safeParse(req.body);
   if (!parseResult.success) {
@@ -6578,29 +6684,60 @@ app.patch('/api/orders/:orderId', async (req, res) => {
   }
   const order = (await readOrders()).find((entry) => entry.id === req.params.orderId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  const nextState = parseResult.data.state;
-  const denyReason = canTransitionOrder(order, nextState, parseResult.data.userId);
+  const actorUserId = parseResult.data.userId;
+  const requestedState = parseResult.data.state;
+  const fulfilmentOnly = !requestedState || requestedState === order.state;
+  const fulfilmentFields = mergeOrderFulfilmentFields(order, parseResult.data);
+
+  if (fulfilmentOnly) {
+    const isSeller = order.sellerUserId === actorUserId;
+    if (!isSeller) {
+      return res.status(403).json({ error: 'Only the seller can update fulfilment details.' });
+    }
+    if (!FULFILMENT_EDITABLE_STATES.includes(order.state)) {
+      return res.status(400).json({ error: `Cannot update fulfilment while order is ${order.state}.` });
+    }
+    const now = new Date().toISOString();
+    const historyNote = buildFulfilmentHistoryNote(
+      parseResult.data.note || 'Tracking updated',
+      fulfilmentFields,
+      true,
+    );
+    const updated: CommerceOrder = {
+      ...order,
+      ...fulfilmentFields,
+      updatedAt: now,
+      history: [
+        ...order.history,
+        { state: order.state, at: now, byUserId: actorUserId, note: historyNote },
+      ],
+    };
+    await saveOrder(updated);
+    void ensureCustomerFromOrder(updated);
+    io.to(`user:${updated.sellerUserId}`).emit('order:updated', { order: updated });
+    io.to(`user:${updated.buyerUserId}`).emit('order:updated', { order: updated });
+    return res.json({ order: updated, tracking: orderTrackingView(updated), receipt: null });
+  }
+
+  const nextState = requestedState as OrderState;
+  const denyReason = canTransitionOrder(order, nextState, actorUserId);
   if (denyReason) {
     return res.status(400).json({ error: denyReason });
   }
   const now = new Date().toISOString();
-  const fulfilmentNote = parseResult.data.fulfilmentNote ?? order.fulfilmentNote ?? null;
-  const deliveryReference = parseResult.data.deliveryReference === undefined
-    ? order.deliveryReference ?? null
-    : parseResult.data.deliveryReference;
-  const historyNote = [
-    parseResult.data.note || '',
-    deliveryReference && nextState === 'dispatched' ? `Ref ${deliveryReference}` : '',
-  ].filter(Boolean).join(' · ');
+  const historyNote = buildFulfilmentHistoryNote(
+    parseResult.data.note,
+    fulfilmentFields,
+    nextState === 'dispatched' || nextState === 'completed' || nextState === 'processing',
+  );
   const updated: CommerceOrder = {
     ...order,
     state: nextState,
-    deliveryReference,
-    fulfilmentNote,
+    ...fulfilmentFields,
     updatedAt: now,
     history: [
       ...order.history,
-      { state: nextState, at: now, byUserId: parseResult.data.userId, note: historyNote },
+      { state: nextState, at: now, byUserId: actorUserId, note: historyNote },
     ],
   };
   let finalOrder = updated;
@@ -6693,7 +6830,7 @@ app.patch('/api/orders/:orderId', async (req, res) => {
   void ensureCustomerFromOrder(finalOrder);
   io.to(`user:${finalOrder.sellerUserId}`).emit('order:updated', { order: finalOrder });
   io.to(`user:${finalOrder.buyerUserId}`).emit('order:updated', { order: finalOrder });
-  return res.json({ order: finalOrder, receipt: issuedReceipt });
+  return res.json({ order: finalOrder, tracking: orderTrackingView(finalOrder), receipt: issuedReceipt });
 });
 
 app.get('/api/receipts', async (req, res) => {
@@ -7135,6 +7272,11 @@ app.get('/api/customers/:customerId', async (req, res) => {
         currency: order.currency,
         createdAt: order.createdAt,
         itemTitle: order.items[0]?.title || 'Order',
+        courier: order.courier ?? null,
+        trackingCode: order.trackingCode ?? order.deliveryReference ?? null,
+        estimatedDelivery: order.estimatedDelivery ?? null,
+        deliveryReference: order.deliveryReference ?? order.trackingCode ?? null,
+        fulfilmentNote: order.fulfilmentNote ?? null,
       })),
   });
 });
