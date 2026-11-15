@@ -10056,6 +10056,167 @@ app.get('/api/businesses/:businessId', async (req, res) => {
   });
 });
 
+/** Lightweight command-centre counts for Personal vs Business home strips. */
+app.get('/api/home', async (req, res) => {
+  const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+  if (!userId) return res.status(400).json({ error: 'Missing user' });
+  const businessId = typeof req.query.businessId === 'string' ? req.query.businessId.trim() : '';
+  const identityQuery = typeof req.query.identity === 'string' ? req.query.identity.trim().toLowerCase() : '';
+  const identity = identityQuery === 'business' || businessId ? 'business' : 'personal';
+  const now = new Date();
+  const nowIso = now.toISOString();
+
+  let business: BusinessProfile | null = null;
+  let role: BusinessRole | null = null;
+  let sellerIds: string[] = [userId];
+  if (businessId) {
+    business = (await readBusinesses()).find((item) => item.id === businessId) || null;
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    role = businessRoleFor(business, userId);
+    if (!role) return res.status(403).json({ error: 'You are not on this business.' });
+    sellerIds = [business.ownerUserId];
+  }
+
+  const [chats, orders, paymentRequests, documents, catalog, statuses, chatRequests] = await Promise.all([
+    readChats(),
+    readOrders(),
+    readPaymentRequests(),
+    expireQuotationsIfNeeded(await readCommerceDocuments()),
+    readCatalogItems(),
+    readStatuses(),
+    readChatRequests(),
+  ]);
+
+  const myChats = chats.filter((chat) => chat.participants.includes(userId));
+  const personalChats = myChats.filter((chat) => chatSpaceOf(chat) === 'personal');
+  const businessChats = myChats.filter((chat) => {
+    const space = chatSpaceOf(chat);
+    if (space === 'personal') return false;
+    return businessId ? space === businessId : true;
+  });
+  const unreadIn = (list: Chat[]) => {
+    let chatsWithUnread = 0;
+    let messages = 0;
+    list.forEach((chat) => {
+      const count = Number(chat.unreadByUser?.[userId] ?? 0);
+      if (count > 0) {
+        chatsWithUnread += 1;
+        messages += count;
+      }
+    });
+    return { chats: chatsWithUnread, messages };
+  };
+  const personalUnread = unreadIn(personalChats);
+  const businessUnread = unreadIn(businessChats);
+
+  const pendingChatRequests = chatRequests.filter(
+    (item) => item.state === 'pending' && item.toUserId === userId,
+  ).length;
+
+  const openPaymentRequests = paymentRequests.filter((request) => (
+    ['open', 'partial'].includes(request.status)
+    && (
+      request.creatorUserId === userId
+      || request.recipientUserId === userId
+      || request.shares.some((share) => share.userId === userId && share.status !== 'paid')
+    )
+  ));
+
+  const pendingBuyerOrders = orders.filter((order) =>
+    order.buyerUserId === userId
+    && ['pending_payment', 'paid', 'processing', 'dispatched'].includes(order.state),
+  );
+  const scopedSellerOrders = orders.filter((order) => {
+    const sellerMatch = sellerIds.includes(order.sellerUserId);
+    const businessMatch = businessId
+      ? order.businessId === businessId || (!order.businessId && order.sellerUserId === business?.ownerUserId)
+      : sellerMatch;
+    return sellerMatch && businessMatch
+      && ['pending_payment', 'paid', 'processing', 'dispatched'].includes(order.state);
+  });
+
+  const sellerCatalog = catalog.filter((item) =>
+    sellerIds.includes(item.sellerId)
+    && (!businessId || item.businessId === businessId || !item.businessId)
+    && !item.takenDown
+    && (item.status || 'active') !== 'archived',
+  );
+  const lowStock = sellerCatalog.filter((item) => {
+    if (item.trackStock === false) return false;
+    const threshold = item.lowStockThreshold ?? 2;
+    return (item.stockQuantity ?? 0) <= threshold;
+  });
+
+  const unpaidInvoices = documents.filter((doc) => {
+    if (doc.kind !== 'invoice') return false;
+    if (!sellerIds.includes(doc.sellerUserId)) return false;
+    if (businessId && doc.businessId && doc.businessId !== businessId) return false;
+    return ['sent', 'accepted', 'overdue'].includes(doc.state);
+  });
+
+  const liveStatusesFromOthers = statuses.filter((status) => {
+    if (status.userId === userId) return false;
+    if (status.audience === 'marketplace') return true;
+    const created = status.createdAt ? new Date(status.createdAt).getTime() : 0;
+    const expiry = status.expiresAt
+      ? new Date(status.expiresAt).getTime()
+      : created + 24 * 60 * 60 * 1000;
+    return Number.isFinite(expiry) && expiry > now.getTime();
+  }).length;
+
+  let upcomingEvents = 0;
+  try {
+    const db = await getDb();
+    const horizon = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+    if (db) {
+      const rsvps = await db.collection('eventRsvps').find(
+        { userId, status: { $in: ['going', 'interested'] } },
+        { projection: { _id: 0, eventId: 1 } },
+      ).toArray();
+      const rsvpEventIds = rsvps.map((entry) => String((entry as { eventId?: string }).eventId || '')).filter(Boolean);
+      upcomingEvents = await db.collection('events').countDocuments({
+        status: { $in: ['scheduled', 'live'] },
+        startsAt: { $gte: horizon },
+        $or: [
+          { hostUserId: userId },
+          ...(rsvpEventIds.length ? [{ id: { $in: rsvpEventIds } }] : []),
+        ],
+      });
+    }
+  } catch {
+    upcomingEvents = 0;
+  }
+
+  return res.json({
+    identity,
+    businessId: businessId || null,
+    role: role || null,
+    lastUpdatedAt: nowIso,
+    counts: {
+      unreadChats: personalUnread.chats,
+      unreadMessages: personalUnread.messages,
+      unreadBusinessChats: businessUnread.chats,
+      unreadBusinessMessages: businessUnread.messages,
+      pendingChatRequests,
+      upcomingEvents,
+      liveStatusesFromOthers,
+      openPaymentRequests: openPaymentRequests.length,
+      pendingBuyerOrders: pendingBuyerOrders.length,
+      pendingSellerOrders: scopedSellerOrders.length,
+      lowStockCount: lowStock.length,
+      unpaidInvoices: unpaidInvoices.length,
+      catalogCount: sellerCatalog.length,
+    },
+    drilldown: {
+      pendingBuyerOrderIds: pendingBuyerOrders.slice(0, 12).map((order) => order.id),
+      pendingSellerOrderIds: scopedSellerOrders.slice(0, 12).map((order) => order.id),
+      openPaymentRequestIds: openPaymentRequests.slice(0, 12).map((request) => request.id),
+      unpaidInvoiceIds: unpaidInvoices.slice(0, 12).map((doc) => doc.id),
+      lowStockIds: lowStock.slice(0, 12).map((item) => item.id),
+    },
+  });
+});
+
 app.get('/api/sales/dashboard', async (req, res) => {
   const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
   if (!userId) return res.status(400).json({ error: 'Missing user' });
