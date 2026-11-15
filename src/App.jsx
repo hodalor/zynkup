@@ -5,6 +5,7 @@ const NAV = [
   ['overview', 'Overview'],
   ['users', 'Users'],
   ['numbers', 'Blocked numbers'],
+  ['reports', 'Safety reports'],
   ['marketplace', 'Marketplace'],
   ['businesses', 'Businesses'],
   ['orders', 'Orders'],
@@ -134,6 +135,7 @@ export default function App() {
       overview: '/api/admin/overview',
       users: `/api/admin/users?q=${encodeURIComponent(query)}&country=${encodeURIComponent(country)}`,
       numbers: '/api/admin/blocks',
+      reports: '/api/admin/reports',
       marketplace: '/api/admin/catalog',
       businesses: '/api/admin/businesses',
       orders: '/api/admin/orders',
@@ -164,6 +166,7 @@ export default function App() {
     if (!data) return [];
     if (page === 'users') return data.users || [];
     if (page === 'numbers') return data.blocks || [];
+    if (page === 'reports') return data.reports || [];
     if (page === 'marketplace') return data.items || [];
     if (page === 'businesses') return data.businesses || [];
     if (page === 'orders') return data.orders || [];
@@ -283,6 +286,28 @@ export default function App() {
             rows={rows}
             onRow={(row) => setModal({ kind: 'block', row })}
           />
+        ) : null}
+        {page === 'reports' ? (
+          <>
+            <Cards items={[
+              ['Reports', data?.reports?.length || 0],
+              ['Open', data?.open || 0],
+              ['Reviewed', data?.reviewed || 0],
+              ['Dismissed', data?.dismissed || 0],
+            ]} />
+            <Table
+              columns={[
+                { key: 'kind', label: 'Kind' },
+                { key: 'targetName', label: 'Reported', render: (row) => row.targetName || row.targetUserId },
+                { key: 'reason', label: 'Reason' },
+                { key: 'reporterName', label: 'Reporter', render: (row) => row.reporterName || row.reporterUserId },
+                { key: 'state', label: 'State' },
+                { key: 'createdAt', label: 'When', render: (row) => row.createdAt ? new Date(row.createdAt).toLocaleString() : '' },
+              ]}
+              rows={rows}
+              onRow={(row) => setModal({ kind: 'safety-report', row })}
+            />
+          </>
         ) : null}
         {page === 'marketplace' ? (
           <>
@@ -500,6 +525,28 @@ export default function App() {
         <Modal title={modal.row.phone} onClose={() => setModal(null)}>
           <Detail row={modal.row} />
           <button className="primary" onClick={() => act(`/api/admin/blocks/${modal.row.id}`, {}, 'DELETE')}>Remove block</button>
+        </Modal>
+      ) : null}
+      {modal?.kind === 'safety-report' ? (
+        <Modal title={`Report · ${modal.row.reason || modal.row.id}`} onClose={() => setModal(null)}>
+          <Detail row={modal.row} />
+          <div className="stack">
+            <textarea
+              placeholder="Review note"
+              value={form.reviewNote || ''}
+              onChange={(event) => setForm({ ...form, reviewNote: event.target.value })}
+            />
+            <div className="toolbar">
+              <button className="primary" onClick={() => act(`/api/admin/reports/${modal.row.id}`, { state: 'reviewed', reviewNote: form.reviewNote || '' }, 'PATCH')}>Mark reviewed</button>
+              <button className="ghost" onClick={() => act(`/api/admin/reports/${modal.row.id}`, { state: 'dismissed', reviewNote: form.reviewNote || '' }, 'PATCH')}>Dismiss</button>
+              <button className="danger" onClick={() => act(`/api/admin/reports/${modal.row.id}`, { state: 'actioned', reviewNote: form.reviewNote || '' }, 'PATCH')}>Actioned</button>
+            </div>
+            {modal.row.targetUserId ? (
+              <div className="toolbar">
+                <button className="danger" onClick={() => act(`/api/admin/users/${modal.row.targetUserId}/block`, { reason: `Report ${modal.row.reason}`, until: null })}>Block reported user</button>
+              </div>
+            ) : null}
+          </div>
         </Modal>
       ) : null}
       {modal?.kind === 'boost' ? (
