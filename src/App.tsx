@@ -648,8 +648,25 @@ type CommerceOrder = {
   items: Array<{ title: string; quantity: number; price: number }>;
   deliveryReference?: string | null;
   fulfilmentNote?: string | null;
+  courier?: string | null;
+  trackingCode?: string | null;
+  estimatedDelivery?: string | null;
+  history?: Array<{ state: OrderState; at: string; byUserId: string; note?: string }>;
   createdAt: string;
   updatedAt: string;
+};
+
+type OrderTrackingView = {
+  orderId: string;
+  state: OrderState;
+  courier: string | null;
+  trackingCode: string | null;
+  estimatedDelivery: string | null;
+  fulfilmentNote: string | null;
+  deliveryReference: string | null;
+  history: Array<{ state: OrderState; at: string; byUserId: string; note?: string }>;
+  updatedAt: string;
+  source: 'manual';
 };
 
 type AiTone = 'polite' | 'concise' | 'professional' | 'friendly' | 'apologetic';
@@ -910,6 +927,9 @@ type CustomerOrderSummary = {
   currency: string;
   createdAt: string;
   itemTitle?: string;
+  courier?: string | null;
+  trackingCode?: string | null;
+  estimatedDelivery?: string | null;
   deliveryReference?: string | null;
   fulfilmentNote?: string | null;
 };
@@ -1991,6 +2011,13 @@ function App() {
   });
   const [commerceOrders, setCommerceOrders] = useState<CommerceOrder[]>([]);
   const [buyerOrders, setBuyerOrders] = useState<CommerceOrder[]>([]);
+  const [orderDetail, setOrderDetail] = useState<CommerceOrder | null>(null);
+  const [orderDeliveryDraft, setOrderDeliveryDraft] = useState({
+    courier: '',
+    trackingCode: '',
+    estimatedDelivery: '',
+    fulfilmentNote: '',
+  });
   const [payPanel, setPayPanel] = useState<PayPanel>('home');
   const [payForm, setPayForm] = useState({ amount: '', phone: '', note: '', chatId: '' });
   const [payHistoryItems, setPayHistoryItems] = useState<PayHistoryItem[]>([]);
@@ -4212,6 +4239,9 @@ function App() {
     socket.on('order:created', ({ order }: { order: CommerceOrder }) => {
       if (!order?.id) return;
       setCommerceOrders((current) => [order, ...current.filter((entry) => entry.id !== order.id)]);
+      if (order.buyerUserId === currentUserIdRef.current) {
+        setBuyerOrders((current) => [order, ...current.filter((entry) => entry.id !== order.id)]);
+      }
       if (order.sellerUserId === currentUserIdRef.current) {
         showToast(`New order ${order.id}`);
       }
@@ -4219,6 +4249,8 @@ function App() {
     socket.on('order:updated', ({ order }: { order: CommerceOrder }) => {
       if (!order?.id) return;
       setCommerceOrders((current) => current.map((entry) => (entry.id === order.id ? order : entry)));
+      setBuyerOrders((current) => current.map((entry) => (entry.id === order.id ? order : entry)));
+      setOrderDetail((current) => (current?.id === order.id ? order : current));
     });
     socket.on('receipt:created', ({ receipt }: { receipt: SaleReceipt }) => {
       if (!receipt?.id) return;
@@ -5579,33 +5611,76 @@ function App() {
     }
   };
 
-  const updateOrderState = async (orderId: string, state: OrderState) => {
+  const draftFromOrder = (order?: CommerceOrder | null) => ({
+    courier: order?.courier || '',
+    trackingCode: order?.trackingCode || order?.deliveryReference || '',
+    estimatedDelivery: order?.estimatedDelivery ? String(order.estimatedDelivery).slice(0, 10) : '',
+    fulfilmentNote: order?.fulfilmentNote || '',
+  });
+
+  const fulfilmentExtrasFromDraft = () => {
+    const trackingCode = orderDeliveryDraft.trackingCode.trim();
+    return {
+      courier: orderDeliveryDraft.courier.trim() || null,
+      trackingCode: trackingCode || null,
+      deliveryReference: trackingCode || null,
+      estimatedDelivery: orderDeliveryDraft.estimatedDelivery.trim() || null,
+      fulfilmentNote: orderDeliveryDraft.fulfilmentNote.trim() || null,
+    };
+  };
+
+  const openOrderDetail = async (order: CommerceOrder) => {
+    setOrderDetail(order);
+    setOrderDeliveryDraft(draftFromOrder(order));
     if (!currentUserId) return;
-    let deliveryReference: string | undefined;
-    let fulfilmentNote: string | undefined;
-    if (state === 'dispatched') {
-      const referenceInput = window.prompt('Delivery reference (tracking / courier ref)');
-      if (referenceInput === null) return;
-      const trimmedRef = referenceInput.trim();
-      if (!trimmedRef) {
-        showToast('Delivery reference is required when marking dispatched');
-        return;
-      }
-      deliveryReference = trimmedRef;
-      const noteInput = window.prompt('Fulfilment note (optional)');
-      if (noteInput !== null && noteInput.trim()) {
-        fulfilmentNote = noteInput.trim();
-      }
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/api/orders/${encodeURIComponent(order.id)}/tracking?userId=${encodeURIComponent(currentUserId)}`,
+      );
+      const payload = await response.json().catch(() => ({})) as {
+        order?: CommerceOrder;
+        tracking?: OrderTrackingView;
+        error?: string;
+      };
+      if (!response.ok || !payload.order) return;
+      setOrderDetail(payload.order);
+      setOrderDeliveryDraft(draftFromOrder(payload.order));
+      setCommerceOrders((current) =>
+        current.map((entry) => (entry.id === payload.order!.id ? payload.order! : entry)),
+      );
+      setBuyerOrders((current) =>
+        current.map((entry) => (entry.id === payload.order!.id ? payload.order! : entry)),
+      );
+    } catch {
+      // keep local order snapshot
     }
+  };
+
+  const updateOrderState = async (
+    orderId: string,
+    state?: OrderState | null,
+    extras?: {
+      courier?: string | null;
+      trackingCode?: string | null;
+      deliveryReference?: string | null;
+      estimatedDelivery?: string | null;
+      fulfilmentNote?: string | null;
+    },
+  ) => {
+    if (!currentUserId) return;
+    const includeTracking = !state
+      || state === 'processing'
+      || state === 'dispatched'
+      || state === 'completed';
+    const trackingExtras = extras || (includeTracking ? fulfilmentExtrasFromDraft() : undefined);
     try {
       const response = await fetch(`${API_BASE_URL}/api/orders/${encodeURIComponent(orderId)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: currentUserId,
-          state,
-          ...(deliveryReference ? { deliveryReference } : {}),
-          ...(fulfilmentNote !== undefined ? { fulfilmentNote } : {}),
+          ...(state ? { state } : {}),
+          ...(trackingExtras || {}),
         }),
       });
       const payload = await response.json().catch(() => ({}));
@@ -5617,11 +5692,16 @@ function App() {
         setCommerceOrders((current) =>
           current.map((entry) => (entry.id === payload.order.id ? payload.order : entry)),
         );
+        setBuyerOrders((current) =>
+          current.map((entry) => (entry.id === payload.order.id ? payload.order : entry)),
+        );
+        setOrderDetail(payload.order);
+        setOrderDeliveryDraft(draftFromOrder(payload.order));
       }
       if (payload.receipt) {
         setSaleReceipts((current) => [payload.receipt, ...current.filter((entry) => entry.id !== payload.receipt.id)]);
       }
-      showToast(`Order marked ${state.replace(/_/g, ' ')}`);
+      showToast(state ? `Order marked ${state.replace(/_/g, ' ')}` : 'Tracking details saved');
     } catch {
       showToast('Could not update order');
     }
@@ -12614,8 +12694,14 @@ function App() {
                   <small>
                     {order.state.replace(/_/g, ' ')} · {moneyLabel(order.totalAmount, order.currency)}
                   </small>
+                  {(order.trackingCode || order.deliveryReference) ? (
+                    <small>Tracking: {order.trackingCode || order.deliveryReference}</small>
+                  ) : null}
                 </div>
                 <div className="business-product-actions">
+                  <button onClick={() => void openOrderDetail(order)} type="button">
+                    Tracking
+                  </button>
                   {order.state === 'pending_payment' ? (
                     <button disabled={payBusy} onClick={() => void payForCommerceOrder(order)} type="button">
                       Pay with Paystack
@@ -12624,6 +12710,36 @@ function App() {
                 </div>
               </div>
             ))}
+            {orderDetail && orderDetail.buyerUserId === currentUserId ? (
+              <div className="order-tracking-panel">
+                <div className="order-tracking-header">
+                  <h4>Order tracking · {orderDetail.items?.[0]?.title || orderDetail.id}</h4>
+                  <button onClick={() => setOrderDetail(null)} type="button">Close</button>
+                </div>
+                <p>
+                  Status: {orderDetail.state.replace(/_/g, ' ')} ·{' '}
+                  {moneyLabel(orderDetail.totalAmount, orderDetail.currency)}
+                </p>
+                {orderDetail.courier ? <p>Courier: {orderDetail.courier}</p> : null}
+                {(orderDetail.trackingCode || orderDetail.deliveryReference) ? (
+                  <p>Tracking code: {orderDetail.trackingCode || orderDetail.deliveryReference}</p>
+                ) : null}
+                {orderDetail.estimatedDelivery ? (
+                  <p>Estimated delivery: {String(orderDetail.estimatedDelivery).slice(0, 10)}</p>
+                ) : null}
+                {orderDetail.fulfilmentNote ? <p>Notes: {orderDetail.fulfilmentNote}</p> : null}
+                <h4>Fulfilment timeline</h4>
+                <ol className="order-timeline">
+                  {(orderDetail.history || []).slice().reverse().map((entry, index) => (
+                    <li key={`${entry.at}-${index}`} className={index === 0 ? 'active' : undefined}>
+                      <strong>{entry.state.replace(/_/g, ' ')}</strong>
+                      <span>{new Date(entry.at).toLocaleString()}</span>
+                      {entry.note ? <small>{entry.note}</small> : null}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            ) : null}
           </section>
         ) : null}
 
@@ -12696,6 +12812,9 @@ function App() {
                   <small>
                     {' '}
                     · Order · {order.state.replace(/_/g, ' ')} · {moneyLabel(order.totalAmount, order.currency)}
+                    {(order.trackingCode || order.deliveryReference)
+                      ? ` · Tracking ${order.trackingCode || order.deliveryReference}`
+                      : ''}
                   </small>
                 </span>
                 {order.state === 'pending_payment' ? (
@@ -12703,7 +12822,9 @@ function App() {
                     Pay
                   </button>
                 ) : (
-                  <strong>·</strong>
+                  <button onClick={() => { setPayPanel('orders'); void openOrderDetail(order); }} type="button">
+                    Track
+                  </button>
                 )}
               </div>
             ))}
@@ -13287,22 +13408,121 @@ function App() {
                     <small>
                       {(order.items || []).map((entry) => `${entry.title} ×${entry.quantity}`).join(', ')}
                     </small>
-                    {order.deliveryReference ? (
-                      <small>Delivery ref: {order.deliveryReference}</small>
+                    {order.courier ? <small>Courier: {order.courier}</small> : null}
+                    {(order.trackingCode || order.deliveryReference) ? (
+                      <small>Tracking: {order.trackingCode || order.deliveryReference}</small>
+                    ) : null}
+                    {order.estimatedDelivery ? (
+                      <small>ETA: {String(order.estimatedDelivery).slice(0, 10)}</small>
                     ) : null}
                     {order.fulfilmentNote ? (
                       <small>Fulfilment: {order.fulfilmentNote}</small>
                     ) : null}
                   </div>
                   <div className="business-product-actions">
+                    <button onClick={() => void openOrderDetail(order)} type="button">
+                      Tracking
+                    </button>
                     {sellerOrderActions(order).map(([state, label]) => (
-                      <button key={state} onClick={() => void updateOrderState(order.id, state)} type="button">
+                      <button
+                        key={state}
+                        onClick={() => {
+                          if (orderDetail?.id !== order.id) {
+                            setOrderDetail(order);
+                            setOrderDeliveryDraft(draftFromOrder(order));
+                          }
+                          void updateOrderState(order.id, state);
+                        }}
+                        type="button"
+                      >
                         {label}
                       </button>
                     ))}
                   </div>
                 </div>
               ))}
+              {orderDetail && orderDetail.sellerUserId === currentUserId ? (
+                <div className="order-tracking-panel">
+                  <div className="order-tracking-header">
+                    <h4>Fulfilment · {orderDetail.items?.[0]?.title || orderDetail.id}</h4>
+                    <button onClick={() => setOrderDetail(null)} type="button">Close</button>
+                  </div>
+                  <p>Status: {orderDetail.state.replace(/_/g, ' ')}</p>
+                  {['paid', 'processing', 'dispatched'].includes(orderDetail.state) ? (
+                    <div className="order-tracking-form">
+                      <label>
+                        Courier
+                        <input
+                          value={orderDeliveryDraft.courier}
+                          onChange={(event) => setOrderDeliveryDraft((current) => ({
+                            ...current,
+                            courier: event.target.value,
+                          }))}
+                          placeholder="Courier / carrier name"
+                        />
+                      </label>
+                      <label>
+                        Tracking code
+                        <input
+                          value={orderDeliveryDraft.trackingCode}
+                          onChange={(event) => setOrderDeliveryDraft((current) => ({
+                            ...current,
+                            trackingCode: event.target.value,
+                          }))}
+                          placeholder="Tracking code"
+                        />
+                      </label>
+                      <label>
+                        Estimated delivery
+                        <input
+                          type="date"
+                          value={orderDeliveryDraft.estimatedDelivery}
+                          onChange={(event) => setOrderDeliveryDraft((current) => ({
+                            ...current,
+                            estimatedDelivery: event.target.value,
+                          }))}
+                        />
+                      </label>
+                      <label>
+                        Fulfilment notes
+                        <textarea
+                          value={orderDeliveryDraft.fulfilmentNote}
+                          onChange={(event) => setOrderDeliveryDraft((current) => ({
+                            ...current,
+                            fulfilmentNote: event.target.value,
+                          }))}
+                          placeholder="Optional notes for the buyer"
+                          rows={3}
+                        />
+                      </label>
+                      <div className="business-product-actions">
+                        <button onClick={() => void updateOrderState(orderDetail.id, null)} type="button">
+                          Save tracking
+                        </button>
+                        {sellerOrderActions(orderDetail).map(([state, label]) => (
+                          <button
+                            key={`detail-${state}`}
+                            onClick={() => void updateOrderState(orderDetail.id, state)}
+                            type="button"
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <h4>Fulfilment timeline</h4>
+                  <ol className="order-timeline">
+                    {(orderDetail.history || []).slice().reverse().map((entry, index) => (
+                      <li key={`${entry.at}-${index}`} className={index === 0 ? 'active' : undefined}>
+                        <strong>{entry.state.replace(/_/g, ' ')}</strong>
+                        <span>{new Date(entry.at).toLocaleString()}</span>
+                        {entry.note ? <small>{entry.note}</small> : null}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -13539,7 +13759,13 @@ function App() {
                       {order.itemTitle || order.id} · {order.state.replace(/_/g, ' ')} ·{' '}
                       {moneyLabel(order.totalAmount, order.currency)} ·{' '}
                       {new Date(order.createdAt).toLocaleDateString()}
-                      {order.deliveryReference ? ` · Ref ${order.deliveryReference}` : ''}
+                      {order.courier ? ` · ${order.courier}` : ''}
+                      {(order.trackingCode || order.deliveryReference)
+                        ? ` · Tracking ${order.trackingCode || order.deliveryReference}`
+                        : ''}
+                      {order.estimatedDelivery
+                        ? ` · ETA ${String(order.estimatedDelivery).slice(0, 10)}`
+                        : ''}
                       {order.fulfilmentNote ? ` · ${order.fulfilmentNote}` : ''}
                     </p>
                   ))}

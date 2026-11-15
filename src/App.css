@@ -1843,6 +1843,75 @@
   justify-content: flex-end;
 }
 
+.order-tracking-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid #1d2634;
+  background: #111822;
+}
+
+.order-tracking-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.order-tracking-header h4,
+.order-tracking-panel h4 {
+  margin: 0;
+}
+
+.order-tracking-form {
+  display: grid;
+  gap: 10px;
+}
+
+.order-tracking-form label {
+  display: grid;
+  gap: 6px;
+  color: #acb3b9;
+  font-size: 0.85rem;
+}
+
+.order-tracking-form input,
+.order-tracking-form textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid #1d2634;
+  background: #0d121a;
+  color: #edf4ff;
+  font: inherit;
+}
+
+.order-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.order-timeline li {
+  display: grid;
+  gap: 2px;
+  padding-left: 12px;
+  border-left: 2px solid #2a3642;
+}
+
+.order-timeline li.active {
+  border-left-color: #3b82f6;
+}
+
+.order-timeline li span,
+.order-timeline li small {
+  color: #acb3b9;
+}
+
 .business-product-actions button {
   padding: 8px 12px;
   border-radius: 10px;
