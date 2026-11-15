@@ -57,6 +57,12 @@ import {
   type AutomationsDeps,
 } from './automationsApi.js';
 import {
+  awardLoyaltyForCompletedOrder,
+  registerLoyaltyApi,
+  reverseLoyaltyForRefundedOrder,
+  type LoyaltyDeps,
+} from './loyaltyApi.js';
+import {
   hasOpenAi,
   openaiChat,
   openaiMeetingAssist,
@@ -1791,6 +1797,7 @@ let communitiesDeps: CommunitiesDeps;
 let voiceRoomsDeps: VoiceRoomsDeps;
 let gamesDeps: GamesDeps;
 let automationsDeps: AutomationsDeps | null = null;
+let loyaltyDeps: LoyaltyDeps | null = null;
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -6874,6 +6881,13 @@ app.patch('/api/orders/:orderId', async (req, res) => {
     await saveOrder(finalOrder);
   }
   void ensureCustomerFromOrder(finalOrder);
+  if (loyaltyDeps) {
+    if (finalOrder.state === 'completed' && order.state !== 'completed') {
+      void awardLoyaltyForCompletedOrder(loyaltyDeps, finalOrder).catch(() => undefined);
+    } else if (finalOrder.state === 'refunded' && order.state !== 'refunded') {
+      void reverseLoyaltyForRefundedOrder(loyaltyDeps, finalOrder).catch(() => undefined);
+    }
+  }
   io.to(`user:${finalOrder.sellerUserId}`).emit('order:updated', { order: finalOrder });
   io.to(`user:${finalOrder.buyerUserId}`).emit('order:updated', { order: finalOrder });
   return res.json({ order: finalOrder, tracking: orderTrackingView(finalOrder), receipt: issuedReceipt });
@@ -12539,6 +12553,23 @@ automationsDeps = {
   },
 };
 registerAutomationsApi(app, automationsDeps);
+
+loyaltyDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  resolveUserName: async (userId) => {
+    const users = await readUsers();
+    return users.find((user) => user.id === userId)?.name || null;
+  },
+  canManageBusiness: async (userId, businessId) => {
+    if (!businessId) return true;
+    const business = (await readBusinesses()).find((entry) => entry.id === businessId);
+    if (!business) return false;
+    return Boolean(businessRoleFor(business, userId));
+  },
+};
+registerLoyaltyApi(app, loyaltyDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
