@@ -52,6 +52,11 @@ import {
   type CardsDeps,
 } from './cardsApi.js';
 import {
+  evaluateAutomations,
+  registerAutomationsApi,
+  type AutomationsDeps,
+} from './automationsApi.js';
+import {
   hasOpenAi,
   openaiChat,
   openaiMeetingAssist,
@@ -1785,6 +1790,7 @@ const server = http.createServer(app);
 let communitiesDeps: CommunitiesDeps;
 let voiceRoomsDeps: VoiceRoomsDeps;
 let gamesDeps: GamesDeps;
+let automationsDeps: AutomationsDeps | null = null;
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -4405,6 +4411,20 @@ const maybeCreateLowStockAlert = async (item: CatalogItem) => {
   };
   await saveInventoryAlert(alert);
   io.to(`user:${item.sellerId}`).emit('inventory:alert', alert);
+  if (automationsDeps) {
+    void evaluateAutomations(automationsDeps, {
+      ownerUserId: item.sellerId,
+      businessId: item.businessId || null,
+      trigger: 'low_stock',
+      catalogItemId: item.id,
+      contextSummary: `Low stock: ${item.title} (${item.stockQuantity} ≤ ${threshold})`,
+      templateVars: {
+        title: item.title,
+        stock: String(item.stockQuantity ?? 0),
+        threshold: String(threshold),
+      },
+    });
+  }
   return alert;
 };
 
@@ -6643,6 +6663,22 @@ app.post('/api/orders', async (req, res) => {
   void ensureCustomerFromOrder(order);
   io.to(`user:${order.sellerUserId}`).emit('order:created', { order });
   io.to(`user:${order.buyerUserId}`).emit('order:created', { order });
+  if (automationsDeps) {
+    void evaluateAutomations(automationsDeps, {
+      ownerUserId: order.sellerUserId,
+      businessId: order.businessId || null,
+      trigger: 'new_order',
+      orderId: order.id,
+      chatId: order.chatId || null,
+      customerUserId: order.buyerUserId,
+      contextSummary: `New order ${order.id}: ${item.title} × ${quantity}`,
+      templateVars: {
+        title: item.title,
+        amount: String(order.totalAmount),
+        currency: order.currency || '',
+      },
+    });
+  }
   void recordAdminEvent(getDb, {
     level: 'info',
     area: 'orders',
@@ -9995,6 +10031,25 @@ app.post('/api/payments/verify', async (req, res) => {
         [...new Set([paymentRequest.creatorUserId, ...paymentRequest.shares.map((s) => s.userId)])].forEach((uid) => {
           io.to(`user:${uid}`).emit('payment:request', { request: paymentRequest });
         });
+        if (
+          automationsDeps
+          && paymentRequest.status === 'paid'
+          && existing.status !== 'paid'
+        ) {
+          void evaluateAutomations(automationsDeps, {
+            ownerUserId: paymentRequest.creatorUserId || paymentRequest.recipientUserId,
+            trigger: 'payment_request_paid',
+            paymentRequestId: paymentRequest.id,
+            chatId: paymentRequest.chatId || null,
+            customerUserId: payerId || null,
+            contextSummary: `Payment request paid: ${paymentRequest.amount} ${paymentRequest.currency}`,
+            templateVars: {
+              amount: String(paymentRequest.amount),
+              currency: paymentRequest.currency || '',
+              note: paymentRequest.note || '',
+            },
+          });
+        }
       }
     }
 
@@ -11429,6 +11484,41 @@ app.post('/api/messages', async (req, res) => {
     }
   }
 
+  // I5 workflow rules — draft_only for message actions (never auto-send).
+  if (
+    automationsDeps
+    && !payload.anonymous
+    && !message.automated
+    && chat.kind === 'direct'
+  ) {
+    const peerId = chat.participants.find((id) => id !== payload.senderId);
+    if (peerId) {
+      try {
+        const businesses = await businessesForUser(peerId);
+        const ownedBusiness = businesses.find((business) => business.ownerUserId === peerId)
+          || businesses[0]
+          || null;
+        const senderName = senderUser?.name || 'Customer';
+        void evaluateAutomations(automationsDeps, {
+          ownerUserId: peerId,
+          businessId: ownedBusiness?.id || null,
+          trigger: 'new_message',
+          chatId: chat.id,
+          messageId: message.id,
+          customerUserId: payload.senderId,
+          customerDisplayName: senderName,
+          contextSummary: (message.text || 'New message').slice(0, 200),
+          templateVars: {
+            name: senderName,
+            text: (message.text || '').slice(0, 500),
+          },
+        });
+      } catch {
+        // Never fail sends because workflow automation failed.
+      }
+    }
+  }
+
   let scamWarning: ReturnType<typeof scanScamSignals> | null = null;
   if (!payload.anonymous && message.kind === 'text' && message.text) {
     scamWarning = scanScamSignals(message.text);
@@ -12363,6 +12453,92 @@ const cardsDeps: CardsDeps = {
     })),
 };
 registerCardsApi(app, cardsDeps);
+
+automationsDeps = {
+  getDb,
+  io,
+  resolveRequestUserId,
+  notifyOfflineUser,
+  findCustomer: async ({ sellerUserId, customerUserId, chatId, businessId }) => {
+    const customers = await readBusinessCustomers();
+    const active = customers.filter(
+      (entry) => entry.sellerUserId === sellerUserId && !entry.deletedAt,
+    );
+    if (customerUserId) {
+      const byUser = active.find(
+        (entry) =>
+          entry.customerUserId === customerUserId
+          && (!businessId || !entry.businessId || entry.businessId === businessId),
+      );
+      if (byUser) return byUser;
+    }
+    if (chatId) {
+      const byChat = active.find((entry) => entry.chatId === chatId);
+      if (byChat) return byChat;
+    }
+    return findMatchingCustomer(customers, {
+      sellerUserId,
+      customerUserId,
+      businessId,
+    });
+  },
+  saveCustomer: async (customer) => {
+    const saved = await saveBusinessCustomer(customer as BusinessCustomer);
+    io.to(`user:${saved.sellerUserId}`).emit('customer:updated', {
+      customer: customerPublicView(saved),
+    });
+    return saved;
+  },
+  ensureCustomer: async ({ sellerUserId, customerUserId, chatId, businessId, displayName }) => {
+    const customers = await readBusinessCustomers();
+    const existing = findMatchingCustomer(customers, {
+      sellerUserId,
+      customerUserId,
+      businessId,
+    }) || (chatId
+      ? customers.find(
+        (entry) => entry.sellerUserId === sellerUserId && entry.chatId === chatId && !entry.deletedAt,
+      )
+      : null);
+    if (existing) {
+      if (chatId && !existing.chatId) {
+        const next = { ...existing, chatId, updatedAt: new Date().toISOString() };
+        return saveBusinessCustomer(next);
+      }
+      return existing;
+    }
+    if (!customerUserId && !displayName) return null;
+    const stamp = new Date().toISOString();
+    const users = await readUsers();
+    const buyer = customerUserId ? users.find((user) => user.id === customerUserId) : null;
+    const created: BusinessCustomer = {
+      id: `cust${Date.now()}`,
+      sellerUserId,
+      businessId: businessId || null,
+      customerUserId: customerUserId || null,
+      displayName: displayName || buyer?.name || 'Customer',
+      phone: buyer?.phone || '',
+      tags: [],
+      notes: [],
+      followUpAt: null,
+      followUpNote: '',
+      marketingConsent: 'unknown',
+      marketingConsentUpdatedAt: null,
+      orderIds: [],
+      lastOrderAt: null,
+      orderCount: 0,
+      totalSpent: 0,
+      chatId: chatId || null,
+      deletedAt: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    await saveBusinessCustomer(created);
+    io.to(`user:${sellerUserId}`).emit('customer:updated', { customer: customerPublicView(created) });
+    return created;
+  },
+};
+registerAutomationsApi(app, automationsDeps);
 
 const startServer = () => {
   // Cloud Run fails the revision if the process does not listen on PORT quickly.
