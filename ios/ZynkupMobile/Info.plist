@@ -28,6 +28,7 @@
         <key>CFBundleURLSchemes</key>
         <array>
           <string>com.prynova.zynkup</string>
+          <string>zynkup</string>
         </array>
       </dict>
     </array>

@@ -15,6 +15,7 @@ import {
   Animated,
   Easing,
   Image,
+  ImageBackground,
   Linking,
   Modal,
   PermissionsAndroid,
@@ -39,6 +40,13 @@ import {
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { io } from 'socket.io-client';
 import { firebaseAuth, firebaseConfigReady, nativeFirebaseReady } from './firebaseConfig';
+
+const brandSplashLogo = require('./assets/brand/splash-logo.png');
+const brandSplashCity = require('./assets/brand/splash-start.jpg');
+const brandMark = require('./assets/brand/logo-mark.png');
+const brandWordmark = require('./assets/brand/wordmark.png');
+const brandLockup = require('./assets/brand/logo-lockup.png');
+const brandGradient = require('./assets/brand/button-gradient.png');
 
 const loadOptionalModule = (request) => {
   try {
@@ -161,6 +169,7 @@ const DEFAULT_APP_SETTINGS = {
   groupInvitePrivacy: 'everyone',
   readReceiptsEnabled: true,
   appLockEnabled: false,
+  pinDisabled: false,
 };
 const SETTINGS_MENU = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top', icon: '★' },
@@ -755,6 +764,13 @@ function AppContent() {
     accountType: '',
     photoUri: '',
   });
+  const [authSecretVisible, setAuthSecretVisible] = useState(false);
+  const [startContinued, setStartContinued] = useState(false);
+  const [startStep, setStartStep] = useState('splash');
+  useEffect(() => {
+    const timer = setTimeout(() => setStartStep('city'), 1400);
+    return () => clearTimeout(timer);
+  }, []);
   const phoneAuthConfirmationRef = useRef(null);
   const phoneAuthIdTokenRef = useRef('');
   const phoneAuthChallengeIdRef = useRef('');
@@ -1466,11 +1482,11 @@ function AppContent() {
           photoUri: payload.profile.photoUri ?? current.photoUri,
         }));
       }
-      if (pinToSave.length === 4) {
+      if (/^\d{4,6}$/.test(pinToSave)) {
         setAppLockPin(pinToSave);
         await AsyncStorage.setItem(APP_LOCK_PIN_KEY, pinToSave).catch(() => undefined);
       }
-      if (nextSettings.appLockEnabled === false) {
+      if (nextSettings.appLockEnabled === false || nextSettings.pinDisabled) {
         setAppLockPin('');
         setAppUnlocked(true);
         await AsyncStorage.removeItem(APP_LOCK_PIN_KEY).catch(() => undefined);
@@ -1641,8 +1657,14 @@ function AppContent() {
       pin: '',
       otp: '',
     }));
-    setAuthMode(phone ? 'pin' : 'phone');
-    showToast(phone ? 'Enter your PIN to open this account.' : 'Enter your phone number.', 'info', 2800);
+    setAuthMode(phone && !appSettingsRef.current.pinDisabled ? 'pin' : (phone ? 'phone' : 'phone'));
+    showToast(
+      phone && !appSettingsRef.current.pinDisabled
+        ? 'Enter your PIN to open this account.'
+        : 'Enter your phone number.',
+      'info',
+      2800,
+    );
   };
 
   const resetAuthForm = () => {
@@ -1829,6 +1851,96 @@ function AppContent() {
     }
   };
 
+  const signInFromWelcome = async () => {
+    if (isAuthBusy) {
+      return;
+    }
+    if (!authForm.countryCode.trim()) {
+      showToast('Select your country code first.', 'error');
+      setCountryPickerVisible(true);
+      return;
+    }
+    const countryCode = authForm.countryCode.trim();
+    const phoneNumber = authForm.phone.trim();
+    const normalizedPhone = normalizeAuthPhone(countryCode, phoneNumber);
+    if (normalizedPhone.length < 8) {
+      showToast('Enter a valid phone number first.', 'error');
+      return;
+    }
+    if (!isValidAuthPin(authForm.pin)) {
+      showToast('Enter your 4–6 digit PIN.', 'error');
+      return;
+    }
+    const pin = authForm.pin.trim();
+    setAuthPendingAction('lookup');
+    showToast('Signing you in...', 'info', 0);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/auth/phone/lookup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          countryCode,
+          phoneNumber,
+          deviceId: currentDeviceId || (await AsyncStorage.getItem(DEVICE_STORAGE_KEY)) || undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showToast(getBackendErrorMessage(payload, 'Could not check this phone number.'), 'error');
+        return;
+      }
+      const verifiedPhone = payload.phone || normalizedPhone;
+      setAuthForm((current) => ({
+        ...current,
+        verifiedPhone,
+        pin,
+        otp: '',
+      }));
+      if (payload.registered && payload.hasPin && payload.otpRequired) {
+        forgotPinFlowRef.current = false;
+        showToast('This install is new. Confirm the SMS code, then enter your PIN.', 'info', 4200);
+        setAuthPendingAction('send-code');
+        await deliverPhoneOtp(countryCode, phoneNumber, verifiedPhone);
+        return;
+      }
+      if (!(payload.registered && payload.hasPin)) {
+        showToast('No account on this number yet. Create one to join.', 'info', 3200);
+        setAuthMode('phone');
+        return;
+      }
+      setAuthPendingAction('pin-login');
+      const loginResponse = await fetch(`${API_BASE_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...authDevicePayload(),
+          countryCode,
+          phoneNumber,
+          phone: verifiedPhone,
+          pin,
+          platform: Platform.OS,
+          label: `${Platform.OS} device`,
+        }),
+      });
+      const loginPayload = await loginResponse.json().catch(() => ({}));
+      if (loginPayload.code === 'OTP_REQUIRED') {
+        showToast('Confirm the SMS code for this number, then enter your PIN again.', 'info', 4200);
+        setAuthPendingAction('send-code');
+        await deliverPhoneOtp(countryCode, phoneNumber, verifiedPhone);
+        return;
+      }
+      if (!loginResponse.ok) {
+        showToast(getBackendErrorMessage(loginPayload, 'Incorrect PIN.'), 'error');
+        return;
+      }
+      await finishAuthenticatedSession(loginPayload, pin);
+    } catch (error) {
+      reportOtpFailure(error);
+    } finally {
+      setAuthPendingAction('');
+    }
+  };
+
   const resetPinAfterOtp = async () => {
     if (isAuthBusy) {
       return;
@@ -1976,23 +2088,28 @@ function AppContent() {
         if (wantsVideo) {
           permissions.push(PermissionsAndroid.PERMISSIONS.CAMERA);
         }
+        const blocked = [];
         for (const permission of permissions) {
-          const alreadyGranted = await PermissionsAndroid.check(permission);
-          if (alreadyGranted) continue;
-          const result = await PermissionsAndroid.request(permission);
-          if (result === PermissionsAndroid.RESULTS.GRANTED) continue;
-          if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
-            Alert.alert(
-              permission === PermissionsAndroid.PERMISSIONS.CAMERA ? 'Camera is blocked' : 'Microphone is blocked',
-              'ZynkUp already asked for this permission. Open phone settings and allow it, then come back to the call.',
-              [
-                { text: 'Not now', style: 'cancel' },
-                { text: 'Open settings', onPress: () => Linking.openSettings() },
-              ],
-            );
-            throw new Error('permission-denied');
+          let granted = await PermissionsAndroid.check(permission);
+          if (!granted) {
+            const result = await PermissionsAndroid.request(permission);
+            granted = result === PermissionsAndroid.RESULTS.GRANTED;
           }
+          if (!granted) blocked.push(permission);
         }
+        if (blocked.length) {
+          const cameraBlocked = blocked.includes(PermissionsAndroid.PERMISSIONS.CAMERA);
+          Alert.alert(
+            cameraBlocked ? 'Camera is blocked' : 'Microphone is blocked',
+            'Allow the camera and microphone for ZynkUp, then open the video call again.',
+            [
+              { text: 'Not now', style: 'cancel' },
+              { text: 'Open settings', onPress: () => Linking.openSettings() },
+            ],
+          );
+          throw new Error('permission-denied');
+        }
+        if (wantsVideo) setCameraPermissionGranted(true);
       }
 
       const existing = callMediaStreamRef.current;
@@ -2017,36 +2134,73 @@ function AppContent() {
         }
         const videoTrack = videoOnly.getVideoTracks?.()?.[0];
         if (!videoTrack) throw new Error('camera-failed');
+        videoTrack.enabled = true;
         existing.addTrack(videoTrack);
+        const connection = peerConnectionRef.current;
+        if (connection) {
+          const sender = connection.getSenders?.().find((item) => item.track?.kind === 'video');
+          if (sender?.replaceTrack) {
+            sender.replaceTrack(videoTrack).catch(() => undefined);
+          } else {
+            try {
+              connection.addTrack(videoTrack, existing);
+            } catch {
+              // Already attached.
+            }
+          }
+        }
         callMediaStreamRef.current = existing;
-        setLocalCallStream(existing);
+        const PreviewStream = webRtcModule?.MediaStream;
+        setLocalCallStream(PreviewStream ? new PreviewStream(existing.getTracks()) : existing);
         return existing;
       }
       existing?.getTracks?.().forEach((track) => track.stop());
 
+      const videoAttempts = wantsVideo
+        ? [
+          { audio: true, video: true },
+          { audio: true, video: { facingMode: 'user' } },
+          { audio: true, video: { facingMode: 'user', width: 640, height: 480 } },
+        ]
+        : [{ audio: true, video: false }];
       let stream;
-      try {
-        stream = await mediaDevices.getUserMedia({
-          audio: true,
-          video: wantsVideo ? { facingMode: 'user', width: 640, height: 480 } : false,
-        });
-      } catch (mediaError) {
-        if (!wantsVideo) {
-          const reason = `${mediaError?.name || ''} ${mediaError?.message || ''}`;
-          throw new Error(/permission|NotAllowed|Security/i.test(reason) ? 'permission-denied' : 'camera-failed');
-        }
+      let lastError;
+      for (const constraints of videoAttempts) {
         try {
-          stream = await mediaDevices.getUserMedia({ audio: true, video: true });
-        } catch (fallbackError) {
-          const reason = `${mediaError?.name || ''} ${fallbackError?.name || ''} ${fallbackError?.message || ''}`;
-          throw new Error(/permission|NotAllowed|Security/i.test(reason) ? 'permission-denied' : 'camera-failed');
+          stream = await mediaDevices.getUserMedia(constraints);
+          break;
+        } catch (mediaError) {
+          lastError = mediaError;
         }
+      }
+      if (!stream) {
+        const reason = `${lastError?.name || ''} ${lastError?.message || ''}`;
+        throw new Error(/permission|NotAllowed|Security/i.test(reason) ? 'permission-denied' : 'camera-failed');
       }
       stream.getAudioTracks?.().forEach((track) => {
         track.enabled = true;
       });
+      stream.getVideoTracks?.().forEach((track) => {
+        track.enabled = true;
+      });
+      const connection = peerConnectionRef.current;
+      if (connection) {
+        stream.getTracks().forEach((track) => {
+          const sender = connection.getSenders?.().find((item) => item.track?.kind === track.kind);
+          if (sender?.replaceTrack) {
+            sender.replaceTrack(track).catch(() => undefined);
+          } else {
+            try {
+              connection.addTrack(track, stream);
+            } catch {
+              // Track is already on this connection.
+            }
+          }
+        });
+      }
       callMediaStreamRef.current = stream;
-      setLocalCallStream(stream);
+      const PreviewStream = webRtcModule?.MediaStream;
+      setLocalCallStream(PreviewStream ? new PreviewStream(stream.getTracks()) : stream);
       return stream;
     });
     mediaQueueRef.current = job.then(() => undefined, () => undefined);
@@ -2089,14 +2243,37 @@ function AppContent() {
   };
 
   const setCallVideoEnabled = (enabled) => {
-    setCallCameraOff(!enabled);
-    localCallStream?.getVideoTracks?.()?.forEach((track) => {
-      track.enabled = enabled;
-    });
-    const call = activeCallRef.current;
-    if (call) {
-      emitCallSignal(call.id, 'camera', { enabled }, call.peerUserId);
+    if (!enabled) {
+      setCallCameraOff(true);
+      localCallStream?.getVideoTracks?.()?.forEach((track) => {
+        track.enabled = false;
+      });
+      const call = activeCallRef.current;
+      if (call) {
+        emitCallSignal(call.id, 'camera', { enabled: false }, call.peerUserId);
+      }
+      return;
     }
+    void ensureCallMedia('Video').then((stream) => {
+      const tracks = stream?.getVideoTracks?.() || [];
+      if (!tracks.length) {
+        throw new Error('camera-failed');
+      }
+      tracks.forEach((track) => {
+        track.enabled = true;
+      });
+      setCallCameraOff(false);
+      setCallError('');
+      const call = activeCallRef.current;
+      if (call) {
+        emitCallSignal(call.id, 'camera', { enabled: true }, call.peerUserId);
+      }
+    }).catch((error) => {
+      setCallCameraOff(true);
+      setCallError(error?.message === 'permission-denied'
+        ? 'Camera permission was denied. Allow the camera, then tap Camera again.'
+        : 'The camera did not open. Tap Camera to try again.');
+    });
   };
 
   const setCallSpeaker = (enabled) => {
@@ -2553,9 +2730,13 @@ function AppContent() {
     );
   };
 
+  const revealApp = () => {
+    setBootstrapReady(true);
+  };
+
   const applyBootstrapPayload = (payload, options = {}) => {
     const nextCurrentUserId = payload.currentUserId ?? '';
-    setBootstrapReady(true);
+    revealApp();
     setAuthRequired(Boolean(payload.authRequired));
     setAuthVisible(Boolean(payload.authRequired) && !nextCurrentUserId);
     const nextUsersById = Object.fromEntries((payload.users ?? []).map((user) => [user.id, user]));
@@ -2920,7 +3101,14 @@ function AppContent() {
     const bootstrapSession = async () => {
       const storedDeviceId = await AsyncStorage.getItem(DEVICE_STORAGE_KEY);
       const account = await readRememberedAccount();
-      if (account?.userId && account?.phone) {
+      const settingsRaw = await AsyncStorage.getItem(SETTINGS_STORAGE_KEY).catch(() => null);
+      let skipPin = false;
+      try {
+        skipPin = Boolean(JSON.parse(settingsRaw || '{}').pinDisabled);
+      } catch {
+        skipPin = false;
+      }
+      if (account?.userId && account?.phone && !skipPin) {
         const parts = splitStoredPhone(account.phone);
         pinHoldingRef.current = true;
         currentUserIdRef.current = account.userId;
@@ -2937,7 +3125,7 @@ function AppContent() {
           setAuthMode('pin');
           setAuthRequired(true);
           setAuthVisible(true);
-          setBootstrapReady(true);
+          revealApp();
         }
       }
       try {
@@ -2978,7 +3166,7 @@ function AppContent() {
           }
         } catch {
           if (!cancelled) {
-            setBootstrapReady(true);
+            revealApp();
           }
         }
       }
@@ -3605,7 +3793,7 @@ function AppContent() {
             setDismissedCards(parsed);
           }
         }
-        if (nextSettings.appLockEnabled && storedPin && /^\d{4,6}$/.test(storedPin)) {
+        if (!nextSettings.pinDisabled && nextSettings.appLockEnabled && storedPin && /^\d{4,6}$/.test(storedPin)) {
           setAppUnlocked(false);
         }
       } catch {
@@ -3945,9 +4133,19 @@ function AppContent() {
     if (!call || phoneLocked || (call.state !== 'ringing' && call.state !== 'ongoing')) {
       return undefined;
     }
-    void ensureCallMedia(call.kind).catch(() => {
-      if (call.state === 'ongoing') {
-        setCallError('Camera or microphone permission was denied.');
+    void ensureCallMedia(call.kind).then(() => {
+      if (String(call.kind).toLowerCase() === 'video') {
+        setCallCameraOff(false);
+        setCallError('');
+      }
+    }).catch((error) => {
+      if (String(call.kind).toLowerCase() === 'video') {
+        setCallCameraOff(true);
+      }
+      if (String(call.kind).toLowerCase() === 'video' || call.state === 'ongoing') {
+        setCallError(error?.message === 'permission-denied'
+          ? 'Camera or microphone permission was denied. Allow them in phone settings.'
+          : 'The camera did not start. Tap Camera to try again.');
       }
     });
     return undefined;
@@ -8933,9 +9131,7 @@ function AppContent() {
       <View style={styles.lightScreen}>
         <View style={styles.lightHeader}>
           <View>
-            <Text style={styles.appWordmark}>
-              Zynk<Text style={styles.appWordmarkAccent}>Up</Text>
-            </Text>
+            <Image source={brandLockup} style={styles.brandHeaderLockup} resizeMode="contain" />
             <Pressable onPress={() => setIdentitySheetVisible(true)}>
               <Text style={styles.identityChipText}>{identityLabel}</Text>
             </Pressable>
@@ -9149,9 +9345,7 @@ function AppContent() {
   const renderPay = () => (
     <View style={styles.lightScreen}>
       <View style={styles.lightHeader}>
-        <Text style={styles.payWordmark}>
-          Zynk<Text style={styles.appWordmarkAccent}>Up</Text> Pay
-        </Text>
+        <Image source={brandLockup} style={styles.brandHeaderLockup} resizeMode="contain" />
         <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
           <Text style={styles.lightHeaderActionText}>◔</Text>
         </Pressable>
@@ -9859,10 +10053,22 @@ function AppContent() {
           />
           <Text style={styles.settingsSectionCaption}>Security</Text>
           {renderSettingsToggle(
-            'App lock',
-            appSettings.appLockEnabled,
-            (value) => updateAppSetting('appLockEnabled', value, { syncProfile: true }),
-            'Require PIN when opening ZynkUp. The same PIN unlocks a locked chat. It does not stop screenshots.',
+            'Use a PIN',
+            !appSettings.pinDisabled,
+            (value) => {
+              updateAppSetting('pinDisabled', !value);
+              updateAppSetting('appLockEnabled', value, { syncProfile: true });
+              if (!value) {
+                pinHoldingRef.current = false;
+                setAppUnlocked(true);
+                setAppLockPin('');
+                AsyncStorage.removeItem(APP_LOCK_PIN_KEY).catch(() => undefined);
+                showToast('PIN is off. This phone opens ZynkUp without asking.', 'success', 2600);
+              } else {
+                showToast('PIN is on. Set a 4–6 digit PIN below, then save.', 'info', 2600);
+              }
+            },
+            'Turn this off if you do not want a PIN when you open ZynkUp. Your account stays on this phone.',
           )}
           <TextInput
             value={accountPinDraft}
@@ -9877,8 +10083,8 @@ function AppContent() {
           <Pressable
             style={styles.sendButtonWide}
             onPress={() => {
-              if (appSettings.appLockEnabled && !/^\d{4,6}$/.test(accountPinDraft.trim()) && !appLockPin) {
-                showToast('Enter a 4–6 digit PIN to enable app lock.', 'error');
+              if (!appSettings.pinDisabled && !/^\d{4,6}$/.test(accountPinDraft.trim()) && !appLockPin) {
+                showToast('Enter a 4–6 digit PIN, or turn Use a PIN off.', 'error');
                 return;
               }
               void saveProfileToServer(
@@ -10312,6 +10518,18 @@ function AppContent() {
     );
   };
 
+  const renderBrandButton = (label, onPress, disabled = false) => (
+    <Pressable
+      style={[styles.brandButton, disabled ? styles.brandButtonDisabled : null]}
+      disabled={disabled}
+      onPress={onPress}
+    >
+      <ImageBackground source={brandGradient} style={styles.brandButtonFill} imageStyle={styles.brandButtonImage}>
+        <Text style={styles.brandButtonText}>{label}</Text>
+      </ImageBackground>
+    </Pressable>
+  );
+
   const renderAuthGate = (dismissible = false) => {
     const authContainerStyle = authMode === 'welcome' ? styles.authWelcomeScreen : styles.authFlowScreen;
     const authContentStyle = authMode === 'welcome' ? styles.authWelcomeCard : styles.authFlowCard;
@@ -10319,25 +10537,14 @@ function AppContent() {
       if (authMode === 'welcome') {
         return (
           <View style={styles.authWelcomeFooter}>
-            <Pressable
-              style={styles.authPrimaryButton}
-              onPress={() => {
-                setAuthMode('phone');
-              }}
-            >
-              <Text style={styles.authPrimaryButtonText}>Get started - it's free</Text>
-            </Pressable>
-            <Pressable
-              style={styles.authSecondaryButton}
-              onPress={() => {
-                setAuthMode('phone');
-              }}
-            >
-              <Text style={styles.authSecondaryButtonText}>I already have an account</Text>
-            </Pressable>
-            <Text style={styles.authLegalText}>
-              By continuing you agree to our <Text style={styles.authLegalLink}>Terms of Service</Text> &amp;{'\n'}
-              <Text style={styles.authLegalLink}>Privacy Policy</Text>
+            {renderBrandButton(
+              authPendingAction === 'lookup' || authPendingAction === 'pin-login' ? 'Please wait...' : 'Log In  →',
+              () => void signInFromWelcome(),
+              isAuthBusy,
+            )}
+            <Text style={styles.authSwitchRow}>
+              New to ZynkUP?{' '}
+              <Text style={styles.authSwitchLink} onPress={() => setAuthMode('phone')}>Create Account</Text>
             </Text>
           </View>
         );
@@ -10346,15 +10553,11 @@ function AppContent() {
       if (authMode === 'phone') {
         return (
           <View style={styles.authStepFooter}>
-            <Pressable
-              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
-              disabled={isAuthBusy}
-              onPress={() => void continueWithPhone()}
-            >
-              <Text style={styles.authDarkButtonText}>
-                {authPendingAction === 'lookup' || authPendingAction === 'send-code' ? 'Please wait...' : 'Continue'}
-              </Text>
-            </Pressable>
+            {renderBrandButton(
+              authPendingAction === 'lookup' || authPendingAction === 'send-code' ? 'Please wait...' : 'Continue  →',
+              () => void continueWithPhone(),
+              isAuthBusy,
+            )}
             {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
           </View>
         );
@@ -10363,13 +10566,11 @@ function AppContent() {
       if (authMode === 'pin') {
         return (
           <View style={styles.authStepFooter}>
-            <Pressable
-              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
-              disabled={isAuthBusy}
-              onPress={() => void loginWithPin()}
-            >
-              <Text style={styles.authDarkButtonText}>{authPendingAction === 'pin-login' ? 'Signing in...' : 'Sign in'}</Text>
-            </Pressable>
+            {renderBrandButton(
+              authPendingAction === 'pin-login' ? 'Signing in...' : 'Log In  →',
+              () => void loginWithPin(),
+              isAuthBusy,
+            )}
             <Pressable disabled={isAuthBusy} onPress={() => void startForgotPinAuth()} style={{ marginTop: 12 }}>
               <Text style={styles.authResendAccent}>Forgot PIN? Verify with OTP</Text>
             </Pressable>
@@ -10381,13 +10582,11 @@ function AppContent() {
       if (authMode === 'otp') {
         return (
           <View style={styles.authStepFooter}>
-            <Pressable
-              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
-              disabled={isAuthBusy}
-              onPress={() => void verifyPhoneOtp()}
-            >
-              <Text style={styles.authDarkButtonText}>{authPendingAction === 'verify-otp' ? 'Verifying...' : 'Verify code'}</Text>
-            </Pressable>
+            {renderBrandButton(
+              authPendingAction === 'verify-otp' ? 'Verifying...' : 'Verify code  →',
+              () => void verifyPhoneOtp(),
+              isAuthBusy,
+            )}
             {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
           </View>
         );
@@ -10396,13 +10595,11 @@ function AppContent() {
       if (authMode === 'reset-pin') {
         return (
           <View style={styles.authStepFooter}>
-            <Pressable
-              style={[styles.authDarkButton, isAuthBusy ? styles.authDarkButtonDisabled : null]}
-              disabled={isAuthBusy}
-              onPress={() => void resetPinAfterOtp()}
-            >
-              <Text style={styles.authDarkButtonText}>{authPendingAction === 'reset-pin' ? 'Saving...' : 'Save PIN & continue'}</Text>
-            </Pressable>
+            {renderBrandButton(
+              authPendingAction === 'reset-pin' ? 'Saving...' : 'Save PIN & continue',
+              () => void resetPinAfterOtp(),
+              isAuthBusy,
+            )}
             {isAuthBusy ? <Text style={styles.authInlineStatusText}>{authPendingLabel}</Text> : null}
           </View>
         );
@@ -10411,25 +10608,18 @@ function AppContent() {
       if (authMode === 'profile') {
         return (
           <View style={styles.authStepFooter}>
-            <Pressable style={styles.authDarkButton} onPress={continueFromProfileStep}>
-              <Text style={styles.authDarkButtonText}>Continue</Text>
-            </Pressable>
+            {renderBrandButton('Continue  →', continueFromProfileStep, false)}
           </View>
         );
       }
 
       return (
         <View style={styles.authStepFooter}>
-          <Pressable
-            style={[
-              styles.authDarkButton,
-              !authForm.accountType || isAuthBusy ? styles.authDarkButtonDisabled : null,
-            ]}
-            disabled={!authForm.accountType || isAuthBusy}
-            onPress={() => void completePhoneRegistration()}
-          >
-            <Text style={styles.authDarkButtonText}>{authPendingAction === 'register' ? 'Please wait...' : "Let's go"}</Text>
-          </Pressable>
+          {renderBrandButton(
+            authPendingAction === 'register' ? 'Please wait...' : "Let's go  →",
+            () => void completePhoneRegistration(),
+            !authForm.accountType || isAuthBusy,
+          )}
           <Text style={styles.authInlineStatusText}>
             {isAuthBusy
               ? authPendingLabel
@@ -10444,31 +10634,50 @@ function AppContent() {
     const content = (
       <View style={authContainerStyle}>
         {authMode === 'welcome' ? (
-          <View style={styles.authWelcomeBackdrop}>
-            <View style={styles.authWelcomeGlowOuter} />
-            <View style={styles.authWelcomeGlowInner} />
-            <View style={styles.authBrandIcon}>
-              <Text style={styles.authBrandIconText}>↑</Text>
-            </View>
-          </View>
-        ) : null}
-        {authMode === 'welcome' ? (
           <View style={authContentStyle}>
-            <>
-              <View style={styles.authWelcomeTopSpacer} />
-              <Text style={styles.authBrandWordmark}>
-                Zynk<Text style={styles.authBrandWordmarkAccent}>Up</Text>
-              </Text>
-              <Text style={styles.authWelcomeTagline}>Chat. Pay. Sell. All in one place.</Text>
-              <Text style={styles.authWelcomeSubline}>Built for Africa. Built for you.</Text>
-              <View style={styles.authPillRow}>
-                {['Chat', 'Pay', 'Sell', 'Offline-ready', 'GH Ghana'].map((pill) => (
-                  <View key={pill} style={styles.authFeaturePill}>
-                    <Text style={styles.authFeaturePillText}>{pill}</Text>
-                  </View>
-                ))}
-              </View>
-            </>
+            <View style={styles.authLoginBrand}>
+              <Image source={brandMark} style={styles.authLoginMark} resizeMode="contain" />
+              <Image source={brandWordmark} style={styles.authLoginWordmark} resizeMode="contain" />
+            </View>
+            <Text style={styles.authLoginTitle}>Welcome Back</Text>
+            <Text style={styles.authLoginSubtitle}>Log in to your account</Text>
+            <View style={styles.authLoginField}>
+              <Text style={styles.authLoginFieldIcon}>☎</Text>
+              <Pressable style={styles.authLoginCode} onPress={() => setCountryPickerVisible(true)}>
+                <Text style={styles.authLoginCodeText}>{selectedAuthCountry?.dialCode || '+233'}</Text>
+              </Pressable>
+              <TextInput
+                value={authForm.phone}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, phone: value }))}
+                placeholder="Phone number"
+                placeholderTextColor="#8d93a8"
+                keyboardType="phone-pad"
+                style={styles.authLoginInput}
+              />
+            </View>
+            <View style={styles.authLoginField}>
+              <Text style={styles.authLoginFieldIcon}>🔒</Text>
+              <TextInput
+                value={authForm.pin}
+                onChangeText={(value) => setAuthForm((current) => ({ ...current, pin: value.replace(/\D/g, '').slice(0, 6) }))}
+                placeholder="PIN"
+                placeholderTextColor="#8d93a8"
+                keyboardType="number-pad"
+                secureTextEntry={!authSecretVisible}
+                maxLength={6}
+                style={styles.authLoginInput}
+              />
+              <Pressable onPress={() => setAuthSecretVisible((current) => !current)} hitSlop={8}>
+                <Text style={styles.authLoginEye}>{authSecretVisible ? '🙈' : '👁'}</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              disabled={isAuthBusy}
+              onPress={() => void startForgotPinAuth()}
+              style={styles.authForgotWrap}
+            >
+              <Text style={styles.authForgotText}>Forgot PIN?</Text>
+            </Pressable>
             {authFooter}
           </View>
         ) : (
@@ -10481,6 +10690,10 @@ function AppContent() {
             >
               <View style={authContentStyle}>
                 <>
+                  <View style={styles.authStepBrand}>
+                    <Image source={brandMark} style={styles.authStepMark} resizeMode="contain" />
+                    <Image source={brandWordmark} style={styles.authStepWordmark} resizeMode="contain" />
+                  </View>
                   <View style={styles.authStepHeader}>
                     <Pressable style={styles.authBackButton} onPress={goBackAuthStep}>
                       <Text style={styles.authBackButtonText}>‹</Text>
@@ -10755,20 +10968,30 @@ function AppContent() {
     );
   };
 
-  if (!bootstrapReady) {
+  if (!bootstrapReady || !startContinued) {
+    const onCityScreen = startStep === 'city';
     return (
-      <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+      <View style={styles.bootstrapScreen}>
         <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
-        <View style={styles.bootstrapLoader}>
-          <Text style={styles.authBrandWordmark}>
-            Zynk<Text style={styles.authBrandWordmarkAccent}>Up</Text>
-          </Text>
-          <ActivityIndicator color="#ffffff" size="small" style={styles.bootstrapLoaderSpinner} />
-          <Text style={styles.bootstrapLoaderTitle}>Starting your workspace...</Text>
-          <Text style={styles.bootstrapLoaderBody}>Checking session and connecting to the server.</Text>
-        </View>
-        {renderToast()}
-      </SafeAreaView>
+        {onCityScreen ? (
+          <>
+            <Image source={brandSplashCity} style={styles.bootstrapArt} resizeMode="cover" />
+            <SafeAreaView style={styles.splashContinueWrap} edges={['bottom', 'left', 'right']} pointerEvents="box-none">
+              <View style={styles.splashContinue}>
+                {renderBrandButton(
+                  bootstrapReady ? 'Continue' : 'Please wait...',
+                  () => setStartContinued(true),
+                  !bootstrapReady,
+                )}
+              </View>
+            </SafeAreaView>
+          </>
+        ) : (
+          <SafeAreaView style={styles.splashStage} edges={['top', 'bottom', 'left', 'right']}>
+            <Image source={brandSplashLogo} style={styles.splashLogo} resizeMode="contain" />
+          </SafeAreaView>
+        )}
+      </View>
     );
   }
 
@@ -13484,7 +13707,7 @@ function AppContent() {
                       {control(callMuted ? 'Unmute' : 'Mute', () => setCallAudioMuted(!callMuted), answered, callMuted)}
                       {control(callSpeakerOn ? 'Speaker' : 'Earpiece', () => setCallSpeaker(!callSpeakerOn), true, callSpeakerOn)}
                       {videoCall
-                        ? control(callCameraOff ? 'Camera' : 'Cam off', () => setCallVideoEnabled(callCameraOff), answered, callCameraOff)
+                        ? control(callCameraOff ? 'Camera' : 'Cam off', () => setCallVideoEnabled(callCameraOff), true, callCameraOff)
                         : control('Video', () => {
                           emitCallSignal(call.id, 'video-upgrade', { from: currentUserId }, call.peerUserId);
                           showToast('Asked them to switch to video.', 'info');
@@ -14284,7 +14507,7 @@ function AppContent() {
       <Modal
         transparent
         animationType="fade"
-        visible={appSettings.appLockEnabled && !appUnlocked && Boolean(appLockPin)}
+        visible={appSettings.appLockEnabled && !appSettings.pinDisabled && !appUnlocked && Boolean(appLockPin)}
         onRequestClose={() => undefined}
       >
         <View style={styles.lockOverlay}>
@@ -15066,7 +15289,7 @@ const styles = StyleSheet.create({
     color: '#d11a2a',
   },
   chatHomeAvatarText: {
-    color: '#111827',
+    color: '#f8fbff',
     fontWeight: '800',
     fontSize: 18,
   },
@@ -15099,7 +15322,7 @@ const styles = StyleSheet.create({
     paddingRight: 8,
   },
   chatHomeName: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 16,
     fontWeight: '800',
     flex: 1,
@@ -15324,7 +15547,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   statusAddTitle: {
-    color: '#111827',
+    color: '#14221c',
     fontSize: 15,
     fontWeight: '700',
     letterSpacing: -0.2,
@@ -16916,7 +17139,7 @@ const styles = StyleSheet.create({
   },
   authWelcomeScreen: {
     flex: 1,
-    backgroundColor: '#030712',
+    backgroundColor: '#070B24',
     justifyContent: 'flex-start',
     paddingHorizontal: 24,
     paddingTop: 54,
@@ -16925,7 +17148,7 @@ const styles = StyleSheet.create({
   },
   authFlowScreen: {
     flex: 1,
-    backgroundColor: '#f4f5f7',
+    backgroundColor: '#070B24',
     justifyContent: 'flex-start',
     paddingHorizontal: 20,
     paddingTop: 34,
@@ -16965,7 +17188,7 @@ const styles = StyleSheet.create({
     width: 360,
     height: 360,
     borderRadius: 180,
-    backgroundColor: 'rgba(37, 99, 235, 0.26)',
+    backgroundColor: 'rgba(34, 211, 238, 0.28)',
     top: -120,
     right: -120,
   },
@@ -16974,7 +17197,7 @@ const styles = StyleSheet.create({
     width: 300,
     height: 300,
     borderRadius: 150,
-    backgroundColor: 'rgba(29, 78, 216, 0.22)',
+    backgroundColor: 'rgba(232, 121, 249, 0.32)',
     bottom: -120,
     left: -90,
   },
@@ -17008,7 +17231,154 @@ const styles = StyleSheet.create({
     fontFamily: DISPLAY_FONT_FAMILY,
   },
   authBrandWordmarkAccent: {
-    color: '#60a5fa',
+    color: '#F5C518',
+  },
+  bootstrapScreen: {
+    flex: 1,
+    backgroundColor: '#070B18',
+  },
+  splashStage: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  splashLogo: {
+    width: '100%',
+    height: 120,
+  },
+  splashContinueWrap: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'flex-end',
+  },
+  splashContinue: {
+    paddingHorizontal: 28,
+    paddingBottom: 108,
+  },
+  bootstrapArt: {
+    ...StyleSheet.absoluteFillObject,
+    width: '100%',
+    height: '100%',
+  },
+  brandHeaderLockup: {
+    width: 168,
+    height: 42,
+  },
+  authLoginBrand: {
+    alignItems: 'center',
+    marginTop: 18,
+    marginBottom: 18,
+  },
+  authLoginMark: {
+    width: 108,
+    height: 108,
+  },
+  authLoginWordmark: {
+    width: 210,
+    height: 54,
+    marginTop: 4,
+  },
+  authLoginTitle: {
+    color: '#ffffff',
+    fontSize: 34,
+    fontWeight: '800',
+    textAlign: 'center',
+    letterSpacing: -0.6,
+  },
+  authLoginSubtitle: {
+    color: '#c9d0e6',
+    fontSize: 16,
+    textAlign: 'center',
+    marginTop: 8,
+    marginBottom: 26,
+  },
+  authLoginField: {
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    marginBottom: 14,
+  },
+  authLoginFieldIcon: {
+    color: '#9aa3bd',
+    fontSize: 16,
+    marginRight: 10,
+  },
+  authLoginCode: {
+    marginRight: 8,
+  },
+  authLoginCodeText: {
+    color: '#f8fbff',
+    fontWeight: '700',
+    fontSize: 15,
+  },
+  authLoginInput: {
+    flex: 1,
+    color: '#f8fbff',
+    fontSize: 16,
+    paddingVertical: 14,
+  },
+  authLoginEye: {
+    fontSize: 16,
+    marginLeft: 8,
+  },
+  authForgotWrap: {
+    alignSelf: 'flex-end',
+    marginBottom: 18,
+    marginTop: 2,
+  },
+  authForgotText: {
+    color: '#d5d8e6',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  authSwitchRow: {
+    color: '#c9d0e6',
+    textAlign: 'center',
+    marginTop: 16,
+    fontSize: 15,
+  },
+  authSwitchLink: {
+    color: '#22D3EE',
+    fontWeight: '800',
+  },
+  brandButton: {
+    borderRadius: 28,
+    overflow: 'hidden',
+  },
+  brandButtonDisabled: {
+    opacity: 0.55,
+  },
+  brandButtonFill: {
+    minHeight: 58,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  brandButtonImage: {
+    borderRadius: 28,
+  },
+  brandButtonText: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  authStepBrand: {
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  authStepMark: {
+    width: 72,
+    height: 72,
+  },
+  authStepWordmark: {
+    width: 150,
+    height: 38,
+    marginTop: 2,
   },
   bootstrapLoader: {
     flex: 1,
@@ -17072,11 +17442,13 @@ const styles = StyleSheet.create({
   },
   authPrimaryButton: {
     minHeight: 58,
-    borderRadius: 18,
-    backgroundColor: '#ffffff',
+    borderRadius: 28,
+    backgroundColor: '#22D3EE',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
+    borderWidth: 0,
+    overflow: 'hidden',
   },
   authPrimaryButtonText: {
     color: '#08111f',
@@ -17085,10 +17457,10 @@ const styles = StyleSheet.create({
   },
   authSecondaryButton: {
     minHeight: 54,
-    borderRadius: 18,
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 28,
+    backgroundColor: 'rgba(255,255,255,0.06)',
     borderWidth: 1,
-    borderColor: 'rgba(148, 163, 184, 0.18)',
+    borderColor: 'rgba(168, 85, 247, 0.45)',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
@@ -17106,7 +17478,7 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   authLegalLink: {
-    color: '#f8fbff',
+    color: '#22D3EE',
     fontWeight: '700',
   },
   authStepHeader: {
@@ -17118,13 +17490,13 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: '#f3f4f6',
+    backgroundColor: 'rgba(255,255,255,0.08)',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
   },
   authBackButtonText: {
-    color: '#0f172a',
+    color: '#f8fbff',
     fontSize: 24,
     fontWeight: '500',
     marginTop: -2,
@@ -17134,42 +17506,47 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 999,
     overflow: 'hidden',
-    backgroundColor: '#e5e7eb',
+    backgroundColor: 'rgba(255,255,255,0.12)',
     marginRight: 12,
   },
   authProgressFill: {
     height: '100%',
     borderRadius: 999,
-    backgroundColor: '#111827',
+    backgroundColor: '#E879F9',
   },
   authProgressLabel: {
-    color: '#6b7280',
+    color: '#c4b5fd',
     fontSize: 12,
     fontWeight: '700',
   },
   authStepEmoji: {
     fontSize: 40,
     marginBottom: 8,
+    textAlign: 'center',
+    alignSelf: 'center',
   },
   authStepTitle: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 26,
     fontWeight: '800',
     lineHeight: 30,
     fontFamily: DISPLAY_FONT_FAMILY,
+    textAlign: 'center',
   },
   authStepAccent: {
-    color: '#111827',
+    color: '#22D3EE',
     fontSize: 26,
     fontWeight: '800',
     lineHeight: 30,
     marginBottom: 8,
     fontFamily: DISPLAY_FONT_FAMILY,
+    textAlign: 'center',
   },
   authStepBody: {
-    color: '#6b7280',
+    color: '#c4b5fd',
     fontSize: 14,
     lineHeight: 20,
+    textAlign: 'center',
   },
   authPhoneRow: {
     flexDirection: 'row',
@@ -17182,7 +17559,9 @@ const styles = StyleSheet.create({
     minHeight: 58,
     minWidth: 108,
     borderRadius: 18,
-    backgroundColor: '#f3f4f6',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
     alignItems: 'center',
     justifyContent: 'center',
     flexDirection: 'row',
@@ -17190,12 +17569,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
   },
   authCountryChipText: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 16,
     fontWeight: '700',
   },
   authCountryChevron: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 14,
     fontWeight: '700',
   },
@@ -17203,8 +17582,10 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 58,
     borderRadius: 18,
-    backgroundColor: '#f3f4f6',
-    color: '#111827',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
+    color: '#f8fbff',
     fontSize: 18,
     fontWeight: '600',
     paddingHorizontal: 18,
@@ -17213,6 +17594,7 @@ const styles = StyleSheet.create({
     color: '#9ca3af',
     fontSize: 13,
     lineHeight: 19,
+    textAlign: 'center',
   },
   authOtpRow: {
     flexDirection: 'row',
@@ -17224,28 +17606,32 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 52,
     borderRadius: 16,
-    backgroundColor: '#f3f4f6',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   authOtpBoxFilled: {
-    backgroundColor: '#e5edff',
+    backgroundColor: 'rgba(34, 211, 238, 0.22)',
+    borderColor: '#22D3EE',
   },
   authOtpBoxText: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 21,
     fontWeight: '800',
   },
   authOtpBoxTextFilled: {
-    color: '#1d4ed8',
+    color: '#f8fbff',
   },
   authResendText: {
     color: '#9ca3af',
     fontSize: 13,
     marginBottom: 14,
+    textAlign: 'center',
   },
   authResendAccent: {
-    color: '#111827',
+    color: '#f8fbff',
     fontWeight: '700',
   },
   authKeypadGrid: {
@@ -17259,7 +17645,9 @@ const styles = StyleSheet.create({
     aspectRatio: 1,
     maxHeight: 64,
     borderRadius: 18,
-    backgroundColor: '#f8fafc',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -17267,12 +17655,12 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   authKeypadKeyText: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 21,
     fontWeight: '700',
   },
   authFooterDock: {
-    backgroundColor: '#f4f5f7',
+    backgroundColor: '#070B24',
     paddingTop: 10,
   },
   authProfilePhotoWrap: {
@@ -17322,7 +17710,7 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   authFieldLabel: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 12,
     fontWeight: '800',
     letterSpacing: 0.9,
@@ -17332,8 +17720,10 @@ const styles = StyleSheet.create({
   authProfileInput: {
     minHeight: 54,
     borderRadius: 16,
-    backgroundColor: '#f3f4f6',
-    color: '#111827',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
+    color: '#f8fbff',
     fontSize: 15,
     paddingHorizontal: 16,
   },
@@ -17342,7 +17732,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     minHeight: 54,
     borderRadius: 16,
-    backgroundColor: '#f3f4f6',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.35)',
     overflow: 'hidden',
   },
   authUsernamePrefix: {
@@ -17357,7 +17749,7 @@ const styles = StyleSheet.create({
   },
   authUsernameInput: {
     flex: 1,
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 15,
     paddingRight: 16,
     paddingVertical: 15,
@@ -17406,7 +17798,7 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   authAccountTitle: {
-    color: '#111827',
+    color: '#f8fbff',
     fontSize: 20,
     fontWeight: '800',
     marginBottom: 8,
@@ -17427,8 +17819,8 @@ const styles = StyleSheet.create({
   },
   authDarkButton: {
     minHeight: 58,
-    borderRadius: 18,
-    backgroundColor: '#111827',
+    borderRadius: 28,
+    backgroundColor: '#A855F7',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 18,
@@ -17932,11 +18324,11 @@ const styles = StyleSheet.create({
   },
   callScreen: {
     flex: 1,
-    backgroundColor: '#071015',
+    backgroundColor: '#070B24',
   },
   callStageMain: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#071015',
+    backgroundColor: '#12082E',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -17947,7 +18339,7 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#163028',
+    backgroundColor: '#1a1038',
   },
   callFullPhotoLetter: {
     color: '#f7fbfc',
@@ -18006,15 +18398,17 @@ const styles = StyleSheet.create({
     height: 64,
     paddingHorizontal: 12,
     borderRadius: 32,
-    backgroundColor: 'rgba(255,255,255,0.92)',
+    backgroundColor: 'rgba(18, 12, 48, 0.72)',
+    borderWidth: 1,
+    borderColor: 'rgba(168, 85, 247, 0.45)',
     alignItems: 'center',
     justifyContent: 'center',
   },
   callControlActive: {
-    backgroundColor: '#b7f0dc',
+    backgroundColor: 'rgba(34, 211, 238, 0.28)',
   },
   callControlText: {
-    color: '#10211b',
+    color: '#f8fbff',
     fontSize: 13,
     fontWeight: '800',
   },
@@ -18026,7 +18420,7 @@ const styles = StyleSheet.create({
   },
   lockOverlay: {
     flex: 1,
-    backgroundColor: '#0c1412',
+    backgroundColor: '#070B24',
     justifyContent: 'center',
     paddingHorizontal: 16,
   },
@@ -18035,7 +18429,7 @@ const styles = StyleSheet.create({
     top: 8,
     right: 10,
     zIndex: 40,
-    backgroundColor: '#128C7E',
+    backgroundColor: '#7C3AED',
     borderRadius: 18,
     paddingHorizontal: 14,
     paddingVertical: 8,
@@ -18082,7 +18476,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#22c55e',
   },
   callEndButton: {
-    backgroundColor: '#ef4444',
+    backgroundColor: '#FF2D3A',
   },
   callRoundButtonText: {
     color: '#ffffff',
