@@ -521,6 +521,9 @@ function AppContent() {
     countryCode: '',
     currency: '',
     photoUri: '',
+    profileVideoUri: '',
+    profileVideoPosterUri: '',
+    profileVideoDurationSeconds: 0,
     blockedUserIds: [],
   });
   const [settingsPanel, setSettingsPanel] = useState('');
@@ -696,6 +699,7 @@ function AppContent() {
   const [callMinimized, setCallMinimized] = useState(false);
   const [callMuted, setCallMuted] = useState(false);
   const [callSpeakerOn, setCallSpeakerOn] = useState(false);
+  const callSpeakerOnRef = useRef(false);
   const [callCameraOff, setCallCameraOff] = useState(false);
   const [remoteCameraOff, setRemoteCameraOff] = useState(false);
   const [callControlsVisible, setCallControlsVisible] = useState(true);
@@ -710,6 +714,15 @@ function AppContent() {
   const [statusAudience, setStatusAudience] = useState('contacts');
   const [statusTab, setStatusTab] = useState('contacts');
   const [chatListTab, setChatListTab] = useState('recent');
+  const [exploreSection, setExploreSection] = useState('status');
+  const [communitiesMine, setCommunitiesMine] = useState([]);
+  const [communitiesDiscover, setCommunitiesDiscover] = useState([]);
+  const [communityEvents, setCommunityEvents] = useState([]);
+  const [gameCatalog, setGameCatalog] = useState([]);
+  const [exploreBusy, setExploreBusy] = useState(false);
+  const [exploreReload, setExploreReload] = useState(0);
+  const [communityName, setCommunityName] = useState('');
+  const [aiToneMenuVisible, setAiToneMenuVisible] = useState(false);
   const [chatRequests, setChatRequests] = useState([]);
   const [mutualUserIds, setMutualUserIds] = useState([]);
   const mutualUserIdsRef = useRef([]);
@@ -1348,15 +1361,27 @@ function AppContent() {
 
   const savedNameFor = (userId) => contactItems.find((contact) => contact.linkedUserId === userId)?.name || '';
 
+  const shortPhone = (phone) => {
+    const value = String(phone || '').replace(/\s+/g, '');
+    if (!value) return '';
+    if (value.length <= 8) return value;
+    return `${value.slice(0, 8)}...`;
+  };
+
   const displayNameFor = (userId, fallback = '') => {
-    if (!userId) return fallback || 'ZynkUp';
+    if (!userId) return fallback || 'ZynkUP';
     if (userId === currentUserId) return 'Message yourself';
     const saved = savedNameFor(userId);
     if (saved) return saved;
     const user = usersById[userId];
-    if (!user) return fallback || 'ZynkUp';
-    if (user.phone) return `${user.phone} · ${user.name || 'ZynkUp'}${user.username ? ` · ${user.username}` : ''}`;
-    return user.name || fallback || 'ZynkUp';
+    if (!user) return fallback || 'ZynkUP';
+    return user.name || fallback || shortPhone(user.phone) || 'ZynkUP';
+  };
+
+  const headerLabelFor = (userId, fallback = '') => {
+    const phone = shortPhone(usersById[userId]?.phone);
+    if (phone) return phone;
+    return displayNameFor(userId, fallback);
   };
 
   const isMutualContact = (userId) => {
@@ -1446,11 +1471,14 @@ function AppContent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: nextProfile.name.trim() || undefined,
-          about: nextProfile.about.trim() || 'Hey there! I am using ZynkUp.',
+          about: nextProfile.about.trim() || 'Hey there! I am using ZynkUP.',
           phone: nextProfile.phone.trim() || undefined,
           username: nextProfile.username?.trim() || undefined,
           avatar,
           photoUri: /^https?:\/\//i.test(nextProfile.photoUri || '') ? nextProfile.photoUri : '',
+          profileVideoUri: /^https?:\/\//i.test(nextProfile.profileVideoUri || '') ? nextProfile.profileVideoUri : '',
+          profileVideoPosterUri: /^https?:\/\//i.test(nextProfile.profileVideoPosterUri || '') ? nextProfile.profileVideoPosterUri : '',
+          profileVideoDurationSeconds: Number(nextProfile.profileVideoDurationSeconds) || 0,
           currency: nextProfile.currency || accountCurrency,
           lastSeenPrivacy: nextSettings.lastSeenPrivacy,
           profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
@@ -1480,6 +1508,9 @@ function AppContent() {
           countryCode: payload.profile.countryCode ?? current.countryCode,
           currency: payload.profile.currency ?? current.currency,
           photoUri: payload.profile.photoUri ?? current.photoUri,
+          profileVideoUri: payload.profile.profileVideoUri ?? current.profileVideoUri,
+          profileVideoPosterUri: payload.profile.profileVideoPosterUri ?? current.profileVideoPosterUri,
+          profileVideoDurationSeconds: payload.profile.profileVideoDurationSeconds ?? current.profileVideoDurationSeconds,
         }));
       }
       if (/^\d{4,6}$/.test(pinToSave)) {
@@ -1547,6 +1578,58 @@ function AppContent() {
     } catch {
       showToast('Could not upload profile photo. The preview stays on this phone.', 'error', 4200);
     }
+  };
+
+  const pickProfileVideo = async () => {
+    const result = await openImageLibrary({ mediaType: 'video', selectionLimit: 1 });
+    if (result.errorCode) {
+      Alert.alert('Permission needed', result.errorMessage || 'Allow gallery access to add a profile video.');
+      return;
+    }
+    const asset = result.assets?.[0];
+    if (result.didCancel || !asset?.uri) {
+      return;
+    }
+    let durationSeconds = Number(asset.duration) || 0;
+    if (durationSeconds > 30) {
+      durationSeconds = durationSeconds / 1000;
+    }
+    durationSeconds = Math.round(durationSeconds);
+    if (durationSeconds && (durationSeconds < 1 || durationSeconds > 6)) {
+      showToast('Profile videos must be 1–6 seconds.', 'error', 3600);
+      return;
+    }
+    showToast('Uploading profile video...', 'info', 0);
+    try {
+      const uploaded = await uploadUris([asset.uri], {
+        names: [`profile-video-${Date.now()}.mp4`],
+        types: [asset.type || 'video/mp4'],
+        fallbackType: 'video/mp4',
+      });
+      if (!uploaded[0]) {
+        showToast('Could not upload profile video.', 'error');
+        return;
+      }
+      const nextFields = {
+        profileVideoUri: uploaded[0],
+        profileVideoPosterUri: /^https?:\/\//i.test(profile.photoUri || '') ? profile.photoUri : '',
+        profileVideoDurationSeconds: durationSeconds || 6,
+      };
+      setProfile((current) => ({ ...current, ...nextFields }));
+      await saveProfileToServer(nextFields);
+    } catch {
+      showToast('Could not upload profile video.', 'error');
+    }
+  };
+
+  const removeProfileVideo = async () => {
+    const nextFields = {
+      profileVideoUri: '',
+      profileVideoPosterUri: '',
+      profileVideoDurationSeconds: 0,
+    };
+    setProfile((current) => ({ ...current, ...nextFields }));
+    await saveProfileToServer(nextFields);
   };
 
   const clearChatHistory = () => {
@@ -2101,7 +2184,7 @@ function AppContent() {
           const cameraBlocked = blocked.includes(PermissionsAndroid.PERMISSIONS.CAMERA);
           Alert.alert(
             cameraBlocked ? 'Camera is blocked' : 'Microphone is blocked',
-            'Allow the camera and microphone for ZynkUp, then open the video call again.',
+            'Allow the camera and microphone for ZynkUP, then open the video call again.',
             [
               { text: 'Not now', style: 'cancel' },
               { text: 'Open settings', onPress: () => Linking.openSettings() },
@@ -2277,6 +2360,7 @@ function AppContent() {
   };
 
   const setCallSpeaker = (enabled) => {
+    callSpeakerOnRef.current = enabled;
     setCallSpeakerOn(enabled);
     CueSound?.setSpeaker?.(enabled);
   };
@@ -2359,14 +2443,14 @@ function AppContent() {
           granted = result === PermissionsAndroid.RESULTS.GRANTED;
         }
         if (!granted) {
-          showToast('Contacts are off. Allow ZynkUp to read contacts, then tap Sync again.', 'error', 4200);
+          showToast('Contacts are off. Allow ZynkUP to read contacts, then tap Sync again.', 'error', 4200);
           await Linking.openSettings();
           return;
         }
       } else {
         const permission = await Contacts.requestPermission();
         if (permission !== 'authorized') {
-          showToast('Contacts are off. Allow ZynkUp to read contacts, then tap Sync again.', 'error', 4200);
+          showToast('Contacts are off. Allow ZynkUP to read contacts, then tap Sync again.', 'error', 4200);
           await Linking.openSettings();
           return;
         }
@@ -2413,8 +2497,8 @@ function AppContent() {
       if (!options.quiet) {
         showToast(
           matched.length
-            ? `${matched.length} contact${matched.length === 1 ? '' : 's'} on ZynkUp. You can chat and call them.`
-            : `Checked ${payloadContacts.length} numbers. None of them are on ZynkUp yet.`,
+            ? `${matched.length} contact${matched.length === 1 ? '' : 's'} on ZynkUP. You can chat and call them.`
+            : `Checked ${payloadContacts.length} numbers. None of them are on ZynkUP yet.`,
           matched.length ? 'success' : 'info',
           4200,
         );
@@ -2646,7 +2730,7 @@ function AppContent() {
   };
 
   const getUserMeta = (userId) => ({
-    name: userId === currentUserId ? 'You' : displayNameFor(userId, usersById[userId]?.name ?? 'ZynkUp'),
+    name: userId === currentUserId ? 'You' : displayNameFor(userId, usersById[userId]?.name ?? 'ZynkUP'),
     avatar: usersById[userId]?.avatar ?? (userId === currentUserId ? profile.name.slice(0, 2).toUpperCase() : 'ZU'),
   });
 
@@ -2762,6 +2846,9 @@ function AppContent() {
       countryCode: payload.profile?.countryCode ?? current.countryCode,
       currency: payload.profile?.currency || currencyForPhone(payload.profile?.phone, payload.profile?.countryCode),
       photoUri: payload.profile?.photoUri || current.photoUri,
+      profileVideoUri: payload.profile?.profileVideoUri || '',
+      profileVideoPosterUri: payload.profile?.profileVideoPosterUri || '',
+      profileVideoDurationSeconds: payload.profile?.profileVideoDurationSeconds || 0,
       blockedUserIds: payload.profile?.blockedUserIds ?? current.blockedUserIds ?? [],
     }));
     if (payload.profile) {
@@ -3252,7 +3339,7 @@ function AppContent() {
       if (message.senderId && message.senderId !== currentUserIdRef.current && message.senderId !== 'anonymous') {
         const sender = message.sender || usersByIdRef.current[message.senderId];
         const senderLabel = sender?.phone
-          ? `${sender.phone} · ${sender.name || 'ZynkUp'}`
+          ? `${sender.phone} · ${sender.name || 'ZynkUP'}`
           : (sender?.name || 'New message');
         setChatItems((current) => {
           if (current.some((item) => item.id === message.chatId)) {
@@ -3299,7 +3386,7 @@ function AppContent() {
           !mutedChatIdsRef.current.includes(message.chatId)
         ) {
           const lockedChat = lockedChatIdsRef.current.includes(message.chatId);
-          const senderName = lockedChat ? 'ZynkUp' : (usersByIdRef.current[message.senderId]?.name || 'New message');
+          const senderName = lockedChat ? 'ZynkUP' : (usersByIdRef.current[message.senderId]?.name || 'New message');
           const preview = settings.showNotificationPreview && !lockedChat
             ? (message.text || (message.kind === 'image' ? 'Photo' : message.kind === 'voice' ? 'Voice message' : 'New message'))
             : 'New message';
@@ -3974,7 +4061,7 @@ function AppContent() {
     }
     const mapped = mapCallFromServer(incomingCallPayload, currentUserIdRef.current || currentUserId, userMap);
     if (caller?.phone && mapped.initiatorId !== (currentUserIdRef.current || currentUserId)) {
-      mapped.name = `${caller.phone} · ${caller.name || 'ZynkUp'}`;
+      mapped.name = `${caller.phone} · ${caller.name || 'ZynkUP'}`;
     }
     setCalls((current) => {
       const existingIndex = current.findIndex((item) => item.id === mapped.id);
@@ -4283,7 +4370,7 @@ function AppContent() {
     if (!live) return undefined;
     if (systemCallIdRef.current !== live.id) {
       systemCallIdRef.current = live.id;
-      CueSound?.beginSystemCall?.(live.initiatorId !== currentUserId, live.name || 'ZynkUp');
+      CueSound?.beginSystemCall?.(live.initiatorId !== currentUserId, live.name || 'ZynkUP');
     }
     if (live.state === 'ongoing') {
       CueSound?.answerSystemCall?.();
@@ -4296,22 +4383,76 @@ function AppContent() {
       setCallMinimized(false);
       return undefined;
     }
-    void ensureCallMedia(activeCall.kind).catch((error) => {
+    let cancelled = false;
+    const applyRoute = () => {
+      if (!cancelled) {
+        CueSound?.setSpeaker?.(callSpeakerOnRef.current);
+      }
+    };
+    void ensureCallMedia(activeCall.kind).then(() => {
+      applyRoute();
+    }).catch((error) => {
       setCallError(error?.message === 'permission-denied'
         ? 'Camera or microphone permission was denied.'
         : 'The camera did not start. Tap Camera to try again.');
     });
-    CueSound?.setSpeaker?.(callSpeakerOn);
+    const routeTimers = [400, 1200, 2200].map((delay) => setTimeout(applyRoute, delay));
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       void PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
     }
     CueSound?.showOngoingCall?.(activeCall.name || 'Call', activeCall.kind === 'Video');
     revealCallControls();
     return () => {
+      cancelled = true;
+      routeTimers.forEach((timer) => clearTimeout(timer));
       CueSound?.hideOngoingCall?.();
       CueSound?.resetAudioRoute?.();
     };
   }, [activeCall?.id, activeCall?.state, activeCall?.kind]);
+
+  useEffect(() => {
+    if (activeView !== 'Explore' || exploreSection === 'status' || !currentUserId) {
+      return undefined;
+    }
+    let cancelled = false;
+    const load = async () => {
+      setExploreBusy(true);
+      try {
+        if (exploreSection === 'community') {
+          const response = await fetch(`${API_BASE_URL}/api/communities?userId=${encodeURIComponent(currentUserId)}`);
+          const payload = await response.json().catch(() => ({}));
+          if (!cancelled && response.ok) {
+            setCommunitiesMine(payload.mine || []);
+            setCommunitiesDiscover(payload.discoverable || []);
+          }
+        } else if (exploreSection === 'events') {
+          const response = await fetch(`${API_BASE_URL}/api/events?userId=${encodeURIComponent(currentUserId)}`);
+          const payload = await response.json().catch(() => ({}));
+          if (!cancelled && response.ok) {
+            setCommunityEvents(payload.events || []);
+          }
+        } else if (exploreSection === 'games') {
+          const response = await fetch(`${API_BASE_URL}/api/games`);
+          const payload = await response.json().catch(() => ({}));
+          if (!cancelled && response.ok) {
+            setGameCatalog(payload.games || []);
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          showToast('Could not load that section.', 'error');
+        }
+      } finally {
+        if (!cancelled) {
+          setExploreBusy(false);
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeView, exploreSection, currentUserId, exploreReload]);
 
   useEffect(() => {
     if (!activeCall || activeCall.state !== 'ringing' || activeCall.initiatorId !== currentUserId) {
@@ -4789,7 +4930,7 @@ function AppContent() {
         return;
       }
       setBusinessReportDraft('');
-      showToast('Report sent. Thanks for helping keep ZynkUp safe.', 'success');
+      showToast('Report sent. Thanks for helping keep ZynkUP safe.', 'success');
     } catch {
       showToast('Could not send the report.', 'error');
     }
@@ -4834,7 +4975,7 @@ function AppContent() {
       return `- ${item.title}${variants ? ` (${variants})` : ''} x${item.quantity} · ${item.currency} ${item.price}`;
     });
     return [
-      `ZynkUp receipt ${receipt.receiptNumber}`,
+      `ZynkUP receipt ${receipt.receiptNumber}`,
       receipt.businessName || receipt.sellerName,
       `Buyer: ${receipt.buyerName}`,
       ...lines,
@@ -7436,8 +7577,8 @@ function AppContent() {
           avatar: authAvatar,
           about:
             accountType === 'business'
-              ? 'Business account on Zynkup.'
-              : 'Personal account on Zynkup.',
+              ? 'Business account on ZynkUP.'
+              : 'Personal account on ZynkUP.',
           businessName: accountType === 'business' ? authForm.name.trim() : undefined,
           businessDescription:
             accountType === 'business'
@@ -7833,7 +7974,7 @@ function AppContent() {
         const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA);
         if (result !== PermissionsAndroid.RESULTS.GRANTED) {
           if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
-            Alert.alert('Camera is blocked', 'Allow the camera in phone settings so ZynkUp can scan a web login code.', [
+            Alert.alert('Camera is blocked', 'Allow the camera in phone settings so ZynkUP can scan a web login code.', [
               { text: 'Not now', style: 'cancel' },
               { text: 'Open settings', onPress: () => Linking.openSettings() },
             ]);
@@ -7994,8 +8135,8 @@ function AppContent() {
       setPhonePrompt({ ...payload.user, rawNumber });
       return;
     }
-    const invite = `Hi, I am on ZynkUp. Join me so we can chat and call: https://zynkup.app`;
-    Alert.alert('Not on ZynkUp yet', `${rawNumber} is not registered. Send an invite by SMS?`, [
+    const invite = `Hi, I am on ZynkUP. Join me so we can chat and call: https://zynkup.app`;
+    Alert.alert('Not on ZynkUP yet', `${rawNumber} is not registered. Send an invite by SMS?`, [
       { text: 'Not now', style: 'cancel' },
       {
         text: 'Send invite',
@@ -8617,6 +8758,30 @@ function AppContent() {
     );
   };
 
+  const renderToneMenu = () => (
+    <View style={styles.aiToneMenu}>
+      <Pressable style={styles.aiToneMenuButton} onPress={() => setAiToneMenuVisible((current) => !current)}>
+        <Text style={styles.aiToneMenuButtonText}>Tone · {aiRewriteTone} ▾</Text>
+      </Pressable>
+      {aiToneMenuVisible ? (
+        <View style={styles.aiToneMenuList}>
+          {['polite', 'concise', 'professional', 'friendly', 'apologetic'].map((tone) => (
+            <Pressable
+              key={tone}
+              style={styles.aiToneMenuItem}
+              onPress={() => {
+                setAiRewriteTone(tone);
+                setAiToneMenuVisible(false);
+              }}
+            >
+              <Text style={[styles.aiToneMenuItemText, aiRewriteTone === tone ? styles.aiToneMenuItemTextOn : null]}>{tone}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+
   const renderChatDetail = () => {
     if (!activeChat) {
       return null;
@@ -8634,7 +8799,7 @@ function AppContent() {
           onPress: () => onAvatarPress(activeChat.peerUserId, activeChat.name),
         })}
         <Pressable style={styles.detailHeaderText} onPress={() => setPeerProfileVisible(true)}>
-          <Text style={styles.detailTitle}>{displayNameFor(activeChat.peerUserId, activeChat.name)}</Text>
+          <Text style={styles.detailTitle}>{headerLabelFor(activeChat.peerUserId, activeChat.name)}</Text>
           <Text style={styles.detailSubtitle}>{getPresenceLabel(activeChat)}</Text>
         </Pressable>
         <View style={styles.detailHeaderActions}>
@@ -8826,19 +8991,7 @@ function AppContent() {
           <Text style={styles.aiAssistButtonText}>Dictate</Text>
         </Pressable>
       </View>
-      <View style={styles.aiToneRow}>
-        {['polite', 'concise', 'professional', 'friendly', 'apologetic'].map((tone) => (
-          <Pressable
-            key={tone}
-            style={[styles.aiToneChip, aiRewriteTone === tone ? styles.aiToneChipActive : null]}
-            onPress={() => setAiRewriteTone(tone)}
-          >
-            <Text style={[styles.aiToneChipText, aiRewriteTone === tone ? styles.aiToneChipTextActive : null]}>
-              {tone}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
+      {renderToneMenu()}
       {aiSuggestions.length ? (
         <View style={styles.aiChipRow}>
           {aiSuggestions.map((suggestion) => (
@@ -9014,7 +9167,7 @@ function AppContent() {
         if (contactItems.filter((contact) => contact.registered || contact.linkedUserId).length === 0) {
           cards.push({
             id: 'business-customers',
-            title: 'Find customers on ZynkUp',
+            title: 'Find customers on ZynkUP',
             body: 'Sync contacts to see who already joined',
             action: () => {
               void syncPhoneContacts(currentUserId);
@@ -9074,8 +9227,13 @@ function AppContent() {
   };
 
   const renderChatList = () => {
-    const recentChats = visibleChatItems.slice(0, 4);
-    const earlierChats = visibleChatItems.slice(4);
+    const unreadCount = visibleChatItems.filter((chat) => Number(chat.unread || 0) > 0).length;
+    const requestCount = chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId).length;
+    const listedChats = visibleChatItems.filter((chat) => {
+      if (chatListTab === 'unread') return Number(chat.unread || 0) > 0;
+      if (chatListTab === 'groups') return chat.kind === 'group';
+      return true;
+    });
 
     const renderChatRow = (chat, index) => (
       <View key={chat.id} style={styles.chatHomeRow}>
@@ -9128,34 +9286,29 @@ function AppContent() {
     );
 
     return (
-      <View style={styles.lightScreen}>
-        <View style={styles.lightHeader}>
-          <View>
-            <Image source={brandLockup} style={styles.brandHeaderLockup} resizeMode="contain" />
-            <Pressable onPress={() => setIdentitySheetVisible(true)}>
-              <Text style={styles.identityChipText}>{identityLabel}</Text>
-            </Pressable>
+      <View style={styles.chatListScreen}>
+        <View style={styles.chatListHeader}>
+          <View style={styles.chatListTitleBlock}>
+            <Image source={brandMark} style={styles.chatListMark} />
+            <View>
+              <Text style={styles.chatListTitle}>Chats</Text>
+              <Pressable onPress={() => setIdentitySheetVisible(true)}>
+                <Text style={styles.chatListIdentity}>{identityLabel} ▾</Text>
+              </Pressable>
+            </View>
           </View>
           <View style={styles.lightHeaderActions}>
             <Pressable
-              style={styles.lightHeaderAction}
+              style={styles.chatListAction}
               onPress={() => setChatSearchOpen((current) => !current)}
             >
-              <Text style={styles.lightHeaderActionText}>⌕</Text>
+              <Text style={styles.chatListActionText}>⌕</Text>
             </Pressable>
             <Pressable
-              style={styles.lightHeaderAction}
-              onPress={() => {
-                void syncPhoneContacts(currentUserId);
-                setRoomPicking(false);
-                setRoomSelection([]);
-                setNewChatVisible(true);
-              }}
+              style={styles.chatListAction}
+              onPress={() => setActiveView('Profile')}
             >
-              <Text style={styles.lightHeaderActionText}>+</Text>
-            </Pressable>
-            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
-              <Text style={styles.lightHeaderActionText}>⌁</Text>
+              <Text style={styles.chatListActionText}>⋮</Text>
             </Pressable>
           </View>
         </View>
@@ -9165,17 +9318,19 @@ function AppContent() {
             <Text style={styles.businessAlertText}>{appNotice}</Text>
           </View>
         ) : null}
-        <View style={styles.modeSwitch}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chatFilterRow}>
           {[
-            ['recent', 'Messages'],
+            ['recent', 'All'],
+            ['unread', unreadCount ? `Unread  ${unreadCount}` : 'Unread'],
+            ['groups', 'Groups'],
             ['calls', 'Calls'],
-            ['requests', `Requests${chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId).length ? ` ${chatRequests.filter((item) => item.state === 'pending' && item.toUserId === currentUserId).length}` : ''}`],
+            ['requests', requestCount ? `Requests  ${requestCount}` : 'Requests'],
           ].map(([id, label]) => (
-            <Pressable key={id} style={[styles.modeSwitchButton, chatListTab === id ? styles.modeSwitchButtonActive : null]} onPress={() => setChatListTab(id)}>
-              <Text style={[styles.modeSwitchText, chatListTab === id ? styles.modeSwitchTextActive : null]}>{label}</Text>
+            <Pressable key={id} style={[styles.chatFilterChip, chatListTab === id ? styles.chatFilterChipOn : null]} onPress={() => setChatListTab(id)}>
+              <Text style={[styles.chatFilterText, chatListTab === id ? styles.chatFilterTextOn : null]}>{label}</Text>
             </Pressable>
           ))}
-        </View>
+        </ScrollView>
 
         {chatListTab === 'calls' ? renderCalls() : null}
 
@@ -9205,7 +9360,7 @@ function AppContent() {
             contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset + 72 }]}
             showsVerticalScrollIndicator={false}
           >
-            {chatListTab === 'recent' ? renderHomeCards(activeBusinessId ? 'business' : 'personal') : null}
+            {chatListTab === 'recent' || chatListTab === 'unread' || chatListTab === 'groups' ? renderHomeCards(activeBusinessId ? 'business' : 'personal') : null}
             {chatListTab === 'requests' ? (
               <View>
                 <Text style={styles.lightSectionLabel}>CHAT REQUESTS</Text>
@@ -9240,25 +9395,23 @@ function AppContent() {
                 }) : <Text style={styles.cardBody}>No chat requests.</Text>}
               </View>
             ) : null}
-            {chatListTab === 'recent' ? <Text style={styles.lightSectionLabel}>{showArchivedChats ? 'ARCHIVED' : 'RECENT'}</Text> : null}
-            {chatListTab === 'recent' && recentChats.length ? recentChats.map((chat, index) => renderChatRow(chat, index)) : chatListTab === 'recent' ? (
-              <View style={styles.emptyChatCard}>
-                <Text style={styles.cardTitle}>No chats yet</Text>
-                <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
-                <Pressable
-                  style={styles.sendButtonWide}
-                  onPress={() => {
-                    void syncPhoneContacts(currentUserId);
-                    setNewChatVisible(true);
-                  }}
-                >
-                  <Text style={styles.sendButtonText}>New conversation</Text>
-                </Pressable>
-              </View>
+            {chatListTab === 'recent' || chatListTab === 'unread' || chatListTab === 'groups' ? (
+              listedChats.length ? listedChats.map((chat, index) => renderChatRow(chat, index)) : (
+                <View style={styles.emptyChatCard}>
+                  <Text style={styles.cardTitle}>{chatListTab === 'unread' ? 'No unread chats' : chatListTab === 'groups' ? 'No groups yet' : 'No chats yet'}</Text>
+                  <Text style={styles.cardBody}>Start a new conversation with one of your registered contacts.</Text>
+                  <Pressable
+                    style={styles.sendButtonWide}
+                    onPress={() => {
+                      void syncPhoneContacts(currentUserId);
+                      setNewChatVisible(true);
+                    }}
+                  >
+                    <Text style={styles.sendButtonText}>New conversation</Text>
+                  </Pressable>
+                </View>
+              )
             ) : null}
-
-            {chatListTab === 'recent' && earlierChats.length ? <Text style={styles.lightSectionLabel}>EARLIER TODAY</Text> : null}
-            {chatListTab === 'recent' ? earlierChats.map((chat, index) => renderChatRow(chat, index + recentChats.length)) : null}
           </ScrollView>
 
           <Pressable
@@ -9445,6 +9598,152 @@ function AppContent() {
           ))}
         </View>
       </ScrollView>
+    </View>
+  );
+
+  const createCommunity = async () => {
+    const name = communityName.trim();
+    if (name.length < 2) {
+      showToast('Enter a community name.', 'error');
+      return;
+    }
+    const response = await fetch(`${API_BASE_URL}/api/communities`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, name, privacy: 'public' }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(payload.error || 'Could not create the community.', 'error');
+      return;
+    }
+    setCommunityName('');
+    setExploreReload((current) => current + 1);
+    showToast('Community created.', 'success');
+  };
+
+  const joinCommunity = async (communityId) => {
+    const response = await fetch(`${API_BASE_URL}/api/communities/${communityId}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(payload.error || 'Could not join.', 'error');
+      return;
+    }
+    setExploreReload((current) => current + 1);
+    showToast('Joined.', 'success');
+  };
+
+  const rsvpEvent = async (eventId) => {
+    const response = await fetch(`${API_BASE_URL}/api/events/${eventId}/rsvp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, status: 'going' }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(payload.error || 'Could not RSVP.', 'error');
+      return;
+    }
+    setCommunityEvents((current) => current.map((item) => item.id === eventId ? { ...item, ...(payload.event || {}), myRsvp: { status: 'going' } } : item));
+    showToast('You are going.', 'success');
+  };
+
+  const startGame = async (gameSlug) => {
+    const response = await fetch(`${API_BASE_URL}/api/games/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUserId, gameSlug }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      showToast(payload.error || 'Could not start the game.', 'error');
+      return;
+    }
+    showToast(payload.session?.status === 'lobby' ? 'Game lobby is open.' : 'Game started.', 'success');
+  };
+
+  const renderExplore = () => (
+    <View style={styles.lightScreen}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chatFilterRow}>
+        {[
+          ['status', 'Status'],
+          ['community', 'Community'],
+          ['events', 'Events'],
+          ['games', 'Games'],
+        ].map(([id, label]) => (
+          <Pressable key={id} style={[styles.chatFilterChip, exploreSection === id ? styles.chatFilterChipOn : null, styles.exploreChip]} onPress={() => setExploreSection(id)}>
+            <Text style={[styles.chatFilterText, exploreSection === id ? styles.chatFilterTextOn : null, exploreSection === id ? null : styles.exploreChipText]}>{label}</Text>
+          </Pressable>
+        ))}
+      </ScrollView>
+      {exploreSection === 'status' ? renderStatus() : (
+        <ScrollView contentContainerStyle={[styles.lightScrollContent, { paddingBottom: lightContentBottomInset }]}>
+          {exploreBusy ? <ActivityIndicator color="#7C3AED" style={{ marginTop: 24 }} /> : null}
+          {exploreSection === 'community' ? (
+            <View>
+              <Text style={styles.lightSectionLabel}>YOUR COMMUNITIES</Text>
+              {communitiesMine.length ? communitiesMine.map((community) => (
+                <View key={community.id} style={styles.statusFeedCard}>
+                  <Text style={styles.statusFeedName}>{community.name}</Text>
+                  <Text style={styles.statusFeedBody}>{community.description || `${community.memberCount || 1} members · ${community.privacy || 'public'}`}</Text>
+                </View>
+              )) : <Text style={styles.cardBody}>You have not joined a community yet.</Text>}
+              <Text style={styles.lightSectionLabel}>DISCOVER</Text>
+              {communitiesDiscover.filter((community) => !communitiesMine.some((mine) => mine.id === community.id)).map((community) => (
+                <View key={community.id} style={styles.statusFeedCard}>
+                  <Text style={styles.statusFeedName}>{community.name}</Text>
+                  <Text style={styles.statusFeedBody}>{community.description || community.privacy || 'Public community'}</Text>
+                  <Pressable style={styles.catalogChip} onPress={() => void joinCommunity(community.id)}>
+                    <Text style={styles.catalogChipText}>Join</Text>
+                  </Pressable>
+                </View>
+              ))}
+              <TextInput
+                value={communityName}
+                onChangeText={setCommunityName}
+                placeholder="New community name"
+                placeholderTextColor="#7d8b92"
+                style={styles.input}
+              />
+              <Pressable style={styles.sendButtonWide} onPress={() => void createCommunity()}>
+                <Text style={styles.sendButtonText}>Create community</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {exploreSection === 'events' ? (
+            <View>
+              <Text style={styles.lightSectionLabel}>EVENTS</Text>
+              {communityEvents.length ? communityEvents.map((event) => (
+                <View key={event.id} style={styles.statusFeedCard}>
+                  <Text style={styles.statusFeedName}>{event.title}</Text>
+                  <Text style={styles.statusFeedBody}>{event.startsAt ? new Date(event.startsAt).toLocaleString() : 'Time to be announced'} · {event.status || 'scheduled'}</Text>
+                  <Pressable style={styles.catalogChip} onPress={() => void rsvpEvent(event.id)}>
+                    <Text style={styles.catalogChipText}>{event.myRsvp?.status === 'going' ? 'Going' : 'RSVP'}</Text>
+                  </Pressable>
+                </View>
+              )) : <Text style={styles.cardBody}>No events yet. Communities can host them.</Text>}
+            </View>
+          ) : null}
+          {exploreSection === 'games' ? (
+            <View>
+              <Text style={styles.lightSectionLabel}>GAMES</Text>
+              {gameCatalog.length ? gameCatalog.map((game) => (
+                <View key={game.slug || game.id} style={styles.statusFeedCard}>
+                  <Text style={styles.statusFeedName}>{game.name || game.title}</Text>
+                  <Text style={styles.statusFeedBody}>{game.description || game.pointsNote || 'Points stay on your profile. They are not cash.'}</Text>
+                  <Pressable style={styles.catalogChip} onPress={() => void startGame(game.slug)} disabled={Boolean(game.comingSoon)}>
+                    <Text style={styles.catalogChipText}>{game.comingSoon ? 'Soon' : 'Play'}</Text>
+                  </Pressable>
+                </View>
+              )) : <Text style={styles.cardBody}>Games will show here when the catalog is available.</Text>}
+            </View>
+          ) : null}
+        </ScrollView>
+      )}
     </View>
   );
 
@@ -10063,12 +10362,12 @@ function AppContent() {
                 setAppUnlocked(true);
                 setAppLockPin('');
                 AsyncStorage.removeItem(APP_LOCK_PIN_KEY).catch(() => undefined);
-                showToast('PIN is off. This phone opens ZynkUp without asking.', 'success', 2600);
+                showToast('PIN is off. This phone opens ZynkUP without asking.', 'success', 2600);
               } else {
                 showToast('PIN is on. Set a 4–6 digit PIN below, then save.', 'info', 2600);
               }
             },
-            'Turn this off if you do not want a PIN when you open ZynkUp. Your account stays on this phone.',
+            'Turn this off if you do not want a PIN when you open ZynkUP. Your account stays on this phone.',
           )}
           <TextInput
             value={accountPinDraft}
@@ -10301,7 +10600,7 @@ function AppContent() {
     if (settingsPanel === 'help') {
       return (
         <ScrollView style={styles.settingsPanelScroll}>
-          <Text style={styles.cardBody}>Need help? Send feedback and we will improve ZynkUp with you.</Text>
+          <Text style={styles.cardBody}>Need help? Send feedback and we will improve ZynkUP with you.</Text>
           {[
             'How do I link a desktop device?',
             'How do payments work?',
@@ -10332,7 +10631,7 @@ function AppContent() {
                 return;
               }
               setFeedbackDraft('');
-              showToast('Thanks — feedback sent to the ZynkUp team.', 'success', 3200);
+              showToast('Thanks — feedback sent to the ZynkUP team.', 'success', 3200);
               setSettingsPanel('');
             }}
           >
@@ -10361,8 +10660,26 @@ function AppContent() {
         <Pressable onPress={() => void pickProfilePhoto()}>
           <Text style={styles.editPhotoText}>Edit photo</Text>
         </Pressable>
+        {profile.profileVideoUri ? (
+          <Video
+            source={{ uri: profile.profileVideoUri }}
+            style={styles.profileVideoPreview}
+            resizeMode="cover"
+            repeat
+            muted
+            paused={false}
+          />
+        ) : null}
+        <Pressable onPress={() => void pickProfileVideo()}>
+          <Text style={styles.editPhotoText}>{profile.profileVideoUri ? 'Replace profile video' : 'Add profile video'}</Text>
+        </Pressable>
+        {profile.profileVideoUri ? (
+          <Pressable onPress={() => void removeProfileVideo()}>
+            <Text style={styles.editPhotoText}>Remove profile video</Text>
+          </Pressable>
+        ) : null}
         <Text style={styles.settingsProfileName}>{profile.name || 'Your name'}</Text>
-        <Text style={styles.settingsProfileMeta}>{profile.about || 'Hey there! I am using ZynkUp.'}</Text>
+        <Text style={styles.settingsProfileMeta}>{profile.about || 'Hey there! I am using ZynkUP.'}</Text>
         <Text style={styles.settingsProfileMeta}>{profile.phone || 'Add your phone number'}</Text>
         <Text style={styles.settingsProfileMeta}>{accountCurrency}{accountCountry?.name ? ` · ${accountCountry.name}` : ''}</Text>
       </Pressable>
@@ -10469,7 +10786,7 @@ function AppContent() {
           </View>
           <Text style={styles.celebrationTitle}>You're in,</Text>
           <Text style={styles.celebrationAccent}>{celebrationDisplayName}! 🎉</Text>
-          <Text style={styles.celebrationSubtitle}>ZynkUp is ready. Here's everything waiting for you.</Text>
+          <Text style={styles.celebrationSubtitle}>ZynkUP is ready. Here's everything waiting for you.</Text>
           <View style={styles.celebrationFeatureList}>
             {highlights.map((item) => (
               <View key={item.title} style={styles.celebrationFeatureCard}>
@@ -10487,7 +10804,7 @@ function AppContent() {
               setEntryCelebrationVisible(false);
             }}
           >
-            <Text style={styles.celebrationButtonText}>Open ZynkUp →</Text>
+            <Text style={styles.celebrationButtonText}>Open ZynkUP →</Text>
           </Pressable>
         </View>
       </View>
@@ -10898,7 +11215,7 @@ function AppContent() {
                   {authMode === 'account' ? (
                     <>
                       <Text style={styles.authStepTitle}>How will you use</Text>
-                      <Text style={styles.authStepAccent}>ZynkUp?</Text>
+                      <Text style={styles.authStepAccent}>ZynkUP?</Text>
                       <Text style={[styles.authStepBody, styles.authAccountCopy]}>
                         Pick one to start - you can always switch later.
                       </Text>
@@ -10936,7 +11253,7 @@ function AppContent() {
                           </Pressable>
                         );
                       })}
-                      <Text style={styles.authAccountFootnote}>ZynkUp is free to use. Business features are always available.</Text>
+                      <Text style={styles.authAccountFootnote}>ZynkUP is free to use. Business features are always available.</Text>
                     </>
                   ) : null}
                 </>
@@ -11052,14 +11369,14 @@ function AppContent() {
 
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'left', 'right']}>
-      <StatusBar barStyle="dark-content" translucent backgroundColor="transparent" />
+      <StatusBar barStyle={activeView === 'Chats' ? 'light-content' : 'dark-content'} translucent backgroundColor="transparent" />
 
       {activeView === 'Chats' && chatScreen === 'detail' ? (
         renderChatDetail()
       ) : (
         <View style={styles.screen}>
           {activeView === 'Chats' ? renderChatList() : null}
-          {activeView === 'Explore' ? renderStatus() : null}
+          {activeView === 'Explore' ? renderExplore() : null}
           {activeView === 'Pay' ? renderPay() : null}
           {activeView === 'Business' ? renderBusiness() : null}
           {activeView === 'Profile' ? renderSettings() : null}
@@ -11068,7 +11385,7 @@ function AppContent() {
             {tabs.map((tab) => (
               <Pressable
                 key={tab}
-                style={styles.bottomNavItem}
+                style={[styles.bottomNavItem, activeView === tab ? styles.bottomNavItemOn : null]}
                 onPress={() => {
                   setActiveView(tab);
                   setChatScreen('list');
@@ -11818,7 +12135,7 @@ function AppContent() {
       <Modal transparent visible={Boolean(phonePrompt)} animationType="fade" onRequestClose={() => setPhonePrompt(null)}>
         <Pressable style={styles.dialogOverlay} onPress={() => setPhonePrompt(null)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
-            <Text style={styles.dialogTitle}>{phonePrompt?.name || 'On ZynkUp'}</Text>
+            <Text style={styles.dialogTitle}>{phonePrompt?.name || 'On ZynkUP'}</Text>
             <Text style={styles.cardBody}>{phonePrompt?.phone}{phonePrompt?.username ? ` · ${phonePrompt.username}` : ''}</Text>
             <Text style={styles.cardMeta}>Statuses stay private until you both save each other.</Text>
             <Pressable style={styles.sendButtonWide} onPress={() => { const userId = phonePrompt?.id; setPhonePrompt(null); void createDirectChat(userId); }}>
@@ -11983,7 +12300,7 @@ function AppContent() {
                       style={[styles.ghostButton, { marginTop: 12 }]}
                       onPress={() => {
                         const lines = [
-                          `ZynkUp sales report (${salesDashboard.period})`,
+                          `ZynkUP sales report (${salesDashboard.period})`,
                           `Currency ${salesDashboard.currency}`,
                           `Pending orders ${salesDashboard.metrics?.pendingOrders ?? 0}`,
                           `Confirmed sales ${salesDashboard.metrics?.confirmedSalesCount ?? 0}`,
@@ -12008,7 +12325,7 @@ function AppContent() {
               <ScrollView style={styles.businessPanelScroll}>
                 <Text style={styles.cardBody}>
                   {(activeBusiness?.visibility || 'draft') === 'published'
-                    ? 'Your storefront is public. Anyone on ZynkUp can open it.'
+                    ? 'Your storefront is public. Anyone on ZynkUP can open it.'
                     : 'This storefront is a draft. Publish when you are ready for customers to find you.'}
                 </Text>
                 <TextInput
@@ -12320,7 +12637,7 @@ function AppContent() {
                     <Text style={styles.sheetOptionTitle}>{selectedCustomer.displayName}</Text>
                     <Text style={styles.sheetOptionBody}>
                       {selectedCustomer.phone || 'No phone'}
-                      {selectedCustomer.customerUserId ? ' · On ZynkUp' : ''}
+                      {selectedCustomer.customerUserId ? ' · On ZynkUP' : ''}
                       {' · '}
                       {selectedCustomer.marketingConsent === 'opted_in'
                         ? 'Marketing opted in'
@@ -13454,7 +13771,7 @@ function AppContent() {
         <Pressable style={styles.dialogOverlay} onPress={() => setNewChatVisible(false)}>
           <Pressable style={[styles.dialog, styles.newChatDialog]} onPress={() => undefined}>
             <Text style={styles.dialogTitle}>New chat</Text>
-            <Text style={styles.cardBody}>Contacts on ZynkUp from your phone book</Text>
+            <Text style={styles.cardBody}>Contacts on ZynkUP from your phone book</Text>
             <TextInput
               value={newChatQuery}
               onChangeText={setNewChatQuery}
@@ -13523,7 +13840,7 @@ function AppContent() {
                   return (
                     <View style={styles.emptyChatCard}>
                       <Text style={styles.cardBody}>
-                        No registered contacts yet. Sync your phone book after signing in, or invite friends to ZynkUp.
+                        No registered contacts yet. Sync your phone book after signing in, or invite friends to ZynkUP.
                       </Text>
                       <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
                         <Text style={styles.sendButtonText}>Sync phone book</Text>
@@ -13561,7 +13878,7 @@ function AppContent() {
                       <Text style={styles.sheetOptionBody}>
                         {entry.linkedUserId === currentUserId
                           ? 'Message yourself'
-                          : `${entry.phone} · ${entry.presence === 'online' ? 'Online' : 'On ZynkUp'}`}
+                          : `${entry.phone} · ${entry.presence === 'online' ? 'Online' : 'On ZynkUP'}`}
                       </Text>
                     </Pressable>
                   </View>
@@ -13821,7 +14138,7 @@ function AppContent() {
               void AsyncStorage.setItem(WALLPAPER_KEY, next);
               setChatMenuVisible(false);
             }}>
-              <Text style={styles.sheetOptionTitle}>Wallpaper · {chatWallpaper === 'zynkup' ? 'Zynkup' : chatWallpaper === 'night' ? 'Night' : 'Light'}</Text>
+              <Text style={styles.sheetOptionTitle}>Wallpaper · {chatWallpaper === 'zynkup' ? 'ZynkUP' : chatWallpaper === 'night' ? 'Night' : 'Light'}</Text>
             </Pressable>
             <Pressable style={styles.sheetBack} onPress={() => setChatMenuVisible(false)}>
               <Text style={styles.sheetBackText}>Close</Text>
@@ -14001,21 +14318,7 @@ function AppContent() {
                   </Pressable>
                 ))}
               </View>
-              {(aiHelperTask === 'draft' || aiHelperTask === 'rewrite' || aiHelperTask === 'translate' || aiHelperTask === 'explain') ? (
-                <View style={styles.aiToneRow}>
-                  {['polite', 'concise', 'professional', 'friendly', 'apologetic'].map((tone) => (
-                    <Pressable
-                      key={tone}
-                      style={[styles.aiToneChip, aiRewriteTone === tone ? styles.aiToneChipActive : null]}
-                      onPress={() => setAiRewriteTone(tone)}
-                    >
-                      <Text style={[styles.aiToneChipText, aiRewriteTone === tone ? styles.aiToneChipTextActive : null]}>
-                        {tone}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-              ) : null}
+              {(aiHelperTask === 'draft' || aiHelperTask === 'rewrite' || aiHelperTask === 'translate' || aiHelperTask === 'explain') ? renderToneMenu() : null}
               {aiHelperTask === 'translate' ? (
                 <View style={styles.aiToneRow}>
                   {['en', 'tw', 'ga', 'ee', 'pcm'].map((code) => (
@@ -14243,7 +14546,7 @@ function AppContent() {
             {publicBusinessView?.verified ? ' ✓' : ''}
           </Text>
           <Text style={styles.peerProfileMeta}>
-            {publicBusinessView?.verified ? 'Verified business' : 'Business on ZynkUp'}
+            {publicBusinessView?.verified ? 'Verified business' : 'Business on ZynkUP'}
             {publicBusinessView?.location ? ` · ${publicBusinessView.location}` : ''}
           </Text>
           {publicBusinessView?.hours ? <Text style={styles.peerProfileMeta}>{publicBusinessView.hours}</Text> : null}
@@ -14322,8 +14625,9 @@ function AppContent() {
           >
             {renderPersonAvatar({ userId: activeChat?.peerUserId, name: activeChat?.name, size: 140 })}
           </Pressable>
-          <Text style={styles.peerProfileName}>{activeChat?.name}</Text>
+          <Text style={styles.peerProfileName}>{displayNameFor(activeChat?.peerUserId, activeChat?.name)}</Text>
           <Text style={styles.peerProfileMeta}>{getPresenceLabel(activeChat)}</Text>
+          <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.username ? `@${usersById[activeChat.peerUserId].username}` : ''}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.about || 'No about yet'}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.phone || ''}</Text>
           {activeChat?.peerUserId ? (
@@ -14513,7 +14817,7 @@ function AppContent() {
         <View style={styles.lockOverlay}>
           <View style={styles.dialog}>
             <Text style={styles.dialogTitle}>App locked</Text>
-            <Text style={styles.cardBody}>Enter your PIN to open ZynkUp.</Text>
+            <Text style={styles.cardBody}>Enter your PIN to open ZynkUP.</Text>
             {lockNotice ? <Text style={[styles.cardBody, { color: '#d4544c' }]}>{lockNotice.title}: {lockNotice.body}. Unlock to open it.</Text> : null}
             <TextInput
               value={unlockPinDraft}
@@ -14955,18 +15259,24 @@ const styles = StyleSheet.create({
   bottomNav: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingTop: 6,
-    paddingBottom: 6,
-    paddingHorizontal: 10,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#d9dde4',
-    backgroundColor: '#ffffff',
+    marginHorizontal: 12,
+    marginBottom: 8,
+    paddingTop: 8,
+    paddingBottom: 8,
+    paddingHorizontal: 8,
+    borderRadius: 28,
+    backgroundColor: '#12082A',
   },
   bottomNavItem: {
     flex: 1,
     alignItems: 'center',
     gap: 4,
     position: 'relative',
+    paddingVertical: 6,
+    borderRadius: 22,
+  },
+  bottomNavItemOn: {
+    backgroundColor: '#7C3AED',
   },
   bottomNavComposeWrap: {
     flex: 1,
@@ -15007,17 +15317,17 @@ const styles = StyleSheet.create({
     fontSize: 20,
   },
   bottomNavIconActive: {
-    color: '#15c79a',
+    color: '#ffffff',
   },
   bottomNavLabel: {
-    color: '#7f8591',
+    color: '#b7adc9',
     fontSize: 11,
     fontWeight: '500',
     letterSpacing: -0.1,
   },
   bottomNavLabelActive: {
-    color: '#15c79a',
-    fontWeight: '600',
+    color: '#ffffff',
+    fontWeight: '700',
   },
   bottomNavBadge: {
     position: 'absolute',
@@ -15219,6 +15529,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
   },
   chatHomeAvatar: {
     width: 56,
@@ -15356,7 +15668,7 @@ const styles = StyleSheet.create({
     minWidth: 24,
     height: 24,
     borderRadius: 12,
-    backgroundColor: '#15c79a',
+    backgroundColor: '#FF2D8A',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 6,
@@ -15912,13 +16224,131 @@ const styles = StyleSheet.create({
   chatListShell: {
     flex: 1,
   },
+  chatListScreen: {
+    flex: 1,
+    backgroundColor: '#14082A',
+  },
+  chatListHeader: {
+    paddingTop: 18,
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  chatListTitleBlock: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  chatListMark: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+  },
+  chatListTitle: {
+    color: '#ffffff',
+    fontSize: 28,
+    fontWeight: '800',
+  },
+  chatListIdentity: {
+    color: '#c4b5fd',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  chatListAction: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  chatListActionText: {
+    color: '#ffffff',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  chatFilterRow: {
+    paddingHorizontal: 16,
+    paddingBottom: 12,
+    gap: 8,
+  },
+  chatFilterChip: {
+    minHeight: 38,
+    paddingHorizontal: 16,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  chatFilterChipOn: {
+    backgroundColor: '#7C3AED',
+  },
+  chatFilterText: {
+    color: '#d6d0e6',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  chatFilterTextOn: {
+    color: '#ffffff',
+  },
+  exploreChip: {
+    backgroundColor: '#ece7f8',
+  },
+  exploreChipText: {
+    color: '#3b3354',
+  },
+  profileVideoPreview: {
+    width: 120,
+    height: 160,
+    borderRadius: 16,
+    marginTop: 12,
+    backgroundColor: '#12082A',
+  },
+  aiToneMenu: {
+    marginHorizontal: 12,
+    marginBottom: 8,
+  },
+  aiToneMenuButton: {
+    alignSelf: 'flex-start',
+    minHeight: 36,
+    paddingHorizontal: 14,
+    borderRadius: 18,
+    backgroundColor: '#1c1238',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  aiToneMenuButtonText: {
+    color: '#f8fbff',
+    fontWeight: '700',
+  },
+  aiToneMenuList: {
+    marginTop: 6,
+    borderRadius: 16,
+    backgroundColor: '#1c1238',
+    overflow: 'hidden',
+  },
+  aiToneMenuItem: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  aiToneMenuItemText: {
+    color: '#d6d0e6',
+    fontSize: 15,
+    textTransform: 'capitalize',
+  },
+  aiToneMenuItemTextOn: {
+    color: '#ffffff',
+    fontWeight: '800',
+  },
   chatFab: {
     position: 'absolute',
     right: 18,
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: '#128C7E',
+    backgroundColor: '#7C3AED',
     alignItems: 'center',
     justifyContent: 'center',
     shadowColor: '#0b3b34',
