@@ -2525,6 +2525,9 @@ const privacyAllows = (
   return mutual;
 };
 
+const profileMediaChoice = (value: string | null | undefined): 'photo' | 'video' =>
+  value === 'video' ? 'video' : 'photo';
+
 /** Gate photo/video for a viewer. Video privacy falls back to profilePhotoPrivacy when unset. */
 const presentProfileMedia = (
   profile: Profile | null | undefined,
@@ -2544,7 +2547,7 @@ const presentProfileMedia = (
     profileVideoUri: seeVideo ? (profile?.profileVideoUri || '') : '',
     profileVideoPosterUri: seeVideo ? (profile?.profileVideoPosterUri || '') : '',
     profileVideoDurationSeconds: seeVideo ? (profile?.profileVideoDurationSeconds ?? 0) : 0,
-    profileMediaDefault: profile?.profileMediaDefault === 'video' ? 'video' : 'photo',
+    profileMediaDefault: profileMediaChoice(profile?.profileMediaDefault),
     profilePhotoPrivacy: profile?.profilePhotoPrivacy ?? 'everyone',
     profileVideoPrivacy: profile?.profileVideoPrivacy ?? profile?.profilePhotoPrivacy ?? 'everyone',
   };
@@ -3168,7 +3171,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
         profileVideoUri: item.profileVideoUri || '',
         profileVideoPosterUri: item.profileVideoPosterUri || '',
         profileVideoDurationSeconds: item.profileVideoDurationSeconds ?? 0,
-        profileMediaDefault: item.profileMediaDefault === 'video' ? 'video' : 'photo',
+        profileMediaDefault: profileMediaChoice(item.profileMediaDefault),
       },
     ]),
   );
@@ -3180,7 +3183,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       profileVideoUri: media?.profileVideoUri || user.profileVideoUri || '',
       profileVideoPosterUri: media?.profileVideoPosterUri || user.profileVideoPosterUri || '',
       profileVideoDurationSeconds: media?.profileVideoDurationSeconds ?? user.profileVideoDurationSeconds ?? 0,
-      profileMediaDefault: media?.profileMediaDefault === 'video' || user.profileMediaDefault === 'video' ? 'video' : 'photo',
+      profileMediaDefault: profileMediaChoice(media?.profileMediaDefault ?? user.profileMediaDefault),
     };
   });
   const myBusinesses = await businessesForUser(currentUserId);
@@ -3318,6 +3321,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       profileVideoUri: media.profileVideoUri,
       profileVideoPosterUri: media.profileVideoPosterUri,
       profileVideoDurationSeconds: media.profileVideoDurationSeconds,
+      profileMediaDefault: media.profileMediaDefault,
       presence: seePresence ? user.presence : 'offline',
       lastSeenAt: seePresence ? user.lastSeenAt : undefined,
       lastSeenPrivacy: theirProfile?.lastSeenPrivacy ?? 'everyone',
