@@ -150,6 +150,8 @@ const ACCOUNT_STORAGE_KEY = 'zynkup-mobile-account';
 const OUTBOX_STORAGE_KEY = 'zynkup-mobile-outbox';
 const SEEN_STATUS_KEY = 'zynkup-seen-statuses';
 const WALLPAPER_KEY = 'zynkup-chat-wallpaper';
+const WALLPAPER_IMAGES_KEY = 'zynkup-chat-wallpaper-images';
+const DELETED_CHATS_KEY = 'zynkup-deleted-chats';
 const STATUS_TEXT_LIMIT = 700;
 const SESSION_IDLE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_APP_SETTINGS = {
@@ -170,6 +172,7 @@ const DEFAULT_APP_SETTINGS = {
   readReceiptsEnabled: true,
   appLockEnabled: false,
   pinDisabled: false,
+  appearance: 'dark',
 };
 const SETTINGS_MENU = [
   { id: 'favorites', title: 'Favorites', subtitle: 'Pin important chats to the top', icon: '★' },
@@ -210,6 +213,7 @@ const STATUS_IMAGE_DURATION_MS = 5000;
 const STATUS_VIDEO_DURATION_MS = 60000;
 const BOOTSTRAP_TIMEOUT_MS = 5000;
 const CueSound = NativeModules.CueSound;
+const GallerySaver = NativeModules.GallerySaver;
 const WEBRTC_CONFIGURATION = {
   iceCandidatePoolSize: 4,
   iceServers: [
@@ -221,8 +225,8 @@ const WEBRTC_CONFIGURATION = {
         'turn:global.relay.metered.ca:443',
         'turns:global.relay.metered.ca:443?transport=tcp',
       ],
-      username: 'f6507426c0f4f89d0bda02e2',
-      credential: '7YF0907XexAfvkbL',
+      username: 'cf65e59537c8b09afdee722b',
+      credential: 'Jh8wdW5ryo4Y5lE5',
     },
   ],
 };
@@ -524,13 +528,33 @@ function AppContent() {
     profileVideoUri: '',
     profileVideoPosterUri: '',
     profileVideoDurationSeconds: 0,
+    profileMediaDefault: 'photo',
     blockedUserIds: [],
   });
   const [settingsPanel, setSettingsPanel] = useState('');
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
+  const isDark = appSettings.appearance !== 'light';
+  const chrome = {
+    bg: isDark ? '#14082A' : '#f4efe6',
+    card: isDark ? '#1c1238' : '#ffffff',
+    ink: isDark ? '#f8fbff' : '#111827',
+    muted: isDark ? '#b7adc9' : '#5c6570',
+    nav: isDark ? '#12082A' : '#f4efe6',
+    chip: isDark ? 'rgba(255,255,255,0.1)' : '#e6dfd2',
+    line: isDark ? 'rgba(255,255,255,0.12)' : '#d9d3c7',
+  };
+  const toggleAppearance = () => {
+    const next = isDark ? 'light' : 'dark';
+    const nextSettings = { ...appSettingsRef.current, appearance: next };
+    appSettingsRef.current = nextSettings;
+    setAppSettings(nextSettings);
+    void AsyncStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings)).catch(() => undefined);
+  };
   const [favoriteChatIds, setFavoriteChatIds] = useState([]);
   const [mutedChatIds, setMutedChatIds] = useState([]);
   const [archivedChatIds, setArchivedChatIds] = useState([]);
+  const [deletedChatIds, setDeletedChatIds] = useState([]);
+  const deletedChatIdsRef = useRef([]);
   const [lockedChatIds, setLockedChatIds] = useState([]);
   const [unlockChatId, setUnlockChatId] = useState('');
   const [unlockPin, setUnlockPin] = useState('');
@@ -603,6 +627,7 @@ function AppContent() {
     followUpAt: '',
   });
   const [customerNoteDraft, setCustomerNoteDraft] = useState('');
+  const [customerPickerOpen, setCustomerPickerOpen] = useState(false);
   const [customerPrefs, setCustomerPrefs] = useState([]);
   const [catalogSearch, setCatalogSearch] = useState('');
   const [catalogCategory, setCatalogCategory] = useState('All');
@@ -683,6 +708,8 @@ function AppContent() {
   const [activeCallSeconds, setActiveCallSeconds] = useState(0);
   const [localCallStream, setLocalCallStream] = useState(null);
   const [remoteCallStream, setRemoteCallStream] = useState(null);
+  const [remoteStreamsByUser, setRemoteStreamsByUser] = useState({});
+  const [focusedPeerId, setFocusedPeerId] = useState('');
   const [callError, setCallError] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [recordingPaused, setRecordingPaused] = useState(false);
@@ -707,7 +734,9 @@ function AppContent() {
   const [floatPos, setFloatPos] = useState({ x: 210, y: 120 });
   const [seenStatusIds, setSeenStatusIds] = useState([]);
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
-  const [chatWallpaper, setChatWallpaper] = useState('zynkup');
+  const [chatWallpaper, setChatWallpaper] = useState('beige');
+  const [wallpaperImages, setWallpaperImages] = useState({ all: '', byChat: {} });
+  const [wallpaperSheetVisible, setWallpaperSheetVisible] = useState(false);
   const [roomPicking, setRoomPicking] = useState(false);
   const [roomSelection, setRoomSelection] = useState([]);
   const [roomTitle, setRoomTitle] = useState('');
@@ -723,6 +752,7 @@ function AppContent() {
   const [exploreReload, setExploreReload] = useState(0);
   const [communityName, setCommunityName] = useState('');
   const [aiToneMenuVisible, setAiToneMenuVisible] = useState(false);
+  const [aiToolsMenuVisible, setAiToolsMenuVisible] = useState(false);
   const [chatRequests, setChatRequests] = useState([]);
   const [mutualUserIds, setMutualUserIds] = useState([]);
   const mutualUserIdsRef = useRef([]);
@@ -822,6 +852,7 @@ function AppContent() {
   const remoteReadyRef = useRef(false);
   const iceRestartedRef = useRef(false);
   const signalChainRef = useRef(Promise.resolve());
+  const offerFlightRef = useRef(new Set());
   const outboxRef = useRef([]);
   const outboxFlushRef = useRef(false);
   const flushOutboxRef = useRef(() => undefined);
@@ -864,6 +895,7 @@ function AppContent() {
   const incomingCallRef = useRef(null);
   const refreshSessionRef = useRef(() => undefined);
   const peerConnectionRef = useRef(null);
+  const peerConnectionsRef = useRef(new Map());
   const callMediaStreamRef = useRef(null);
   const mediaQueueRef = useRef(Promise.resolve());
   const remoteMediaStreamRef = useRef(null);
@@ -939,6 +971,9 @@ function AppContent() {
       if ((chat.space || 'personal') !== activeSpace) {
         return false;
       }
+      if (deletedChatIds.includes(chat.id)) {
+        return false;
+      }
       const archived = archivedChatIds.includes(chat.id);
       if (showArchivedChats ? !archived : archived) {
         return false;
@@ -951,7 +986,7 @@ function AppContent() {
     const favorites = scoped.filter((chat) => favoriteChatIds.includes(chat.id));
     const rest = scoped.filter((chat) => !favoriteChatIds.includes(chat.id));
     return [...favorites, ...rest];
-  }, [activeBusinessId, archivedChatIds, chatItems, chatSearchQuery, favoriteChatIds, showArchivedChats]);
+  }, [activeBusinessId, archivedChatIds, chatItems, chatSearchQuery, deletedChatIds, favoriteChatIds, showArchivedChats]);
 
   const payQuickContacts = useMemo(() => {
     const merged = [
@@ -1205,6 +1240,35 @@ function AppContent() {
     showToast(exists ? 'Chat unarchived' : 'Chat archived', 'success', 1400);
   };
 
+  const rememberDeletedChats = (ids) => {
+    deletedChatIdsRef.current = ids;
+    setDeletedChatIds(ids);
+    void AsyncStorage.setItem(DELETED_CHATS_KEY, JSON.stringify(ids)).catch(() => undefined);
+  };
+
+  const revealDeletedChat = (chatId) => {
+    if (!chatId || !deletedChatIdsRef.current.includes(chatId)) return;
+    rememberDeletedChats(deletedChatIdsRef.current.filter((id) => id !== chatId));
+  };
+
+  const deleteChatFromList = async (chat) => {
+    if (!chat?.id) return;
+    const chatId = chat.id;
+    rememberDeletedChats([chatId, ...deletedChatIdsRef.current.filter((id) => id !== chatId)]);
+    setChatItems((current) => current.filter((item) => item.id !== chatId));
+    if (selectedChatIdRef.current === chatId) {
+      setChatScreen('list');
+    }
+    if (chat.kind === 'group') {
+      try {
+        await fetch(`${API_BASE_URL}/api/chats/${chatId}?userId=${encodeURIComponent(currentUserId)}`, { method: 'DELETE' });
+      } catch {
+        // The chat stays off this phone even if the room remains for other members.
+      }
+    }
+    showToast('Chat deleted.', 'success');
+  };
+
   const mapServerMessage = (message, userId = currentUserId) => {
     const deleted = Boolean(message.deletedForEveryone);
     const mediaUrl = deleted ? undefined : message.mediaUrls?.[0];
@@ -1375,13 +1439,17 @@ function AppContent() {
     if (saved) return saved;
     const user = usersById[userId];
     if (!user) return fallback || 'ZynkUP';
-    return user.name || fallback || shortPhone(user.phone) || 'ZynkUP';
+    return user.name || fallback || String(user.phone || '').replace(/\s+/g, '') || 'ZynkUP';
   };
 
   const headerLabelFor = (userId, fallback = '') => {
-    const phone = shortPhone(usersById[userId]?.phone);
+    if (!userId) return fallback || 'ZynkUP';
+    const saved = savedNameFor(userId);
+    if (saved) return saved;
+    const user = usersById[userId];
+    const phone = String(user?.phone || '').replace(/\s+/g, '');
     if (phone) return phone;
-    return displayNameFor(userId, fallback);
+    return user?.name || fallback || 'ZynkUP';
   };
 
   const isMutualContact = (userId) => {
@@ -1479,6 +1547,7 @@ function AppContent() {
           profileVideoUri: /^https?:\/\//i.test(nextProfile.profileVideoUri || '') ? nextProfile.profileVideoUri : '',
           profileVideoPosterUri: /^https?:\/\//i.test(nextProfile.profileVideoPosterUri || '') ? nextProfile.profileVideoPosterUri : '',
           profileVideoDurationSeconds: Number(nextProfile.profileVideoDurationSeconds) || 0,
+          profileMediaDefault: nextProfile.profileMediaDefault === 'video' ? 'video' : 'photo',
           currency: nextProfile.currency || accountCurrency,
           lastSeenPrivacy: nextSettings.lastSeenPrivacy,
           profilePhotoPrivacy: nextSettings.profilePhotoPrivacy,
@@ -1511,6 +1580,7 @@ function AppContent() {
           profileVideoUri: payload.profile.profileVideoUri ?? current.profileVideoUri,
           profileVideoPosterUri: payload.profile.profileVideoPosterUri ?? current.profileVideoPosterUri,
           profileVideoDurationSeconds: payload.profile.profileVideoDurationSeconds ?? current.profileVideoDurationSeconds,
+          profileMediaDefault: payload.profile.profileMediaDefault || current.profileMediaDefault || 'photo',
         }));
       }
       if (/^\d{4,6}$/.test(pinToSave)) {
@@ -2143,7 +2213,11 @@ function AppContent() {
   };
 
   const closePeerConnection = () => {
-    peerConnectionRef.current?.getSenders().forEach((sender) => sender.track?.stop?.());
+    peerConnectionsRef.current.forEach((connection) => {
+      connection.getSenders?.().forEach((sender) => sender.track?.stop?.());
+      connection.close?.();
+    });
+    peerConnectionsRef.current = new Map();
     peerConnectionRef.current?.close?.();
     peerConnectionRef.current = null;
     iceRestartedRef.current = false;
@@ -2156,7 +2230,29 @@ function AppContent() {
     remoteReadyRef.current = false;
     setLocalCallStream(null);
     setRemoteCallStream(null);
+    setRemoteStreamsByUser({});
+    setFocusedPeerId('');
     setLocalVideoLarge(false);
+  };
+
+  const attachLocalTracks = (connection, stream) => {
+    if (!connection || !stream) return;
+    stream.getTracks().forEach((track) => {
+      track.enabled = true;
+      const sender = connection.getSenders?.().find((item) => item.track?.kind === track.kind);
+      if (sender?.track) return;
+      const transceiver = connection.getTransceivers?.().find((item) => item.receiver?.track?.kind === track.kind || item.sender?.track?.kind === track.kind);
+      if (transceiver?.sender?.replaceTrack) {
+        transceiver.direction = 'sendrecv';
+        transceiver.sender.replaceTrack(track).catch(() => undefined);
+        return;
+      }
+      try {
+        connection.addTrack(track, stream);
+      } catch {
+        // Already attached.
+      }
+    });
   };
 
   const ensureCallMedia = (kind) => {
@@ -2219,8 +2315,7 @@ function AppContent() {
         if (!videoTrack) throw new Error('camera-failed');
         videoTrack.enabled = true;
         existing.addTrack(videoTrack);
-        const connection = peerConnectionRef.current;
-        if (connection) {
+        peerConnectionsRef.current.forEach((connection) => {
           const sender = connection.getSenders?.().find((item) => item.track?.kind === 'video');
           if (sender?.replaceTrack) {
             sender.replaceTrack(videoTrack).catch(() => undefined);
@@ -2231,7 +2326,7 @@ function AppContent() {
               // Already attached.
             }
           }
-        }
+        });
         callMediaStreamRef.current = existing;
         const PreviewStream = webRtcModule?.MediaStream;
         setLocalCallStream(PreviewStream ? new PreviewStream(existing.getTracks()) : existing);
@@ -2266,21 +2361,7 @@ function AppContent() {
       stream.getVideoTracks?.().forEach((track) => {
         track.enabled = true;
       });
-      const connection = peerConnectionRef.current;
-      if (connection) {
-        stream.getTracks().forEach((track) => {
-          const sender = connection.getSenders?.().find((item) => item.track?.kind === track.kind);
-          if (sender?.replaceTrack) {
-            sender.replaceTrack(track).catch(() => undefined);
-          } else {
-            try {
-              connection.addTrack(track, stream);
-            } catch {
-              // Track is already on this connection.
-            }
-          }
-        });
-      }
+      peerConnectionsRef.current.forEach((connection) => attachLocalTracks(connection, stream));
       callMediaStreamRef.current = stream;
       const PreviewStream = webRtcModule?.MediaStream;
       setLocalCallStream(PreviewStream ? new PreviewStream(stream.getTracks()) : stream);
@@ -2387,30 +2468,44 @@ function AppContent() {
   };
 
   const enableVideoOnCall = async () => {
-    const connection = peerConnectionRef.current;
     const call = activeCallRef.current;
-    if (!connection || !call) {
-      return;
-    }
+    if (!call) return;
     const stream = await ensureCallMedia('Video');
     const videoTrack = stream.getVideoTracks?.()?.find((track) => track.readyState === 'live');
-    if (!videoTrack) {
-      throw new Error('camera-failed');
-    }
+    if (!videoTrack) throw new Error('camera-failed');
     videoTrack.enabled = true;
-    const sender = connection.getSenders?.().find((item) => item.track?.kind === 'video');
-    if (sender?.replaceTrack) {
-      await sender.replaceTrack(videoTrack);
-    } else {
-      connection.addTrack(videoTrack, stream);
-    }
     setCallCameraOff(false);
-    setActiveCall((current) => (current ? { ...current, kind: 'Video' } : current));
-    emitCallSignal(call.id, 'camera', { enabled: true }, call.peerUserId);
-    if (connection.signalingState === 'stable') {
-      const offer = await connection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-      await connection.setLocalDescription(offer);
-      emitCallSignal(call.id, 'offer', offer, call.peerUserId);
+    setCallSpeaker(true);
+    const nextCall = { ...call, kind: 'Video' };
+    activeCallRef.current = nextCall;
+    setActiveCall(nextCall);
+    setLocalVideoLarge(false);
+    const peers = [...peerConnectionsRef.current.entries()];
+    if (!peers.length && call.peerUserId) {
+      await offerToPeer(nextCall, call.peerUserId);
+      return;
+    }
+    for (const [peerUserId, connection] of peers) {
+      const sender = connection.getSenders?.().find((item) => item.track?.kind === 'video');
+      if (sender?.replaceTrack) {
+        await sender.replaceTrack(videoTrack);
+      } else {
+        try {
+          connection.addTrack(videoTrack, stream);
+        } catch {
+          // Already attached.
+        }
+      }
+      connection.getTransceivers?.().forEach((transceiver) => {
+        const kind = transceiver.sender?.track?.kind || transceiver.receiver?.track?.kind;
+        if (kind === 'video') transceiver.direction = 'sendrecv';
+      });
+      if (connection.signalingState === 'stable') {
+        const offer = await connection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        await connection.setLocalDescription(offer);
+        emitCallSignal(call.id, 'offer', offer, peerUserId);
+      }
+      emitCallSignal(call.id, 'camera', { enabled: true }, peerUserId);
     }
   };
 
@@ -2589,58 +2684,74 @@ function AppContent() {
     }
   };
 
-  const ensurePeerConnection = async (call) => {
-    if (!CAN_USE_NATIVE_WEBRTC || !RTCPeerConnectionNative) {
+  const ensurePeerConnection = async (call, peerUserId) => {
+    if (!CAN_USE_NATIVE_WEBRTC || !RTCPeerConnectionNative || !peerUserId) {
       throw new Error('native-webrtc-unavailable');
     }
-
-    if (peerConnectionRef.current) {
-      return peerConnectionRef.current;
+    const current = peerConnectionsRef.current.get(peerUserId);
+    if (current && current.connectionState !== 'closed' && current.signalingState !== 'closed') {
+      return current;
     }
 
     const connection = new RTCPeerConnectionNative(WEBRTC_CONFIGURATION);
     const MediaStreamCtor = webRtcModule?.MediaStream;
-    if (!remoteMediaStreamRef.current && MediaStreamCtor) {
-      remoteMediaStreamRef.current = new MediaStreamCtor();
-    }
+    const remoteStream = MediaStreamCtor ? new MediaStreamCtor() : null;
     connection.ontrack = (event) => {
-      const bucket = remoteMediaStreamRef.current;
       const track = event.track;
+      if (track) track.enabled = true;
+      const bucket = remoteStream || event.streams?.[0];
       if (bucket && track && !bucket.getTracks().some((item) => item.id === track.id)) {
         bucket.addTrack(track);
-        setRemoteCallStream(bucket);
-        return;
       }
-      if (event.streams?.[0]) {
-        setRemoteCallStream(event.streams[0]);
-      }
+      const nextStream = bucket || event.streams?.[0];
+      if (!nextStream) return;
+      setRemoteStreamsByUser((prev) => ({ ...prev, [peerUserId]: nextStream }));
+      setRemoteCallStream(nextStream);
+      setFocusedPeerId((prev) => prev || peerUserId);
     };
     connection.onicecandidate = (event) => {
       if (event.candidate) {
-        emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), call.peerUserId);
+        emitCallSignal(call.id, 'ice-candidate', event.candidate.toJSON(), peerUserId);
       }
     };
     connection.oniceconnectionstatechange = () => {
       if (connection.iceConnectionState === 'connected' || connection.iceConnectionState === 'completed') {
         setCallError('');
+        CueSound?.setSpeaker?.(callSpeakerOnRef.current);
         return;
       }
-      if (connection.iceConnectionState !== 'failed') {
+      if (connection.iceConnectionState !== 'failed') return;
+      if (typeof connection.restartIce === 'function') {
+        connection.restartIce();
         return;
-      }
-      if (!iceRestartedRef.current) {
-        iceRestartedRef.current = true;
-        if (typeof connection.restartIce === 'function') {
-          connection.restartIce();
-          return;
-        }
       }
       setCallError('Call media could not connect. Try again on a stronger network.');
     };
     const localStream = await ensureCallMedia(call.kind);
-    localStream.getTracks().forEach((track) => connection.addTrack(track, localStream));
+    attachLocalTracks(connection, localStream);
+    const hasVideo = connection.getSenders?.().some((sender) => sender.track?.kind === 'video');
+    if (!hasVideo && connection.addTransceiver) {
+      connection.addTransceiver('video', { direction: 'recvonly' });
+    }
+    peerConnectionsRef.current.set(peerUserId, connection);
     peerConnectionRef.current = connection;
     return connection;
+  };
+
+  const offerToPeer = async (call, peerUserId) => {
+    if (!call?.id || !peerUserId || peerUserId === currentUserIdRef.current) return;
+    const flightKey = `${call.id}:${peerUserId}`;
+    if (offerFlightRef.current.has(flightKey)) return;
+    offerFlightRef.current.add(flightKey);
+    try {
+      const connection = await ensurePeerConnection(call, peerUserId);
+      if (connection.localDescription || connection.signalingState !== 'stable') return;
+      const offer = await connection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await connection.setLocalDescription(offer);
+      emitCallSignal(call.id, 'offer', connection.localDescription || offer, peerUserId);
+    } finally {
+      offerFlightRef.current.delete(flightKey);
+    }
   };
 
   const uploadUris = async (uris, options = {}) => {
@@ -2849,6 +2960,7 @@ function AppContent() {
       profileVideoUri: payload.profile?.profileVideoUri || '',
       profileVideoPosterUri: payload.profile?.profileVideoPosterUri || '',
       profileVideoDurationSeconds: payload.profile?.profileVideoDurationSeconds || 0,
+      profileMediaDefault: payload.profile?.profileMediaDefault || current.profileMediaDefault || 'photo',
       blockedUserIds: payload.profile?.blockedUserIds ?? current.blockedUserIds ?? [],
     }));
     if (payload.profile) {
@@ -2876,7 +2988,10 @@ function AppContent() {
         return next;
       });
     }
-    const nextChats = (payload.chats ?? []).map((chat) => mapChatFromServer(chat, nextCurrentUserId, nextUsersById));
+    const hiddenChats = new Set(deletedChatIdsRef.current);
+    const nextChats = (payload.chats ?? [])
+      .map((chat) => mapChatFromServer(chat, nextCurrentUserId, nextUsersById))
+      .filter((chat) => !hiddenChats.has(chat.id));
     setChatItems(nextChats);
     setSelectedChatId((current) => (nextChats.some((chat) => chat.id === current) ? current : nextChats[0]?.id ?? ''));
     setContactItems(
@@ -3327,6 +3442,7 @@ function AppContent() {
       }
     });
     socket.on('message:new', (message) => {
+      revealDeletedChat(message.chatId);
       if (message.sender?.id) {
         const sender = message.sender;
         usersByIdRef.current = {
@@ -3508,6 +3624,9 @@ function AppContent() {
       }
     });
     socket.on('chat:updated', (chat) => {
+      if (deletedChatIdsRef.current.includes(chat.id)) {
+        return;
+      }
       if (chat.viewerUserId && chat.viewerUserId !== currentUserIdRef.current) {
         return;
       }
@@ -3538,6 +3657,9 @@ function AppContent() {
       });
     });
     socket.on('chat:created', (chat) => {
+      if (deletedChatIdsRef.current.includes(chat.id)) {
+        return;
+      }
       if (!(chat.participants ?? []).includes(currentUserIdRef.current)) {
         return;
       }
@@ -3722,26 +3844,10 @@ function AppContent() {
     });
     socket.on('call:participantJoined', ({ callId, userId }) => {
       const currentCall = activeCallRef.current;
-      if (!currentCall || currentCall.id !== callId || currentCall.initiatorId !== currentUserIdRef.current) {
+      if (!currentCall || currentCall.id !== callId || !userId || userId === currentUserIdRef.current) {
         return;
       }
-
-      void (async () => {
-        try {
-          const connection = await ensurePeerConnection(currentCall);
-          if (connection.localDescription) {
-            return;
-          }
-          const offer = await connection.createOffer({
-            offerToReceiveAudio: true,
-            offerToReceiveVideo: currentCall.kind === 'Video',
-          });
-          await connection.setLocalDescription(offer);
-          emitCallSignal(callId, 'offer', offer, userId);
-        } catch {
-          setCallError('Unable to start call media.');
-        }
-      })();
+      void offerToPeer(currentCall, userId).catch(() => setCallError('Unable to start call media.'));
     });
     socket.on('call:signal', ({ callId, fromUserId, signalType, payload }) => {
       const currentCall = activeCallRef.current;
@@ -3751,20 +3857,34 @@ function AppContent() {
 
       signalChainRef.current = signalChainRef.current.then(async () => {
         try {
-          const connection = await ensurePeerConnection(currentCall);
+          const connection = await ensurePeerConnection(currentCall, fromUserId);
           if (signalType === 'offer') {
-            if (connection.signalingState === 'have-local-offer') {
-              return;
-            }
             if (connection.remoteDescription?.sdp && connection.remoteDescription.sdp === payload?.sdp) {
               return;
+            }
+            if (connection.signalingState === 'have-local-offer') {
+              try {
+                await connection.setLocalDescription({ type: 'rollback' });
+              } catch {
+                return;
+              }
+            }
+            const wantsVideo = String(payload?.sdp || '').includes('m=video');
+            if (wantsVideo && activeCallRef.current?.kind !== 'Video') {
+              const upgraded = { ...activeCallRef.current, kind: 'Video' };
+              activeCallRef.current = upgraded;
+              setActiveCall(upgraded);
+              setCallSpeaker(true);
+              setLocalVideoLarge(false);
             }
             await connection.setRemoteDescription(new RTCSessionDescriptionNative(payload));
             remoteReadyRef.current = true;
             await flushQueuedIce(connection);
+            const local = await ensureCallMedia(wantsVideo ? 'Video' : (activeCallRef.current?.kind || 'Audio'));
+            attachLocalTracks(connection, local);
             const answer = await connection.createAnswer();
             await connection.setLocalDescription(answer);
-            emitCallSignal(callId, 'answer', answer, fromUserId);
+            emitCallSignal(callId, 'answer', connection.localDescription || answer, fromUserId);
             return;
           }
 
@@ -3783,27 +3903,20 @@ function AppContent() {
             return;
           }
 
-          if (signalType === 'video-upgrade') {
-            Alert.alert('Switch to video?', 'The other person wants to turn this into a video call.', [
-              { text: 'Stay on audio', style: 'cancel' },
-              {
-                text: 'Accept',
-                onPress: () => {
-                  emitCallSignal(callId, 'video-upgrade-accept', { accepted: true }, fromUserId);
-                  void enableVideoOnCall().catch((error) => setCallError(error?.message === 'permission-denied' ? 'Camera permission was denied.' : 'The camera did not start. Try the video switch again.'));
-                },
-              },
-            ]);
-            return;
-          }
-
-          if (signalType === 'video-upgrade-accept') {
-            void enableVideoOnCall().catch((error) => setCallError(error?.message === 'permission-denied' ? 'Camera permission was denied.' : 'The camera did not start. Try the video switch again.'));
+          if (signalType === 'video-upgrade' || signalType === 'video-upgrade-accept') {
+            void ensureCallMedia('Video').then(() => {
+              if (activeCallRef.current && activeCallRef.current.kind !== 'Video') {
+                const upgraded = { ...activeCallRef.current, kind: 'Video' };
+                activeCallRef.current = upgraded;
+                setActiveCall(upgraded);
+                setCallSpeaker(true);
+              }
+            }).catch(() => undefined);
             return;
           }
 
           if (signalType === 'ice-candidate' && payload) {
-            if (!remoteReadyRef.current || !connection.remoteDescription) {
+            if (!connection.remoteDescription) {
               pendingIceRef.current.push(payload);
               return;
             }
@@ -3830,7 +3943,7 @@ function AppContent() {
   useEffect(() => {
     void (async () => {
       try {
-        const [storedSettings, storedFavorites, storedMuted, storedArchived, storedLocked, storedPin, storedCards] = await Promise.all([
+        const [storedSettings, storedFavorites, storedMuted, storedArchived, storedLocked, storedPin, storedCards, storedDeleted] = await Promise.all([
           AsyncStorage.getItem(SETTINGS_STORAGE_KEY),
           AsyncStorage.getItem(FAVORITES_STORAGE_KEY),
           AsyncStorage.getItem(MUTED_CHATS_STORAGE_KEY),
@@ -3838,6 +3951,7 @@ function AppContent() {
           AsyncStorage.getItem(LOCKED_CHATS_STORAGE_KEY),
           AsyncStorage.getItem(APP_LOCK_PIN_KEY),
           AsyncStorage.getItem(DISMISSED_CARDS_KEY),
+          AsyncStorage.getItem(DELETED_CHATS_KEY),
         ]);
         let nextSettings = { ...DEFAULT_APP_SETTINGS };
         if (storedSettings) {
@@ -3862,6 +3976,14 @@ function AppContent() {
           const parsed = JSON.parse(storedArchived);
           if (Array.isArray(parsed)) {
             setArchivedChatIds(parsed);
+          }
+        }
+        if (storedDeleted) {
+          const parsed = JSON.parse(storedDeleted);
+          if (Array.isArray(parsed)) {
+            deletedChatIdsRef.current = parsed;
+            setDeletedChatIds(parsed);
+            setChatItems((current) => current.filter((item) => !parsed.includes(item.id)));
           }
         }
         if (storedLocked) {
@@ -4004,22 +4126,7 @@ function AppContent() {
       if (peerConnectionRef.current?.localDescription || peerConnectionRef.current?.remoteDescription) {
         return;
       }
-      void (async () => {
-        try {
-          const connection = await ensurePeerConnection(call);
-          if (connection.localDescription || connection.remoteDescription) {
-            return;
-          }
-          const offer = await connection.createOffer({
-            offerToReceiveAudio: true,
-            offerToReceiveVideo: call.kind === 'Video',
-          });
-          await connection.setLocalDescription(offer);
-          emitCallSignal(call.id, 'offer', offer, call.peerUserId);
-        } catch {
-          setCallError('Unable to start call media.');
-        }
-      })();
+      void offerToPeer(call, call.peerUserId).catch(() => setCallError('Unable to start call media.'));
     }, 40);
     return () => clearTimeout(timer);
   }, [activeCall?.id, activeCall?.state, activeCall?.initiatorId, currentUserId]);
@@ -4083,7 +4190,11 @@ function AppContent() {
       }
     } else if (mapped.state === 'ongoing' || (mapped.state === 'ringing' && mapped.initiatorId === (currentUserIdRef.current || currentUserId))) {
       setIncomingCall((current) => (current?.id === mapped.id ? null : current));
-      setActiveCall(mapped);
+      const kept = activeCallRef.current?.id === mapped.id && activeCallRef.current?.kind === 'Video' && mapped.kind === 'Audio'
+        ? { ...mapped, kind: 'Video' }
+        : mapped;
+      activeCallRef.current = kept;
+      setActiveCall(kept);
       if (mapped.state === 'ongoing') {
         CueSound?.hideIncomingCall?.();
       }
@@ -4406,7 +4517,6 @@ function AppContent() {
       cancelled = true;
       routeTimers.forEach((timer) => clearTimeout(timer));
       CueSound?.hideOngoingCall?.();
-      CueSound?.resetAudioRoute?.();
     };
   }, [activeCall?.id, activeCall?.state, activeCall?.kind]);
 
@@ -4503,8 +4613,16 @@ function AppContent() {
       }
     }).catch(() => undefined);
     void AsyncStorage.getItem(WALLPAPER_KEY).then((value) => {
-      if (value) {
-        setChatWallpaper(value);
+      setChatWallpaper(value === 'day' || value === 'night' ? 'day' : 'beige');
+    }).catch(() => undefined);
+    void AsyncStorage.getItem(WALLPAPER_IMAGES_KEY).then((raw) => {
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        setWallpaperImages({
+          all: typeof parsed.all === 'string' ? parsed.all : '',
+          byChat: parsed.byChat && typeof parsed.byChat === 'object' ? parsed.byChat : {},
+        });
       }
     }).catch(() => undefined);
     void AsyncStorage.getItem(OUTBOX_STORAGE_KEY).then((raw) => {
@@ -7136,6 +7254,7 @@ function AppContent() {
 
     const payload = await response.json();
     const mappedChat = mapChatFromServer(payload.chat, currentUserId, usersById);
+    revealDeletedChat(mappedChat.id);
     setChatItems((current) => (current.some((item) => item.id === mappedChat.id) ? current : [mappedChat, ...current]));
     setSelectedChatId(mappedChat.id);
     setChatScreen('detail');
@@ -7641,7 +7760,7 @@ function AppContent() {
     setCallCameraOff(false);
     setCallMinimized(false);
     setCallControlsVisible(true);
-    setCallSpeaker(false);
+    setCallSpeaker(kind === 'Video');
 
     const response = await fetch(`${API_BASE_URL}/api/calls`, {
       method: 'POST',
@@ -7673,6 +7792,7 @@ function AppContent() {
 
     try {
       await ensureCallMedia(incomingCall.kind);
+      setCallSpeaker(incomingCall.kind === 'Video');
       setCallError('');
     } catch (error) {
       setCallError(!CAN_USE_NATIVE_WEBRTC
@@ -8107,11 +8227,44 @@ function AppContent() {
     </Modal>
   );
 
+  const saveMessageMedia = async (message) => {
+    const uri = message?.imageUri || message?.videoUri || message?.fileUri || message?.audioUri || message?.uri;
+    if (!uri) {
+      showToast('Nothing to save yet.', 'error');
+      return;
+    }
+    const kind = message?.kind === 'image' || message?.kind === 'video' || message?.kind === 'audio'
+      ? message.kind
+      : message?.kind === 'voice'
+        ? 'audio'
+        : message?.imageUri
+          ? 'image'
+          : 'file';
+    if (!GallerySaver?.save) {
+      showToast('Saving needs this latest install.', 'error');
+      return;
+    }
+    showToast(kind === 'image' || kind === 'video' ? 'Saving to gallery...' : 'Saving file...', 'info', 0);
+    try {
+      const label = String(message?.text || kind).slice(0, 40);
+      await GallerySaver.save(uri, kind, label);
+      showToast(kind === 'image' || kind === 'video' ? 'Saved to gallery.' : 'Saved to Files.', 'success');
+    } catch {
+      showToast('Could not save that file.', 'error');
+    }
+  };
+
   const renderMediaViewer = () => (
     <Modal transparent animationType="fade" visible={Boolean(mediaViewer)} onRequestClose={() => setMediaViewer(null)}>
       <View style={styles.viewerOverlay}>
         <Pressable style={styles.viewerClose} onPress={() => setMediaViewer(null)}>
           <Text style={styles.viewerCloseText}>Close</Text>
+        </Pressable>
+        <Pressable
+          style={styles.viewerSave}
+          onPress={() => void saveMessageMedia({ ...mediaViewer, kind: 'image', imageUri: mediaViewer?.uri })}
+        >
+          <Text style={styles.viewerCloseText}>Save</Text>
         </Pressable>
         {mediaViewer?.uri ? (
           <Image resizeMode="contain" source={{ uri: mediaViewer.uri }} style={styles.viewerImage} />
@@ -8439,6 +8592,11 @@ function AppContent() {
             <Text style={styles.attachmentTitle}>DOCUMENT</Text>
             <Text style={styles.attachmentName}>{message.text || 'File'}</Text>
             <Text style={styles.attachmentMeta}>{message.fileUri ? 'Tap to open' : 'Waiting for upload'}</Text>
+            {message.fileUri ? (
+              <Pressable onPress={() => void saveMessageMedia(message)}>
+                <Text style={styles.attachmentMeta}>Save to Files</Text>
+              </Pressable>
+            ) : null}
           </View>
         ) : null}
 
@@ -8653,6 +8811,20 @@ function AppContent() {
     return usersById[userId]?.photoUri || '';
   };
 
+  const profileMediaFor = (userId) => {
+    const source = userId === currentUserId ? profile : (usersById[userId] || {});
+    return {
+      photoUri: userId === currentUserId ? (profile.photoUri || '') : (source.photoUri || ''),
+      profileVideoUri: source.profileVideoUri || '',
+      profileMediaDefault: source.profileMediaDefault === 'video' ? 'video' : 'photo',
+    };
+  };
+
+  const showsProfileVideo = (userId) => {
+    const media = profileMediaFor(userId);
+    return media.profileMediaDefault === 'video' && Boolean(media.profileVideoUri) && !appSettings.lowDataMode;
+  };
+
   const statusTextSize = (value) => {
     const length = String(value || '').trim().length;
     if (length <= 24) return 42;
@@ -8736,7 +8908,16 @@ function AppContent() {
             />
           );
         }) : null}
-        {photoUri ? (
+        {showsProfileVideo(userId) ? (
+          <Video
+            source={{ uri: profileMediaFor(userId).profileVideoUri }}
+            style={{ width: innerSize, height: innerSize, borderRadius: innerSize / 2 }}
+            resizeMode="cover"
+            repeat
+            muted
+            paused={false}
+          />
+        ) : photoUri ? (
           <Image
             source={{ uri: photoUri }}
             style={{ width: innerSize, height: innerSize, borderRadius: innerSize / 2 }}
@@ -8758,9 +8939,54 @@ function AppContent() {
     );
   };
 
+  const renderThemeToggle = () => (
+    <Pressable
+      style={[styles.chatListAction, { backgroundColor: chrome.chip }]}
+      onPress={toggleAppearance}
+    >
+      <Text style={[styles.chatListActionText, { color: chrome.ink }]}>{isDark ? '☀' : '☾'}</Text>
+    </Pressable>
+  );
+
+  const renderAiToolsMenu = () => (
+    <View style={styles.aiToneMenu}>
+      <Pressable
+        style={styles.aiToneMenuButton}
+        onPress={() => {
+          setAiToneMenuVisible(false);
+          setAiToolsMenuVisible((current) => !current);
+        }}
+      >
+        <Text style={styles.aiToneMenuButtonText}>AI tools ▾</Text>
+      </Pressable>
+      {aiToolsMenuVisible ? (
+        <View style={styles.aiToneMenuList}>
+          <Pressable style={styles.aiToneMenuItem} onPress={() => { setAiToolsMenuVisible(false); openAiHelperSheet('draft'); }}>
+            <Text style={styles.aiToneMenuItemText}>AI helper</Text>
+          </Pressable>
+          <Pressable style={styles.aiToneMenuItem} disabled={summaryBusy} onPress={() => { setAiToolsMenuVisible(false); void requestChatSummary('unread'); }}>
+            <Text style={styles.aiToneMenuItemText}>{summaryBusy ? 'Summarising…' : 'Summarise'}</Text>
+          </Pressable>
+          <Pressable style={styles.aiToneMenuItem} disabled={aiAssistBusy} onPress={() => { setAiToolsMenuVisible(false); void requestSuggestedReplies(); }}>
+            <Text style={styles.aiToneMenuItemText}>{aiAssistBusy ? 'Suggesting…' : 'Suggest reply'}</Text>
+          </Pressable>
+          <Pressable style={styles.aiToneMenuItem} disabled={aiAssistBusy || !messageDraft.trim()} onPress={() => { setAiToolsMenuVisible(false); void requestRewriteDraft(); }}>
+            <Text style={styles.aiToneMenuItemText}>Rewrite</Text>
+          </Pressable>
+          <Pressable style={styles.aiToneMenuItem} disabled={dictateBusy} onPress={() => { setAiToolsMenuVisible(false); openDictateSheet(); }}>
+            <Text style={styles.aiToneMenuItemText}>{dictateBusy ? 'Listening…' : 'Dictate'}</Text>
+          </Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+
   const renderToneMenu = () => (
     <View style={styles.aiToneMenu}>
-      <Pressable style={styles.aiToneMenuButton} onPress={() => setAiToneMenuVisible((current) => !current)}>
+      <Pressable style={styles.aiToneMenuButton} onPress={() => {
+        setAiToolsMenuVisible(false);
+        setAiToneMenuVisible((current) => !current);
+      }}>
         <Text style={styles.aiToneMenuButtonText}>Tone · {aiRewriteTone} ▾</Text>
       </Pressable>
       {aiToneMenuVisible ? (
@@ -8782,55 +9008,60 @@ function AppContent() {
     </View>
   );
 
+  const wallpaperColor = chatWallpaper === 'day' ? '#14082A' : '#efeae2';
+  const activeWallpaperUri = activeChat
+    ? (wallpaperImages.byChat?.[activeChat.id] || wallpaperImages.all || '')
+    : '';
+
+  const persistWallpaperImages = (next) => {
+    setWallpaperImages(next);
+    void AsyncStorage.setItem(WALLPAPER_IMAGES_KEY, JSON.stringify(next)).catch(() => undefined);
+  };
+
+  const chooseWallpaperPhoto = async (scope) => {
+    const result = await openImageLibrary({ mediaType: 'photo', selectionLimit: 1 });
+    const uri = result?.assets?.[0]?.uri;
+    if (!uri) {
+      if (result?.errorMessage && result.errorCode !== 'module_unavailable') {
+        showToast('Could not open that photo.', 'error');
+      }
+      return;
+    }
+    if (scope === 'all') {
+      persistWallpaperImages({ ...wallpaperImages, all: uri });
+      showToast('Wallpaper set for all chats.', 'success');
+    } else if (activeChat?.id) {
+      persistWallpaperImages({
+        ...wallpaperImages,
+        byChat: { ...(wallpaperImages.byChat || {}), [activeChat.id]: uri },
+      });
+      showToast('Wallpaper set for this chat.', 'success');
+    }
+    setWallpaperSheetVisible(false);
+  };
+
+  const clearWallpaperPhoto = (scope) => {
+    if (scope === 'all') {
+      persistWallpaperImages({ ...wallpaperImages, all: '' });
+      showToast('Removed the wallpaper for all chats.', 'success');
+    } else if (activeChat?.id) {
+      persistWallpaperImages({
+        ...wallpaperImages,
+        byChat: { ...(wallpaperImages.byChat || {}), [activeChat.id]: '' },
+      });
+      showToast('Removed this chat wallpaper.', 'success');
+    }
+    setWallpaperSheetVisible(false);
+  };
+
   const renderChatDetail = () => {
     if (!activeChat) {
       return null;
     }
-    return (
-      <View style={[styles.detailScreen, { paddingBottom: keyboardInset || insets.bottom, backgroundColor: chatWallpaper === 'night' ? '#10141a' : chatWallpaper === 'plain' ? '#efeae2' : '#0c1c17' }]}>
-      <View style={styles.detailHeader}>
-        <Pressable style={styles.iconCircle} onPress={() => setChatScreen('list')}>
-          <Text style={styles.iconText}>←</Text>
-        </Pressable>
-        {renderPersonAvatar({
-          userId: activeChat.peerUserId,
-          name: activeChat.name,
-          size: 40,
-          onPress: () => onAvatarPress(activeChat.peerUserId, activeChat.name),
-        })}
-        <Pressable style={styles.detailHeaderText} onPress={() => setPeerProfileVisible(true)}>
-          <Text style={styles.detailTitle}>{headerLabelFor(activeChat.peerUserId, activeChat.name)}</Text>
-          <Text style={styles.detailSubtitle}>{getPresenceLabel(activeChat)}</Text>
-        </Pressable>
-        <View style={styles.detailHeaderActions}>
-          <Pressable style={styles.iconCircle} onPress={() => setChatMenuVisible(true)}>
-            <Text style={styles.iconText}>⋮</Text>
-          </Pressable>
-          <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
-            <Text style={styles.iconText}>☎</Text>
-          </Pressable>
-          <Pressable style={styles.iconCircle} onPress={() => setNewChatVisible(true)}>
-            <Text style={styles.iconText}>✎</Text>
-          </Pressable>
-        </View>
-      </View>
-
-      <View pointerEvents="none" style={styles.wallpaperMarks}>
-        {chatWallpaper === 'plain' ? null : ['Z', 'Z', 'Z', 'Z', 'Z', 'Z', 'Z', 'Z'].map((mark, index) => (
-          <Text
-            key={`${mark}-${index}`}
-            style={[
-              styles.wallpaperMark,
-              { top: 30 + (index % 4) * 140, left: 24 + (index % 3) * 110 },
-            ]}
-          >
-            {mark}
-          </Text>
-        ))}
-      </View>
+    const thread = (
       <ScrollView
         ref={threadRef}
-        style={[styles.thread, styles.wallpaperBase, chatWallpaper === 'plain' ? styles.wallpaperPlain : chatWallpaper === 'night' ? styles.wallpaperNight : styles.wallpaperZynkup]}
+        style={[styles.thread, styles.wallpaperBase]}
         contentContainerStyle={styles.threadContent}
         onContentSizeChange={() => {
           if (stickToLatestRef.current) {
@@ -8851,6 +9082,60 @@ function AppContent() {
       >
         {messages.map(renderBubble)}
       </ScrollView>
+    );
+    return (
+      <View style={[styles.detailScreen, { paddingBottom: keyboardInset || insets.bottom, backgroundColor: chrome.bg }]}>
+      <View style={[styles.detailHeader, { backgroundColor: chrome.nav, zIndex: 4 }]}>
+        <Pressable style={styles.iconCircle} onPress={() => setChatScreen('list')}>
+          <Text style={styles.iconText}>←</Text>
+        </Pressable>
+        {renderPersonAvatar({
+          userId: activeChat.peerUserId,
+          name: activeChat.name,
+          size: 40,
+          onPress: () => onAvatarPress(activeChat.peerUserId, activeChat.name),
+        })}
+        <Pressable style={styles.detailHeaderText} onPress={() => setPeerProfileVisible(true)}>
+          <Text numberOfLines={1} ellipsizeMode="tail" style={[styles.detailTitle, { color: chrome.ink }]}>{headerLabelFor(activeChat.peerUserId, activeChat.name)}</Text>
+          <Text numberOfLines={1} style={[styles.detailSubtitle, { color: chrome.muted }]}>{getPresenceLabel(activeChat)}</Text>
+        </Pressable>
+        <View style={styles.detailHeaderActions}>
+          <Pressable style={styles.iconCircle} onPress={() => setChatMenuVisible(true)}>
+            <Text style={styles.iconText}>⋮</Text>
+          </Pressable>
+          <Pressable style={styles.iconCircle} onPress={() => setCallSheetVisible(true)}>
+            <Text style={styles.iconText}>☎</Text>
+          </Pressable>
+          <Pressable style={styles.iconCircle} onPress={() => setNewChatVisible(true)}>
+            <Text style={styles.iconText}>✎</Text>
+          </Pressable>
+        </View>
+      </View>
+
+      <View style={styles.threadStage}>
+        {activeWallpaperUri ? (
+          <ImageBackground source={{ uri: activeWallpaperUri }} style={styles.threadStageFill} imageStyle={styles.threadWallpaperImage}>
+            {thread}
+          </ImageBackground>
+        ) : (
+          <View style={[styles.threadStageFill, { backgroundColor: wallpaperColor }]}>
+            <View pointerEvents="none" style={styles.wallpaperMarks}>
+              {['Z', 'Z', 'Z', 'Z', 'Z', 'Z'].map((mark, index) => (
+                <Text
+                  key={`${mark}-${index}`}
+                  style={[
+                    styles.wallpaperMark,
+                    { color: chatWallpaper === 'day' ? 'rgba(255,255,255,0.06)' : 'rgba(20,8,42,0.08)', top: 24 + (index % 3) * 160, left: 24 + (index % 3) * 110 },
+                  ]}
+                >
+                  {mark}
+                </Text>
+              ))}
+            </View>
+            {thread}
+          </View>
+        )}
+      </View>
 
       {emojiTrayVisible ? (
         <View style={styles.emojiTray}>
@@ -8936,15 +9221,6 @@ function AppContent() {
         </View>
       ) : null}
 
-      <Pressable style={styles.identityComposer} onPress={() => setIdentitySheetVisible(true)}>
-        <Text style={styles.identityComposerText}>
-          {(activeChat?.space || 'personal') === (activeBusinessId || 'personal')
-            ? `Sending as ${identityLabel}`
-            : (activeChat?.space || 'personal') === 'personal'
-              ? 'This chat is personal. Switch to Personal to reply.'
-              : 'This chat belongs to a business. Switch to it to reply.'}
-        </Text>
-      </Pressable>
       {activeChat?.kind === 'group' ? (
         <Pressable
           style={[styles.anonymousToggle, anonymousCompose ? styles.anonymousToggleOn : null]}
@@ -8955,43 +9231,10 @@ function AppContent() {
           </Text>
         </Pressable>
       ) : null}
-      <View style={styles.aiAssistRow}>
-        <Pressable
-          style={styles.aiAssistButton}
-          onPress={() => openAiHelperSheet('draft')}
-        >
-          <Text style={styles.aiAssistButtonText}>AI helper</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.aiAssistButton, summaryBusy ? styles.aiAssistButtonBusy : null]}
-          disabled={summaryBusy}
-          onPress={() => void requestChatSummary('unread')}
-        >
-          <Text style={styles.aiAssistButtonText}>{summaryBusy ? '…' : 'Summarise'}</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.aiAssistButton, aiAssistBusy ? styles.aiAssistButtonBusy : null]}
-          disabled={aiAssistBusy}
-          onPress={() => void requestSuggestedReplies()}
-        >
-          <Text style={styles.aiAssistButtonText}>{aiAssistBusy ? '…' : 'Suggest reply'}</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.aiAssistButton, aiAssistBusy ? styles.aiAssistButtonBusy : null]}
-          disabled={aiAssistBusy || !messageDraft.trim()}
-          onPress={() => void requestRewriteDraft()}
-        >
-          <Text style={styles.aiAssistButtonText}>Rewrite</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.aiAssistButton, dictateBusy ? styles.aiAssistButtonBusy : null]}
-          disabled={dictateBusy}
-          onPress={openDictateSheet}
-        >
-          <Text style={styles.aiAssistButtonText}>Dictate</Text>
-        </Pressable>
+      <View style={styles.composerToolRow}>
+        {renderAiToolsMenu()}
+        {renderToneMenu()}
       </View>
-      {renderToneMenu()}
       {aiSuggestions.length ? (
         <View style={styles.aiChipRow}>
           {aiSuggestions.map((suggestion) => (
@@ -9033,9 +9276,10 @@ function AppContent() {
           }}
           placeholder="Message"
           placeholderTextColor="#7d8b92"
-          multiline={!appSettings.enterIsSend}
-          blurOnSubmit={appSettings.enterIsSend}
-          returnKeyType={appSettings.enterIsSend ? 'send' : 'default'}
+          multiline
+          scrollEnabled
+          blurOnSubmit={false}
+          returnKeyType="default"
           onSubmitEditing={() => {
             if (appSettings.enterIsSend) {
               sendMessage();
@@ -9257,7 +9501,7 @@ function AppContent() {
               {favoriteChatIds.includes(chat.id) ? (
                 <Text style={styles.chatHomeFavoriteStar}>★</Text>
               ) : null}
-              <Text numberOfLines={1} style={styles.chatHomeName}>{displayNameFor(chat.peerUserId, chat.name)}</Text>
+              <Text numberOfLines={1} style={[styles.chatHomeName, { color: chrome.ink }]}>{displayNameFor(chat.peerUserId, chat.name)}</Text>
               {mutedChatIds.includes(chat.id) ? <Text style={styles.chatHomeMuteIcon}>🔕</Text> : null}
               {lockedChatIds.includes(chat.id) ? <Text style={styles.chatHomeMuteIcon}>🔒</Text> : null}
               {/(store|shop|business|biz|kitchen|board)/i.test(chat.name) ? (
@@ -9267,7 +9511,7 @@ function AppContent() {
             <Text style={styles.chatHomeTime}>{chat.time}</Text>
           </View>
           <View style={styles.chatHomeBottomRow}>
-            <Text numberOfLines={1} style={styles.chatHomePreview}>
+            <Text numberOfLines={1} style={[styles.chatHomePreview, { color: chrome.muted }]}>
               {lockedChatIds.includes(chat.id) ? 'Locked' : (peerTypingByChat[chat.id] ? 'typing…' : (/^-?\d+(?:\.\d+)?\s*,/.test(chat.preview || '') ? 'Shared location' : chat.preview))}
             </Text>
             {chat.unread > 0 ? (
@@ -9286,18 +9530,19 @@ function AppContent() {
     );
 
     return (
-      <View style={styles.chatListScreen}>
+      <View style={[styles.chatListScreen, { backgroundColor: chrome.bg }]}>
         <View style={styles.chatListHeader}>
           <View style={styles.chatListTitleBlock}>
             <Image source={brandMark} style={styles.chatListMark} />
             <View>
-              <Text style={styles.chatListTitle}>Chats</Text>
+              <Text style={[styles.chatListTitle, { color: chrome.ink }]}>Chats</Text>
               <Pressable onPress={() => setIdentitySheetVisible(true)}>
                 <Text style={styles.chatListIdentity}>{identityLabel} ▾</Text>
               </Pressable>
             </View>
           </View>
           <View style={styles.lightHeaderActions}>
+            {renderThemeToggle()}
             <Pressable
               style={styles.chatListAction}
               onPress={() => setChatSearchOpen((current) => !current)}
@@ -9318,7 +9563,7 @@ function AppContent() {
             <Text style={styles.businessAlertText}>{appNotice}</Text>
           </View>
         ) : null}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chatFilterRow}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chatFilterScroll} contentContainerStyle={styles.chatFilterRow}>
           {[
             ['recent', 'All'],
             ['unread', unreadCount ? `Unread  ${unreadCount}` : 'Unread'],
@@ -9326,8 +9571,8 @@ function AppContent() {
             ['calls', 'Calls'],
             ['requests', requestCount ? `Requests  ${requestCount}` : 'Requests'],
           ].map(([id, label]) => (
-            <Pressable key={id} style={[styles.chatFilterChip, chatListTab === id ? styles.chatFilterChipOn : null]} onPress={() => setChatListTab(id)}>
-              <Text style={[styles.chatFilterText, chatListTab === id ? styles.chatFilterTextOn : null]}>{label}</Text>
+            <Pressable key={id} style={[styles.chatFilterChip, { backgroundColor: chatListTab === id ? '#7C3AED' : chrome.chip }]} onPress={() => setChatListTab(id)}>
+              <Text style={[styles.chatFilterText, { color: chatListTab === id ? '#ffffff' : chrome.ink }]}>{label}</Text>
             </Pressable>
           ))}
         </ScrollView>
@@ -9368,8 +9613,8 @@ function AppContent() {
                   const otherId = request.fromUserId === currentUserId ? request.toUserId : request.fromUserId;
                   const incoming = request.toUserId === currentUserId && request.state === 'pending';
                   return (
-                    <View key={request.id} style={styles.statusFeedCard}>
-                      <Text style={styles.statusFeedName}>{displayNameFor(otherId)}</Text>
+                    <View key={request.id} style={[styles.statusFeedCard, { backgroundColor: chrome.card, borderColor: chrome.line }]}>
+                      <Text style={[styles.statusFeedName, { color: chrome.ink }]}>{displayNameFor(otherId)}</Text>
                       <Text style={styles.statusFeedTime}>{request.state === 'pending' ? (incoming ? 'Wants to chat' : 'Waiting for them') : 'Accepted'}</Text>
                       {incoming ? (
                         <View style={styles.catalogActionRow}>
@@ -9430,7 +9675,7 @@ function AppContent() {
   };
 
   const renderCalls = () => (
-    <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
+    <ScrollView style={[styles.secondaryScreen, { backgroundColor: chrome.bg }]} contentContainerStyle={styles.secondaryContent}>
       {calls.length ? null : (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>No calls yet</Text>
@@ -9496,12 +9741,15 @@ function AppContent() {
   );
 
   const renderPay = () => (
-    <View style={styles.lightScreen}>
-      <View style={styles.lightHeader}>
+    <View style={[styles.lightScreen, { backgroundColor: chrome.bg }]}>
+      <View style={[styles.lightHeader, { backgroundColor: chrome.bg, shadowOpacity: 0 }]}>
         <Image source={brandLockup} style={styles.brandHeaderLockup} resizeMode="contain" />
-        <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
-          <Text style={styles.lightHeaderActionText}>◔</Text>
-        </Pressable>
+        <View style={styles.lightHeaderActions}>
+          {renderThemeToggle()}
+          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
+            <Text style={styles.lightHeaderActionText}>◔</Text>
+          </Pressable>
+        </View>
       </View>
 
       <ScrollView
@@ -9542,7 +9790,7 @@ function AppContent() {
           </View>
         </View>
 
-        <Text style={styles.lightSectionTitle}>Quick send</Text>
+        <Text style={[styles.lightSectionTitle, { color: chrome.ink }]}>Quick send</Text>
         <View style={styles.quickSendRow}>
           {payQuickContacts.slice(0, 4).map((contact, index) => (
             <Pressable
@@ -9577,7 +9825,7 @@ function AppContent() {
           </Pressable>
         </View>
 
-        <Text style={styles.lightSectionTitle}>Recent transactions</Text>
+        <Text style={[styles.lightSectionTitle, { color: chrome.ink }]}>Recent transactions</Text>
         <View style={styles.payTransactionList}>
           {payHistoryItems.length ? null : (
             <Text style={styles.cardBody}>No payments yet. Send, request, or top up to see them here.</Text>
@@ -9667,16 +9915,16 @@ function AppContent() {
   };
 
   const renderExplore = () => (
-    <View style={styles.lightScreen}>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chatFilterRow}>
+    <View style={[styles.lightScreen, { backgroundColor: chrome.bg }]}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chatFilterScroll} contentContainerStyle={styles.chatFilterRow}>
         {[
           ['status', 'Status'],
           ['community', 'Community'],
           ['events', 'Events'],
           ['games', 'Games'],
         ].map(([id, label]) => (
-          <Pressable key={id} style={[styles.chatFilterChip, exploreSection === id ? styles.chatFilterChipOn : null, styles.exploreChip]} onPress={() => setExploreSection(id)}>
-            <Text style={[styles.chatFilterText, exploreSection === id ? styles.chatFilterTextOn : null, exploreSection === id ? null : styles.exploreChipText]}>{label}</Text>
+          <Pressable key={id} style={[styles.chatFilterChip, { backgroundColor: exploreSection === id ? '#7C3AED' : chrome.chip }]} onPress={() => setExploreSection(id)}>
+            <Text style={[styles.chatFilterText, { color: exploreSection === id ? '#ffffff' : chrome.ink }]}>{label}</Text>
           </Pressable>
         ))}
       </ScrollView>
@@ -9687,15 +9935,15 @@ function AppContent() {
             <View>
               <Text style={styles.lightSectionLabel}>YOUR COMMUNITIES</Text>
               {communitiesMine.length ? communitiesMine.map((community) => (
-                <View key={community.id} style={styles.statusFeedCard}>
-                  <Text style={styles.statusFeedName}>{community.name}</Text>
+                <View key={community.id} style={[styles.statusFeedCard, { backgroundColor: chrome.card, borderColor: chrome.line }]}>
+                  <Text style={[styles.statusFeedName, { color: chrome.ink }]}>{community.name}</Text>
                   <Text style={styles.statusFeedBody}>{community.description || `${community.memberCount || 1} members · ${community.privacy || 'public'}`}</Text>
                 </View>
               )) : <Text style={styles.cardBody}>You have not joined a community yet.</Text>}
               <Text style={styles.lightSectionLabel}>DISCOVER</Text>
               {communitiesDiscover.filter((community) => !communitiesMine.some((mine) => mine.id === community.id)).map((community) => (
-                <View key={community.id} style={styles.statusFeedCard}>
-                  <Text style={styles.statusFeedName}>{community.name}</Text>
+                <View key={community.id} style={[styles.statusFeedCard, { backgroundColor: chrome.card, borderColor: chrome.line }]}>
+                  <Text style={[styles.statusFeedName, { color: chrome.ink }]}>{community.name}</Text>
                   <Text style={styles.statusFeedBody}>{community.description || community.privacy || 'Public community'}</Text>
                   <Pressable style={styles.catalogChip} onPress={() => void joinCommunity(community.id)}>
                     <Text style={styles.catalogChipText}>Join</Text>
@@ -9718,8 +9966,8 @@ function AppContent() {
             <View>
               <Text style={styles.lightSectionLabel}>EVENTS</Text>
               {communityEvents.length ? communityEvents.map((event) => (
-                <View key={event.id} style={styles.statusFeedCard}>
-                  <Text style={styles.statusFeedName}>{event.title}</Text>
+                <View key={event.id} style={[styles.statusFeedCard, { backgroundColor: chrome.card, borderColor: chrome.line }]}>
+                  <Text style={[styles.statusFeedName, { color: chrome.ink }]}>{event.title}</Text>
                   <Text style={styles.statusFeedBody}>{event.startsAt ? new Date(event.startsAt).toLocaleString() : 'Time to be announced'} · {event.status || 'scheduled'}</Text>
                   <Pressable style={styles.catalogChip} onPress={() => void rsvpEvent(event.id)}>
                     <Text style={styles.catalogChipText}>{event.myRsvp?.status === 'going' ? 'Going' : 'RSVP'}</Text>
@@ -9732,11 +9980,11 @@ function AppContent() {
             <View>
               <Text style={styles.lightSectionLabel}>GAMES</Text>
               {gameCatalog.length ? gameCatalog.map((game) => (
-                <View key={game.slug || game.id} style={styles.statusFeedCard}>
-                  <Text style={styles.statusFeedName}>{game.name || game.title}</Text>
+                <View key={game.slug || game.id} style={[styles.gameCard, { backgroundColor: chrome.card, borderColor: chrome.line }]}>
+                  <Text numberOfLines={2} style={[styles.statusFeedName, { color: chrome.ink }]}>{game.name || game.title}</Text>
                   <Text style={styles.statusFeedBody}>{game.description || game.pointsNote || 'Points stay on your profile. They are not cash.'}</Text>
-                  <Pressable style={styles.catalogChip} onPress={() => void startGame(game.slug)} disabled={Boolean(game.comingSoon)}>
-                    <Text style={styles.catalogChipText}>{game.comingSoon ? 'Soon' : 'Play'}</Text>
+                  <Pressable style={[styles.catalogChip, { alignSelf: 'flex-start', marginTop: 10 }]} onPress={() => void startGame(game.slug)} disabled={Boolean(game.comingSoon)}>
+                    <Text style={styles.catalogChipText}>{game.comingSoon ? 'Coming soon' : 'Play'}</Text>
                   </Pressable>
                 </View>
               )) : <Text style={styles.cardBody}>Games will show here when the catalog is available.</Text>}
@@ -9755,17 +10003,20 @@ function AppContent() {
     const otherUpdates = updatesFeed.filter((entry) => entry.userId !== currentUserId);
 
     return (
-      <View style={styles.lightScreen}>
-        <View style={styles.lightHeader}>
+      <View style={[styles.lightScreen, { backgroundColor: chrome.bg }]}>
+        <View style={[styles.lightHeader, { backgroundColor: chrome.bg, shadowOpacity: 0 }]}>
           <View>
-            <Text style={styles.appWordmark}>
+            <Text style={[styles.appWordmark, { color: chrome.ink }]}>
               Expl<Text style={styles.appWordmarkAccent}>ore</Text>
             </Text>
             <Text style={styles.identityChipText}>Status and marketplace</Text>
           </View>
-          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
-            <Text style={styles.lightHeaderActionText}>◌</Text>
-          </Pressable>
+          <View style={styles.lightHeaderActions}>
+            {renderThemeToggle()}
+            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
+              <Text style={styles.lightHeaderActionText}>◌</Text>
+            </Pressable>
+          </View>
         </View>
 
         <ScrollView
@@ -9827,12 +10078,12 @@ function AppContent() {
             const latestStatus = entry.items?.[0];
             const feedIndex = updatesFeed.findIndex((candidate) => candidate.userId === entry.userId);
             return (
-              <Pressable key={entry.userId} style={styles.statusFeedCard} onPress={() => openStatusViewer(feedIndex)}>
+              <Pressable key={entry.userId} style={[styles.statusFeedCard, { backgroundColor: chrome.card, borderColor: chrome.line }]} onPress={() => openStatusViewer(feedIndex)}>
                 <View style={styles.statusFeedAvatarWrap}>
                   {renderPersonAvatar({ userId: entry.userId, name: entry.name, size: 52 })}
                 </View>
                 <View style={styles.statusFeedCopy}>
-                  <Text numberOfLines={1} style={styles.statusFeedName}>{displayNameFor(entry.userId, entry.name)}</Text>
+                  <Text numberOfLines={1} style={[styles.statusFeedName, { color: chrome.ink }]}>{displayNameFor(entry.userId, entry.name)}</Text>
                   <Text style={styles.statusFeedTime}>{latestStatus?.createdAt ? formatClock(latestStatus.createdAt) : 'Just now'}</Text>
                   <Text numberOfLines={2} style={styles.statusFeedBody}>
                     {latestStatus?.text || latestStatus?.assets?.[0]?.caption || 'Tap to view latest update'}
@@ -9935,8 +10186,7 @@ function AppContent() {
 
   const renderBusiness = () => {
     const businessName = profile.businessName || profile.name || 'Your business';
-    const registeredCustomers = contactItems.filter((contact) => contact.registered || contact.linkedUserId);
-    const customerCount = businessCustomers.length || registeredCustomers.length;
+    const customerCount = businessCustomers.length;
     const dueFollowUps = businessCustomers.filter(
       (customer) => customer.followUpAt && new Date(customer.followUpAt).getTime() <= Date.now(),
     ).length;
@@ -9946,14 +10196,17 @@ function AppContent() {
     const catalogCount = filteredCatalogItems.length;
 
     return (
-      <View style={styles.lightScreen}>
-        <View style={styles.lightHeader}>
-          <Text style={styles.businessModeTitle}>
+      <View style={[styles.lightScreen, { backgroundColor: chrome.bg }]}>
+        <View style={[styles.lightHeader, { backgroundColor: chrome.bg, shadowOpacity: 0 }]}>
+          <Text style={[styles.businessModeTitle, { color: chrome.ink }]}>
             Business <Text style={styles.appWordmarkAccent}>Mode</Text>
           </Text>
-          <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
-            <Text style={styles.lightHeaderActionText}>≋</Text>
-          </Pressable>
+          <View style={styles.lightHeaderActions}>
+            {renderThemeToggle()}
+            <Pressable style={styles.lightHeaderAction} onPress={() => setActiveView('Profile')}>
+              <Text style={styles.lightHeaderActionText}>≋</Text>
+            </Pressable>
+          </View>
         </View>
 
         <ScrollView
@@ -10091,7 +10344,7 @@ function AppContent() {
               style={styles.businessGridCard}
               onPress={() => {
                 void loadBusinessCustomers();
-                void syncPhoneContacts(currentUserId, { quiet: true });
+                setCustomerPickerOpen(false);
                 setSelectedCustomer(null);
                 setBusinessPanel('customers');
               }}
@@ -10645,44 +10898,75 @@ function AppContent() {
   };
 
   const renderSettings = () => (
-    <ScrollView style={styles.secondaryScreen} contentContainerStyle={styles.secondaryContent}>
-      <Text style={styles.secondaryTitle}>Profile</Text>
-      <Pressable style={styles.profileHero} onPress={() => setSettingsPanel('account')}>
-        {profile.photoUri ? (
-          <Image source={{ uri: profile.photoUri }} style={styles.profileImage} />
-        ) : (
-          <View style={[styles.profileImage, styles.profileImageFallback]}>
-            <Text style={styles.profileImageFallbackText}>
-              {(profile.name || 'ZU').slice(0, 2).toUpperCase()}
-            </Text>
+    <ScrollView style={[styles.secondaryScreen, { backgroundColor: chrome.bg }]} contentContainerStyle={styles.secondaryContent}>
+      <View style={styles.profileTitleRow}>
+        <Text style={[styles.secondaryTitle, { color: chrome.ink }]}>Profile</Text>
+        {renderThemeToggle()}
+      </View>
+      <View style={styles.profileHero}>
+        <View style={styles.profileMediaRow}>
+          <View style={styles.profileMediaCol}>
+            <Pressable onPress={() => setSettingsPanel('account')}>
+              {profile.photoUri ? (
+                <Image source={{ uri: profile.photoUri }} style={styles.profileMediaThumb} />
+              ) : (
+                <View style={[styles.profileMediaThumb, styles.profileImageFallback]}>
+                  <Text style={styles.profileImageFallbackText}>
+                    {(profile.name || 'ZU').slice(0, 2).toUpperCase()}
+                  </Text>
+                </View>
+              )}
+            </Pressable>
+            <Pressable onPress={() => void pickProfilePhoto()}>
+              <Text style={styles.editPhotoText}>Edit photo</Text>
+            </Pressable>
+            <Pressable onPress={() => {
+              setProfile((current) => ({ ...current, profileMediaDefault: 'photo' }));
+              void saveProfileToServer({ profileMediaDefault: 'photo' });
+            }}>
+              <Text style={styles.editPhotoText}>{profile.profileMediaDefault === 'video' ? 'Use photo as default' : 'Photo is default'}</Text>
+            </Pressable>
           </View>
-        )}
-        <Pressable onPress={() => void pickProfilePhoto()}>
-          <Text style={styles.editPhotoText}>Edit photo</Text>
-        </Pressable>
-        {profile.profileVideoUri ? (
-          <Video
-            source={{ uri: profile.profileVideoUri }}
-            style={styles.profileVideoPreview}
-            resizeMode="cover"
-            repeat
-            muted
-            paused={false}
-          />
-        ) : null}
-        <Pressable onPress={() => void pickProfileVideo()}>
-          <Text style={styles.editPhotoText}>{profile.profileVideoUri ? 'Replace profile video' : 'Add profile video'}</Text>
-        </Pressable>
-        {profile.profileVideoUri ? (
-          <Pressable onPress={() => void removeProfileVideo()}>
-            <Text style={styles.editPhotoText}>Remove profile video</Text>
-          </Pressable>
-        ) : null}
-        <Text style={styles.settingsProfileName}>{profile.name || 'Your name'}</Text>
-        <Text style={styles.settingsProfileMeta}>{profile.about || 'Hey there! I am using ZynkUP.'}</Text>
-        <Text style={styles.settingsProfileMeta}>{profile.phone || 'Add your phone number'}</Text>
-        <Text style={styles.settingsProfileMeta}>{accountCurrency}{accountCountry?.name ? ` · ${accountCountry.name}` : ''}</Text>
-      </Pressable>
+          <View style={styles.profileMediaCol}>
+            {profile.profileVideoUri ? (
+              <Video
+                source={{ uri: profile.profileVideoUri }}
+                style={styles.profileMediaThumb}
+                resizeMode="cover"
+                repeat
+                muted
+                paused={false}
+              />
+            ) : (
+              <View style={[styles.profileMediaThumb, styles.profileImageFallback]}>
+                <Text style={styles.profileImageFallbackText}>Video</Text>
+              </View>
+            )}
+            <Pressable onPress={() => void pickProfileVideo()}>
+              <Text style={styles.editPhotoText}>{profile.profileVideoUri ? 'Replace video' : 'Add video'}</Text>
+            </Pressable>
+            <Pressable onPress={() => {
+              if (!profile.profileVideoUri) {
+                showToast('Add a profile video first.', 'error');
+                return;
+              }
+              setProfile((current) => ({ ...current, profileMediaDefault: 'video' }));
+              void saveProfileToServer({ profileMediaDefault: 'video' });
+            }}>
+              <Text style={styles.editPhotoText}>{profile.profileMediaDefault === 'video' ? 'Video is default' : 'Use video as default'}</Text>
+            </Pressable>
+            {profile.profileVideoUri ? (
+              <Pressable onPress={() => void removeProfileVideo()}>
+                <Text style={styles.editPhotoText}>Remove video</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        </View>
+        <Text style={[styles.settingsProfileName, { color: chrome.ink }]}>{profile.name || 'Your name'}</Text>
+        <Text style={[styles.settingsProfileMeta, { color: chrome.muted }]}>{profile.about || 'Hey there! I am using ZynkUP.'}</Text>
+        <Text style={[styles.settingsProfileMeta, { color: chrome.muted }]}>{profile.phone || 'Add your phone number'}</Text>
+        <Text style={[styles.settingsProfileMeta, { color: chrome.muted }]}>{accountCurrency}{accountCountry?.name ? ` · ${accountCountry.name}` : ''}</Text>
+      </View>
 
       <Pressable style={styles.sendButtonWide} onPress={() => void syncPhoneContacts(currentUserId)}>
         <Text style={styles.sendButtonText}>Sync contacts</Text>
@@ -11368,20 +11652,20 @@ function AppContent() {
   }
 
   return (
-    <SafeAreaView style={styles.screen} edges={['top', 'left', 'right']}>
-      <StatusBar barStyle={activeView === 'Chats' ? 'light-content' : 'dark-content'} translucent backgroundColor="transparent" />
+    <SafeAreaView style={[styles.screen, { backgroundColor: chrome.bg }]} edges={['top', 'left', 'right']}>
+      <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} translucent backgroundColor="transparent" />
 
       {activeView === 'Chats' && chatScreen === 'detail' ? (
         renderChatDetail()
       ) : (
-        <View style={styles.screen}>
+        <View style={[styles.screen, { backgroundColor: chrome.bg }]}>
           {activeView === 'Chats' ? renderChatList() : null}
           {activeView === 'Explore' ? renderExplore() : null}
           {activeView === 'Pay' ? renderPay() : null}
           {activeView === 'Business' ? renderBusiness() : null}
           {activeView === 'Profile' ? renderSettings() : null}
 
-          <View style={[styles.bottomNav, { paddingBottom: Math.max(insets.bottom, 28) + 22 }]}>
+          <View style={[styles.bottomNav, { backgroundColor: chrome.nav, paddingBottom: Math.max(insets.bottom, 8) }]}>
             {tabs.map((tab) => (
               <Pressable
                 key={tab}
@@ -11392,7 +11676,7 @@ function AppContent() {
                 }}
               >
                 <View style={styles.bottomNavIconWrap}>
-                  <Text style={[styles.bottomNavIcon, activeView === tab ? styles.bottomNavIconActive : null]}>
+                  <Text style={[styles.bottomNavIcon, { color: activeView === tab ? '#ffffff' : chrome.muted }]}>
                     {tab === 'Chats' ? '◫' : tab === 'Explore' ? '◉' : tab === 'Pay' ? '▭' : tab === 'Business' ? '⌂' : '◎'}
                   </Text>
                   {tabBadges[tab] ? (
@@ -11401,7 +11685,7 @@ function AppContent() {
                     </View>
                   ) : null}
                 </View>
-                <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={[styles.bottomNavLabel, activeView === tab ? styles.bottomNavLabelActive : null]}>{tab}</Text>
+                <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={[styles.bottomNavLabel, { color: activeView === tab ? '#ffffff' : chrome.muted }]}>{tab}</Text>
               </Pressable>
             ))}
           </View>
@@ -11491,6 +11775,20 @@ function AppContent() {
                 }}
               >
                 <Text style={styles.sheetOptionTitle}>Transcribe</Text>
+              </Pressable>
+            ) : null}
+            {messageActionTarget?.imageUri || messageActionTarget?.videoUri || messageActionTarget?.fileUri || messageActionTarget?.audioUri ? (
+              <Pressable
+                style={styles.sheetOption}
+                onPress={() => {
+                  const target = messageActionTarget;
+                  setMessageActionTarget(null);
+                  void saveMessageMedia(target);
+                }}
+              >
+                <Text style={styles.sheetOptionTitle}>
+                  {messageActionTarget?.kind === 'file' ? 'Save to Files' : messageActionTarget?.kind === 'voice' || messageActionTarget?.kind === 'audio' ? 'Save audio' : 'Save to gallery'}
+                </Text>
               </Pressable>
             ) : null}
             <Pressable
@@ -12768,8 +13066,8 @@ function AppContent() {
                     <Pressable style={styles.catalogChip} onPress={() => void loadBusinessCustomers()}>
                       <Text style={styles.catalogChipText}>Refresh records</Text>
                     </Pressable>
-                    <Pressable style={styles.catalogChip} onPress={() => void syncPhoneContacts(currentUserId)}>
-                      <Text style={styles.catalogChipText}>Sync phone contacts</Text>
+                    <Pressable style={styles.catalogChip} onPress={() => setCustomerPickerOpen((current) => !current)}>
+                      <Text style={styles.catalogChipText}>{customerPickerOpen ? 'Hide contacts' : 'Add from contacts'}</Text>
                     </Pressable>
                     <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>CUSTOMER RECORDS</Text>
                     {businessCustomers.length ? null : (
@@ -12798,21 +13096,34 @@ function AppContent() {
                         </Pressable>
                       );
                     })}
-                    <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>PHONE BOOK ON ZYNKUP</Text>
-                    {contactItems.filter((contact) => contact.registered || contact.linkedUserId).map((contact) => (
-                      <View key={contact.id} style={styles.contactPickRow}>
-                        {renderPersonAvatar({
-                          userId: contact.linkedUserId,
-                          name: contact.name,
-                          size: 44,
-                          onPress: () => onAvatarPress(contact.linkedUserId, contact.name),
-                        })}
-                        <Pressable style={styles.contactPickCopy} onPress={() => void importContactAsCustomer(contact)}>
-                          <Text style={styles.sheetOptionTitle}>{contact.name}</Text>
-                          <Text style={styles.sheetOptionBody}>{contact.phone} · Tap to add to CRM</Text>
+                    {customerPickerOpen ? (
+                      <>
+                        <Text style={[styles.lightSectionLabel, { marginTop: 12 }]}>CHOOSE A CONTACT</Text>
+                        <Text style={styles.cardBody}>Only the people you add here become customers.</Text>
+                        <Pressable style={styles.catalogChip} onPress={() => void syncPhoneContacts(currentUserId)}>
+                          <Text style={styles.catalogChipText}>Refresh phone book</Text>
                         </Pressable>
-                      </View>
-                    ))}
+                        {contactItems.filter((contact) => {
+                          const linked = contact.linkedUserId && businessCustomers.some((entry) => entry.customerUserId === contact.linkedUserId);
+                          const digits = String(contact.phone || '').replace(/\D/g, '');
+                          const samePhone = digits && businessCustomers.some((entry) => String(entry.phone || '').replace(/\D/g, '') === digits);
+                          return !linked && !samePhone;
+                        }).map((contact) => (
+                          <View key={contact.id} style={styles.contactPickRow}>
+                            {renderPersonAvatar({
+                              userId: contact.linkedUserId,
+                              name: contact.name,
+                              size: 44,
+                              onPress: () => onAvatarPress(contact.linkedUserId, contact.name),
+                            })}
+                            <Pressable style={styles.contactPickCopy} onPress={() => void importContactAsCustomer(contact)}>
+                              <Text style={styles.sheetOptionTitle}>{contact.name}</Text>
+                              <Text style={styles.sheetOptionBody}>{contact.phone} · Add as customer</Text>
+                            </Pressable>
+                          </View>
+                        ))}
+                      </>
+                    ) : null}
                   </>
                 )}
               </ScrollView>
@@ -13935,53 +14246,92 @@ function AppContent() {
           if (!call) {
             return null;
           }
+          const others = (call.participantIds || []).filter((id) => id && id !== currentUserId);
+          const primaryPeerId = (focusedPeerId && others.includes(focusedPeerId) ? focusedPeerId : '') || call.peerUserId || others[0] || '';
+          const primaryRemote = remoteStreamsByUser[primaryPeerId] || remoteCallStream;
           const localUrl = localCallStream?.toURL?.() || '';
-          const remoteUrl = remoteCallStream?.toURL?.() || '';
-          const videoTrackLive = (stream) => Boolean(stream?.getVideoTracks?.().some((track) => track.enabled && track.readyState === 'live' && !track.muted));
-          const localVideoLive = videoTrackLive(localCallStream) && !callCameraOff;
-          const remoteVideoLive = videoTrackLive(remoteCallStream) && !remoteCameraOff;
-          const mainIsLocal = localVideoLarge || !remoteVideoLive;
-          const mainUrl = mainIsLocal ? localUrl : remoteUrl;
-          const pipIsLocal = !mainIsLocal;
-          const pipUrl = (localVideoLive || remoteVideoLive) && localUrl && remoteUrl ? (pipIsLocal ? localUrl : remoteUrl) : '';
-          const mainVideoLive = mainIsLocal ? localVideoLive : remoteVideoLive;
-          const pipVideoLive = pipUrl ? (pipIsLocal ? localVideoLive : remoteVideoLive) : false;
-          const stageUserId = mainIsLocal ? currentUserId : call.peerUserId;
+          const remoteUrl = primaryRemote?.toURL?.() || '';
+          const trackLive = (stream, kind) => Boolean(stream?.getTracks?.().some((track) => track.kind === kind && track.enabled !== false && track.readyState !== 'ended'));
+          const localVideoLive = trackLive(localCallStream, 'video') && !callCameraOff;
+          const remoteVideoLive = trackLive(primaryRemote, 'video') && !remoteCameraOff;
+          const videoCall = call.kind === 'Video';
+          const answered = call.state === 'ongoing';
+          const showLocalMain = videoCall && (!answered || localVideoLarge);
+          const mainUrl = showLocalMain ? localUrl : remoteUrl;
+          const mainVideoLive = showLocalMain ? localVideoLive : remoteVideoLive;
+          const stageUserId = showLocalMain ? currentUserId : primaryPeerId;
+          const pipIsLocal = !showLocalMain;
+          const pipUrl = videoCall && answered ? (pipIsLocal ? localUrl : remoteUrl) : '';
+          const pipVideoLive = pipIsLocal ? localVideoLive : remoteVideoLive;
+          const pipUserId = pipIsLocal ? currentUserId : primaryPeerId;
           const canAnswer = call.state === 'ringing' && call.initiatorId !== currentUserId;
-          const peerOnline = usersById[call.peerUserId]?.presence === 'online' || callPhase === 'ringing';
+          const peerOnline = usersById[primaryPeerId]?.presence === 'online' || callPhase === 'ringing';
           const callerPhase = call.initiatorId === currentUserId ? (peerOnline ? 'Ringing' : 'Calling...') : 'Incoming call';
-          const remoteLive = Boolean(remoteCallStream?.getTracks?.()?.some((track) => track.readyState === 'live' && track.enabled));
-          const photoUri = photoForUser(stageUserId) || photoForUser(call.peerUserId);
-          const stageName = mainIsLocal ? (profile.name || 'You') : (call.name || '?');
+          const remoteLive = Object.values(remoteStreamsByUser).some((stream) => trackLive(stream, 'audio')) || trackLive(primaryRemote, 'audio');
+          const stageName = stageUserId === currentUserId ? (profile.name || 'You') : displayNameFor(stageUserId, call.name || 'ZynkUP');
+          const headerName = others.length > 1
+            ? `${displayNameFor(primaryPeerId, call.name || 'ZynkUP')} + ${others.length - 1}`
+            : displayNameFor(primaryPeerId, call.name || 'ZynkUP');
+          const profileStage = (userId, style) => {
+            const label = userId === currentUserId ? (profile.name || 'You') : displayNameFor(userId, 'ZynkUP');
+            if (showsProfileVideo(userId)) {
+              return (
+                <Video
+                  source={{ uri: profileMediaFor(userId).profileVideoUri }}
+                  style={style}
+                  resizeMode="cover"
+                  repeat
+                  muted
+                  paused={false}
+                />
+              );
+            }
+            const photo = photoForUser(userId);
+            if (photo) return <Image source={{ uri: photo }} style={style} resizeMode="cover" />;
+            return (
+              <View style={[style, styles.callFullPhotoFallback]}>
+                <Text style={styles.callFullPhotoLetter}>{label.slice(0, 1).toUpperCase()}</Text>
+              </View>
+            );
+          };
           return (
             <Pressable style={styles.callScreen} onPress={revealCallControls}>
-              {call.kind === 'Video' && mainUrl && mainVideoLive && RTCViewNative && !phoneLocked ? (
-                <RTCViewNative streamURL={mainUrl} style={styles.callStageMain} objectFit="cover" mirror={mainIsLocal} />
+              {Object.entries(remoteStreamsByUser).map(([userId, stream]) => {
+                const url = stream?.toURL?.();
+                if (!url || !RTCViewNative) return null;
+                if (videoCall && ((showLocalMain && pipVideoLive && url === remoteUrl) || (!showLocalMain && mainVideoLive && url === mainUrl))) {
+                  return null;
+                }
+                return <RTCViewNative key={`sink-${userId}`} streamURL={url} style={styles.callAudioSink} objectFit="cover" />;
+              })}
+              {videoCall && mainUrl && mainVideoLive && RTCViewNative && !phoneLocked ? (
+                <RTCViewNative streamURL={mainUrl} style={styles.callStageMain} objectFit="cover" mirror={showLocalMain} />
               ) : (
                 <View style={styles.callStageMain}>
-                  {photoUri ? (
-                    <Image source={{ uri: photoUri }} style={styles.callFullPhoto} resizeMode="cover" />
-                  ) : (
-                    <View style={styles.callFullPhotoFallback}>
-                      <Text style={styles.callFullPhotoLetter}>{stageName.slice(0, 1).toUpperCase()}</Text>
-                    </View>
-                  )}
+                  {profileStage(stageUserId, styles.callFullPhoto)}
                 </View>
               )}
-              {call.kind === 'Video' && pipUrl && RTCViewNative && !phoneLocked ? (
+              {videoCall && answered && pipUrl ? (
                 <Pressable style={styles.callStagePip} onPress={() => setLocalVideoLarge((current) => !current)}>
-                  {pipVideoLive ? (
+                  {pipVideoLive && RTCViewNative && !phoneLocked ? (
                     <RTCViewNative streamURL={pipUrl} style={styles.callStagePipVideo} objectFit="cover" mirror={pipIsLocal} />
                   ) : (
-                    <View style={styles.callStagePipVideo}>
-                      <Text style={styles.callFullPhotoLetter}>{(pipIsLocal ? profile.name : call.name || '?').slice(0, 1).toUpperCase()}</Text>
-                    </View>
+                    profileStage(pipUserId, styles.callStagePipVideo)
                   )}
                 </Pressable>
               ) : null}
+              {others.length > 1 ? (
+                <View style={styles.callPeerStrip}>
+                  {others.map((userId) => (
+                    <Pressable key={userId} style={[styles.callPeerChip, userId === primaryPeerId ? styles.callPeerChipOn : null]} onPress={() => { setFocusedPeerId(userId); setLocalVideoLarge(false); }}>
+                      <Text numberOfLines={1} style={styles.callPeerChipText}>{displayNameFor(userId, 'Contact')}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ) : null}
               {callControlsVisible || call.state !== 'ongoing' || call.kind !== 'Video' ? (
               <View style={styles.callScreenTop}>
-                <Text style={styles.callScreenName}>{call.name}</Text>
+                <Text style={styles.callScreenName}>{headerName}</Text>
                 <Text style={styles.callScreenStatus}>
                   {call.state === 'ongoing'
                     ? `${getAudioDurationLabel(activeCallSeconds * 1000)} · ${remoteLive ? 'Connected' : 'Connecting'}`
@@ -14026,8 +14376,7 @@ function AppContent() {
                       {videoCall
                         ? control(callCameraOff ? 'Camera' : 'Cam off', () => setCallVideoEnabled(callCameraOff), true, callCameraOff)
                         : control('Video', () => {
-                          emitCallSignal(call.id, 'video-upgrade', { from: currentUserId }, call.peerUserId);
-                          showToast('Asked them to switch to video.', 'info');
+                          void enableVideoOnCall().catch((error) => setCallError(error?.message === 'permission-denied' ? 'Camera permission was denied.' : 'The camera did not start.'));
                         }, answered, false)}
                       {videoCall ? control('Flip', flipCallCamera, answered, false) : null}
                       {videoCall ? control('Share', () => void shareCallScreen(), answered, false) : null}
@@ -14133,14 +14482,55 @@ function AppContent() {
               </Pressable>
             ) : null}
             <Pressable style={styles.sheetOption} onPress={() => {
-              const next = chatWallpaper === 'zynkup' ? 'night' : chatWallpaper === 'night' ? 'plain' : 'zynkup';
-              setChatWallpaper(next);
-              void AsyncStorage.setItem(WALLPAPER_KEY, next);
               setChatMenuVisible(false);
+              setWallpaperSheetVisible(true);
             }}>
-              <Text style={styles.sheetOptionTitle}>Wallpaper · {chatWallpaper === 'zynkup' ? 'ZynkUP' : chatWallpaper === 'night' ? 'Night' : 'Light'}</Text>
+              <Text style={styles.sheetOptionTitle}>Wallpaper</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => {
+              const chat = activeChat;
+              setChatMenuVisible(false);
+              Alert.alert('Delete chat?', 'It leaves your chat list on this phone. A new message brings it back.', [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Delete', style: 'destructive', onPress: () => void deleteChatFromList(chat) },
+              ]);
+            }}>
+              <Text style={[styles.sheetOptionTitle, styles.settingsDangerText]}>Delete chat</Text>
             </Pressable>
             <Pressable style={styles.sheetBack} onPress={() => setChatMenuVisible(false)}>
+              <Text style={styles.sheetBackText}>Close</Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
+      <Modal transparent animationType="fade" visible={wallpaperSheetVisible} onRequestClose={() => setWallpaperSheetVisible(false)}>
+        <Pressable style={styles.dialogOverlay} onPress={() => setWallpaperSheetVisible(false)}>
+          <Pressable style={styles.dialog} onPress={() => undefined}>
+            <Text style={styles.dialogTitle}>Chat wallpaper</Text>
+            <Text style={styles.cardBody}>Beige is the default. Day uses the dark purple from the app. A photo can cover every chat, or just this one.</Text>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatWallpaper('beige'); void AsyncStorage.setItem(WALLPAPER_KEY, 'beige'); setWallpaperSheetVisible(false); }}>
+              <Text style={styles.sheetOptionTitle}>Beige {chatWallpaper === 'beige' ? '· On' : ''}</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => { setChatWallpaper('day'); void AsyncStorage.setItem(WALLPAPER_KEY, 'day'); setWallpaperSheetVisible(false); }}>
+              <Text style={styles.sheetOptionTitle}>Day {chatWallpaper === 'day' ? '· On' : ''}</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => void chooseWallpaperPhoto('chat')}>
+              <Text style={styles.sheetOptionTitle}>Photo for this chat</Text>
+            </Pressable>
+            <Pressable style={styles.sheetOption} onPress={() => void chooseWallpaperPhoto('all')}>
+              <Text style={styles.sheetOptionTitle}>Photo for all chats</Text>
+            </Pressable>
+            {activeChat?.id && wallpaperImages.byChat?.[activeChat.id] ? (
+              <Pressable style={styles.sheetOption} onPress={() => clearWallpaperPhoto('chat')}>
+                <Text style={styles.sheetOptionTitle}>Remove this chat photo</Text>
+              </Pressable>
+            ) : null}
+            {wallpaperImages.all ? (
+              <Pressable style={styles.sheetOption} onPress={() => clearWallpaperPhoto('all')}>
+                <Text style={styles.sheetOptionTitle}>Remove the photo for all chats</Text>
+              </Pressable>
+            ) : null}
+            <Pressable style={styles.sheetBack} onPress={() => setWallpaperSheetVisible(false)}>
               <Text style={styles.sheetBackText}>Close</Text>
             </Pressable>
           </Pressable>
@@ -14625,6 +15015,29 @@ function AppContent() {
           >
             {renderPersonAvatar({ userId: activeChat?.peerUserId, name: activeChat?.name, size: 140 })}
           </Pressable>
+          <View style={styles.profileMediaRow}>
+            {photoForUser(activeChat?.peerUserId) ? (
+              <Image source={{ uri: photoForUser(activeChat.peerUserId) }} style={styles.profileMediaThumb} />
+            ) : (
+              <View style={[styles.profileMediaThumb, styles.profileImageFallback]}>
+                <Text style={styles.profileImageFallbackText}>Photo</Text>
+              </View>
+            )}
+            {profileMediaFor(activeChat?.peerUserId).profileVideoUri ? (
+              <Video
+                source={{ uri: profileMediaFor(activeChat.peerUserId).profileVideoUri }}
+                style={styles.profileMediaThumb}
+                resizeMode="cover"
+                repeat
+                muted
+                paused={false}
+              />
+            ) : (
+              <View style={[styles.profileMediaThumb, styles.profileImageFallback]}>
+                <Text style={styles.profileImageFallbackText}>Video</Text>
+              </View>
+            )}
+          </View>
           <Text style={styles.peerProfileName}>{displayNameFor(activeChat?.peerUserId, activeChat?.name)}</Text>
           <Text style={styles.peerProfileMeta}>{getPresenceLabel(activeChat)}</Text>
           <Text style={styles.peerProfileMeta}>{usersById[activeChat?.peerUserId]?.username ? `@${usersById[activeChat.peerUserId].username}` : ''}</Text>
@@ -14781,27 +15194,16 @@ function AppContent() {
             <Pressable style={styles.sheetOption} onPress={() => { toggleArchiveChat(chatActionChat.id); setChatActionChat(null); }}>
               <Text style={styles.sheetOptionTitle}>{archivedChatIds.includes(chatActionChat?.id) ? 'Unarchive' : 'Archive'}</Text>
             </Pressable>
-            {chatActionChat?.kind === 'group' ? (
-              <Pressable style={styles.sheetOption} onPress={() => {
-                const chatId = chatActionChat.id;
-                setChatActionChat(null);
-                void fetch(`${API_BASE_URL}/api/chats/${chatId}?userId=${encodeURIComponent(currentUserId)}`, { method: 'DELETE' })
-                  .then((response) => {
-                    if (!response.ok) {
-                      showToast('Could not delete that chat room.', 'error');
-                      return;
-                    }
-                    setChatItems((current) => current.filter((item) => item.id !== chatId));
-                    if (selectedChatId === chatId) {
-                      setChatScreen('list');
-                    }
-                    showToast('Chat room deleted.', 'success');
-                  })
-                  .catch(() => showToast('Could not delete that chat room.', 'error'));
-              }}>
-                <Text style={styles.sheetOptionTitle}>Delete chat room</Text>
-              </Pressable>
-            ) : null}
+            <Pressable style={styles.sheetOption} onPress={() => {
+              const chat = chatActionChat;
+              setChatActionChat(null);
+              Alert.alert('Delete chat?', 'It leaves your chat list on this phone. A new message brings it back.', [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Delete', style: 'destructive', onPress: () => void deleteChatFromList(chat) },
+              ]);
+            }}>
+              <Text style={[styles.sheetOptionTitle, styles.settingsDangerText]}>Delete chat</Text>
+            </Pressable>
             <Pressable style={styles.sheetBack} onPress={() => setChatActionChat(null)}>
               <Text style={styles.sheetBackText}>Close</Text>
             </Pressable>
@@ -14943,23 +15345,32 @@ function AppContent() {
         <Pressable style={styles.dialogOverlay} onPress={() => setCallInviteVisible(false)}>
           <Pressable style={styles.dialog} onPress={() => undefined}>
             <Text style={styles.dialogTitle}>Add to call</Text>
-            <Text style={styles.cardBody}>They get an invite and can join by calling you.</Text>
+            <Text style={styles.cardBody}>They get a call on this same conversation. The people already talking stay connected.</Text>
             <ScrollView style={styles.newChatList}>
-              {contactItems.filter((contact) => contact.registered && contact.linkedUserId && contact.linkedUserId !== currentUserId && contact.linkedUserId !== activeCall?.peerUserId)
+              {contactItems.filter((contact) => contact.registered && contact.linkedUserId && contact.linkedUserId !== currentUserId && !(activeCall?.participantIds || []).includes(contact.linkedUserId))
                 .filter((contact, index, list) => list.findIndex((item) => item.linkedUserId === contact.linkedUserId) === index)
                 .map((contact) => (
                   <Pressable
                     key={contact.linkedUserId}
                     style={styles.sheetOption}
                     onPress={() => {
-                      socketRef.current?.emit('call:invite', {
-                        toUserId: contact.linkedUserId,
-                        fromUserId: currentUserId,
-                        fromName: profile.name || 'Someone',
-                        kind: activeCall?.kind || 'Audio',
-                      });
+                      const inviteeId = contact.linkedUserId;
+                      const callId = activeCall?.id;
                       setCallInviteVisible(false);
-                      showToast(`Invited ${contact.name}.`, 'success');
+                      if (!callId || !inviteeId) return;
+                      void fetch(`${API_BASE_URL}/api/calls/${callId}/participants`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ userId: currentUserId, inviteeId }),
+                      }).then(async (response) => {
+                        const payload = await response.json().catch(() => ({}));
+                        if (!response.ok) {
+                          showToast(payload.error || 'Could not add them to the call.', 'error');
+                          return;
+                        }
+                        if (payload.call) upsertCall(payload.call);
+                        showToast(`Calling ${contact.name} into this call.`, 'success');
+                      }).catch(() => showToast('Could not add them to the call.', 'error'));
                     }}
                   >
                     <Text style={styles.sheetOptionTitle}>{contact.name}</Text>
@@ -15259,12 +15670,10 @@ const styles = StyleSheet.create({
   bottomNav: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    marginHorizontal: 12,
-    marginBottom: 8,
+    width: '100%',
     paddingTop: 8,
     paddingBottom: 8,
-    paddingHorizontal: 8,
-    borderRadius: 28,
+    paddingHorizontal: 6,
     backgroundColor: '#12082A',
   },
   bottomNavItem: {
@@ -15552,6 +15961,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#0b1418',
+    overflow: 'hidden',
   },
   personAvatarFallback: {
     alignItems: 'center',
@@ -16269,16 +16679,23 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: '700',
   },
+  chatFilterScroll: {
+    flexGrow: 0,
+    height: 48,
+    maxHeight: 48,
+  },
   chatFilterRow: {
+    alignItems: 'center',
     paddingHorizontal: 16,
-    paddingBottom: 12,
     gap: 8,
+    height: 48,
   },
   chatFilterChip: {
-    minHeight: 38,
-    paddingHorizontal: 16,
-    borderRadius: 19,
+    height: 34,
+    paddingHorizontal: 14,
+    borderRadius: 17,
     alignItems: 'center',
+    alignSelf: 'center',
     justifyContent: 'center',
     backgroundColor: 'rgba(255,255,255,0.08)',
   },
@@ -16653,6 +17070,22 @@ const styles = StyleSheet.create({
     color: '#f6f7f8',
     fontSize: 17,
     fontWeight: '700',
+    flexShrink: 1,
+  },
+  threadStage: {
+    flex: 1,
+  },
+  threadStageFill: {
+    flex: 1,
+  },
+  threadWallpaperImage: {
+    resizeMode: 'cover',
+  },
+  gameCard: {
+    borderRadius: 22,
+    padding: 14,
+    marginBottom: 14,
+    borderWidth: 1,
   },
   detailSubtitle: {
     color: '#94a6ad',
@@ -16906,9 +17339,38 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 6,
   },
-  composer: {
+  composerToolRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingBottom: 6,
+  },
+  profileTitleRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  profileMediaRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    gap: 18,
+  },
+  profileMediaCol: {
+    width: 132,
+    alignItems: 'center',
+    gap: 6,
+  },
+  profileMediaThumb: {
+    width: 112,
+    height: 112,
+    borderRadius: 56,
+    backgroundColor: '#1c1238',
+  },
+  composer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
     gap: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
@@ -18386,6 +18848,12 @@ const styles = StyleSheet.create({
     right: 24,
     zIndex: 1,
   },
+  viewerSave: {
+    position: 'absolute',
+    top: 56,
+    left: 24,
+    zIndex: 1,
+  },
   viewerCloseText: {
     color: '#f6f7f8',
     fontSize: 16,
@@ -18787,6 +19255,34 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.3)',
     backgroundColor: '#111',
+  },
+  callAudioSink: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
+  callPeerStrip: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 210,
+    flexDirection: 'row',
+    gap: 8,
+  },
+  callPeerChip: {
+    maxWidth: 140,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  callPeerChipOn: {
+    backgroundColor: '#7C3AED',
+  },
+  callPeerChipText: {
+    color: '#ffffff',
+    fontWeight: '700',
   },
   callStagePipVideo: {
     width: '100%',
