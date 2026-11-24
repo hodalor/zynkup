@@ -95,6 +95,8 @@ type User = {
   profileVideoPosterUri?: string;
   /** Duration of the profile video clip (0–6 seconds). */
   profileVideoDurationSeconds?: number;
+  /** Which profile media plays in lists, calls, and quick pay. */
+  profileMediaDefault?: 'photo' | 'video';
   username?: string;
 };
 
@@ -648,6 +650,7 @@ type Profile = {
   profileVideoPosterUri?: string;
   /** Clip length in whole seconds (0–6). Empty video clears this. */
   profileVideoDurationSeconds?: number;
+  profileMediaDefault?: 'photo' | 'video';
   lastSeenPrivacy?: 'everyone' | 'contacts' | 'nobody';
   profilePhotoPrivacy?: 'everyone' | 'contacts' | 'nobody';
   /** When omitted, falls back to profilePhotoPrivacy. */
@@ -800,6 +803,7 @@ const emptyProfile: Profile = {
   profileVideoUri: '',
   profileVideoPosterUri: '',
   profileVideoDurationSeconds: 0,
+  profileMediaDefault: 'photo',
   lastSeenPrivacy: 'everyone',
   profilePhotoPrivacy: 'everyone',
   profileVideoPrivacy: 'everyone',
@@ -989,6 +993,7 @@ const updateProfileSchema = z.object({
   profileVideoUri: httpsMediaUri('Profile video').optional(),
   profileVideoPosterUri: httpsMediaUri('Profile video poster').optional(),
   profileVideoDurationSeconds: z.number().int().min(0).max(PROFILE_VIDEO_MAX_SECONDS).optional(),
+  profileMediaDefault: z.enum(['photo', 'video']).optional(),
   lastSeenPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   profilePhotoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
   profileVideoPrivacy: z.enum(['everyone', 'contacts', 'nobody']).optional(),
@@ -2539,6 +2544,7 @@ const presentProfileMedia = (
     profileVideoUri: seeVideo ? (profile?.profileVideoUri || '') : '',
     profileVideoPosterUri: seeVideo ? (profile?.profileVideoPosterUri || '') : '',
     profileVideoDurationSeconds: seeVideo ? (profile?.profileVideoDurationSeconds ?? 0) : 0,
+    profileMediaDefault: profile?.profileMediaDefault === 'video' ? 'video' : 'photo',
     profilePhotoPrivacy: profile?.profilePhotoPrivacy ?? 'everyone',
     profileVideoPrivacy: profile?.profileVideoPrivacy ?? profile?.profilePhotoPrivacy ?? 'everyone',
   };
@@ -3162,6 +3168,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
         profileVideoUri: item.profileVideoUri || '',
         profileVideoPosterUri: item.profileVideoPosterUri || '',
         profileVideoDurationSeconds: item.profileVideoDurationSeconds ?? 0,
+        profileMediaDefault: item.profileMediaDefault === 'video' ? 'video' : 'photo',
       },
     ]),
   );
@@ -3173,6 +3180,7 @@ const buildBootstrapPayload = async (session: DeviceSession | null = null): Prom
       profileVideoUri: media?.profileVideoUri || user.profileVideoUri || '',
       profileVideoPosterUri: media?.profileVideoPosterUri || user.profileVideoPosterUri || '',
       profileVideoDurationSeconds: media?.profileVideoDurationSeconds ?? user.profileVideoDurationSeconds ?? 0,
+      profileMediaDefault: media?.profileMediaDefault === 'video' || user.profileMediaDefault === 'video' ? 'video' : 'photo',
     };
   });
   const myBusinesses = await businessesForUser(currentUserId);
@@ -10996,6 +11004,65 @@ app.patch('/api/calls/:callId', async (req, res) => {
       }
     }
   }
+  return res.json({ call });
+});
+
+app.post('/api/calls/:callId/participants', async (req, res) => {
+  const actorId = String(req.body?.userId || '');
+  const inviteeId = String(req.body?.inviteeId || '');
+  if (!actorId || !inviteeId || actorId === inviteeId) {
+    return res.status(400).json({ error: 'Choose someone else to add.' });
+  }
+  const existing = (await readCalls()).find((item) => item.id === req.params.callId);
+  if (!existing || !existing.participantIds.includes(actorId)) {
+    return res.status(404).json({ error: 'Call not found' });
+  }
+  if (existing.state === 'completed' || existing.state === 'missed' || existing.state === 'declined') {
+    return res.status(400).json({ error: 'That call has already ended.' });
+  }
+  if (await usersHaveBlock(actorId, inviteeId)) {
+    return res.status(403).json({ error: 'You cannot add this person.' });
+  }
+  const call = existing.participantIds.includes(inviteeId)
+    ? existing
+    : await updateCall(existing.id, (current) => ({
+        ...current,
+        participantIds: [...current.participantIds, inviteeId],
+      }));
+  if (!call) {
+    return res.status(404).json({ error: 'Call not found' });
+  }
+  for (const participantId of call.participantIds) {
+    if (participantId === inviteeId) continue;
+    io.to(`user:${participantId}`).emit('call:updated', call);
+  }
+  const inviter = (await readUsers()).find((user) => user.id === actorId);
+  const inviterProfile = inviter ? await readProfile(inviter.id) : null;
+  io.to(`user:${inviteeId}`).emit('call:incoming', {
+    ...call,
+    state: 'ringing',
+    initiatorId: actorId,
+    caller: inviter
+      ? {
+          id: inviter.id,
+          name: inviter.name,
+          phone: inviter.phone,
+          username: inviterProfile?.username || '',
+          avatar: inviter.avatar,
+          photoUri: inviterProfile?.photoUri || '',
+          profileVideoUri: '',
+          profileVideoPosterUri: '',
+          profileVideoDurationSeconds: 0,
+        }
+      : null,
+  });
+  void notifyOfflineUser(
+    inviteeId,
+    inviter?.name || inviter?.phone || 'Incoming call',
+    'Incoming group call',
+    { type: 'call', callId: call.id, kind: call.kind },
+    'calls',
+  );
   return res.json({ call });
 });
 
